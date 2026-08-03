@@ -1,15 +1,22 @@
-# Profiling Diffusion Models
+# Profiling Omni and Diffusion Models
 
 > **Warning:** Profiling is for development and debugging only. It adds significant overhead and should not be enabled in production.
 
-Diffusion profiling supports two backends through `profiler_config`:
+Profiling supports two backends through `profiler_config`:
 
 - `torch`: detailed CPU/CUDA traces, operator tables, and optional memory snapshots
 - `cuda`: low-overhead CUDA range control for NVIDIA Nsight Systems (`nsys`)
 
 ## 1. Configure `profiler_config`
 
-Use `profiler_config` to enable profiling for a diffusion model. For diffusion usage, pass it directly to `Omni(...)` or `vllm serve`.
+Use `profiler_config` to enable profiling. For diffusion usage, pass it directly to `Omni(...)` or `vllm serve`. For a multi-stage omni pipeline, add it to each stage that should be captured in the deploy YAML.
+
+For an omni serving pipeline, `POST /start_profile` and
+`POST /stop_profile` accept an optional JSON body such as
+`{"stages": [0, 2]}`. With no body they operate on every configured stage.
+`vllm bench serve --profile` drives these endpoints automatically around the
+measured request set. Keep profiling and latency runs separate because trace
+collection adds overhead.
 
 Minimal torch-profiler config:
 

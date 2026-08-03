@@ -70,6 +70,12 @@ use the exported audio with the upstream Seed-TTS evaluator.
 Save Seed-TTS responses as `{utterance_id}.wav`, ready for the official
 `cal_wer.sh` and `cal_sim.sh` scripts.
 
+Saved result files can be compared across three or more repeated runs with
+`python -m vllm_omni.benchmarks.performance_gate`. It fails closed on request
+errors, incomplete run sets, mismatched completed counts, and invalid selected
+metrics. Use `python -m vllm_omni.benchmarks.quality_gate` separately for the
+benchmark accuracy budget.
+
 - `--save-detailed`
 "When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc."

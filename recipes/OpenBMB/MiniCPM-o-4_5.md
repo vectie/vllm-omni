@@ -33,6 +33,8 @@ also provided.
   - 2-GPU and 3-GPU layouts:
     [`vllm_omni/deploy/minicpmo_4_5_2gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2gpu.yaml),
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
+  - Development-only 2-NPU profiler overlay:
+    [`vllm_omni/deploy/minicpmo_4_5_2npu_profile.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2npu_profile.yaml)
   - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
 - Online example + Gradio demo:
@@ -124,6 +126,72 @@ attributes material time to a generic Ascend operator or graph/runtime path.
 MiniCPM codec policy, vocoder steps, and inter-stage chunking belong here in
 vLLM-Omni. This prevents unprofiled model-specific patches from leaking into
 the hardware plugin.
+
+### Optimization decision matrix
+
+The optimization boundary is settled as follows. "Remote gate" means the
+mechanism is implemented, but its winning value must be measured on the target
+910C/Atlas product rather than guessed on another accelerator.
+
+| Optimization | Current decision | Owner / promotion evidence |
+| --- | --- | --- |
+| Thinker, Talker, Code2Wav stage isolation | Shipped; retain the three-stage topology | vLLM-Omni; end-to-end correctness and stage metrics |
+| Local inter-stage transfer | Shipped with async shared memory; do not add serialization | vLLM-Omni; transfer metrics and profiler trace |
+| Thinker/Talker graph execution on NPU | Shipped as PIECEWISE ACL graph mode | vLLM-Omni platform overlay; 910C startup and accuracy gates |
+| Code2Wav graph/compile | Keep eager for request-owned Flow/HiFT caches and variable shapes | Revisit only after a trace identifies stable exact-shape regions |
+| Initial codec chunk | Remote gate: sweep 8/12/16 against 25 | vLLM-Omni policy; TTFP target plus RTF/quality guards |
+| Steady codec chunk | Remote gate after initial chunk settles | vLLM-Omni policy; per-chunk RTF target plus TTFP/quality guards |
+| Code2Wav diffusion steps | Remote gate: sweep 8/6 against 10 | vLLM-Omni policy; RTF target plus official Seed-TTS quality |
+| Concurrency and stage memory | Remote gate after single-request latency | Deploy config; throughput target plus TTFT/TTFP/RTF guards |
+| Prefix/Radix caching | Do not enable for this pipeline yet | Requires proof that request-owned audio state and multimodal keys are safe |
+| Async compute/transfer overlap and dedicated NPU streams | Profiler-triggered, not speculative | vLLM-Ascend only when the bottleneck is generic across models |
+| Ascend operator/kernel changes | Profiler-triggered, model-agnostic only | vLLM-Ascend trace, operator table, and cross-model regression evidence |
+
+This incorporates the useful SGLang/SGLang-Omni ideas—independent stage
+scheduling, continuous batching, direct local transfer, and overlapping
+communication—without copying Radix caching or static-graph assumptions across
+MiniCPM-o's request-local audio state boundary. Exact-shape-compatible
+Code2Wav batching is already enabled; batches with incompatible cache shapes
+must remain separate for correctness.
+
+### Capture an actionable 910C profile
+
+Latency measurements and profiler measurements are separate runs because the
+profiler changes timing. Start a fresh server with the development-only
+overlay; it writes one trace and operator workbook per stage:
+
+```bash
+mkdir -p /data/profiles/minicpmo45/{stage0,stage1,stage2}
+
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5_2npu_profile.yaml \
+    --trust-remote-code \
+    --allowed-local-media-path /data/benchmarks \
+    --interleave-mm-strings \
+    --host 0.0.0.0 --port 8099
+```
+
+From another shell, use a representative text+audio subset and let the
+benchmark start and stop every configured stage profiler:
+
+```bash
+vllm bench serve --omni \
+    --backend openai-chat-omni \
+    --endpoint /v1/chat/completions \
+    --model openbmb/MiniCPM-o-4_5 \
+    --dataset-name daily-omni \
+    --dataset-path liarliar/Daily-Omni \
+    --daily-omni-video-dir /data/benchmarks/Daily-Omni/Videos \
+    --daily-omni-pack-mode minicpm-interleave \
+    --num-prompts 16 --max-concurrency 1 --profile
+```
+
+Archive the server log, `npu-smi info`, both repository commits, the exact
+commands, and all three `/data/profiles/minicpmo45/stage*` directories. A
+vLLM-Ascend change is justified only when these artifacts attribute material
+time to a generic NPU operator, synchronization, transfer, or graph-runtime
+path. If time remains in MiniCPM chunk policy or Code2Wav model code, make the
+change in vLLM-Omni and rerun both performance and quality gates.
 
 ## GPU
 
@@ -346,6 +414,30 @@ python -m vllm_omni.benchmarks.quality_gate \
 
 The comparator also requires identical evaluated counts, preventing a faster
 candidate from passing by dropping failed or difficult requests.
+
+For each performance sweep, save three distinct baseline files and three
+distinct candidate files. Then make the latency/throughput decision
+machine-checkable. This example promotes a steady-chunk candidate only if the
+median p99 chunk RTF improves by at least 1%, while median TTFP and overall RTF
+regress by no more than 2%:
+
+```bash
+python -m vllm_omni.benchmarks.performance_gate \
+    --baseline baseline-1.json --baseline baseline-2.json --baseline baseline-3.json \
+    --candidate candidate-1.json --candidate candidate-2.json --candidate candidate-3.json \
+    --target-metric p99_audio_chunk_rtf \
+    --guard-metric p99_audio_ttfp_ms \
+    --guard-metric mean_audio_rtf \
+    --min-improvement-percent 1 \
+    --max-guard-regression-percent 2 \
+    --report-json performance-promotion.json
+```
+
+The gate rejects duplicate paths, fewer than three runs, request failures,
+different completed counts, and missing/zero/non-finite metrics. For the
+concurrency sweep, use `--target-metric request_throughput
+--higher-is-better request_throughput`; keep TTFT, TTFP, and RTF as guards.
+Run the quality gates above as a separate mandatory promotion condition.
 
 #### Verification
 

@@ -1,0 +1,26 @@
+# Development-only 2-NPU profiler overlay for MiniCPM-o 4.5.
+#
+# Start from the production-shaped split layout, but capture each stage into a
+# separate directory so Thinker, Talker, and Code2Wav costs remain attributable.
+# Do not use this overlay for latency measurements: profiling adds overhead.
+base_config: minicpmo_4_5_2gpu.yaml
+pipeline: minicpmo_4_5
+
+stages:
+  - stage_id: 0
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /data/profiles/minicpmo45/stage0
+      torch_profiler_record_shapes: true
+
+  - stage_id: 1
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /data/profiles/minicpmo45/stage1
+      torch_profiler_record_shapes: true
+
+  - stage_id: 2
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /data/profiles/minicpmo45/stage2
+      torch_profiler_record_shapes: true

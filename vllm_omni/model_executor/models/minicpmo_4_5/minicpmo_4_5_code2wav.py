@@ -28,6 +28,21 @@ from .batched_token2wav import (
 )
 
 logger = init_logger(__name__)
+_MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV = "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
+
+
+def _resolve_token2wav_n_timesteps(extra: Mapping[str, Any]) -> int:
+    env_value = os.environ.get(_MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV)
+    raw_value = env_value if env_value not in (None, "") else extra.get("token2wav_n_timesteps", 10)
+    try:
+        n_timesteps = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid MiniCPM-o Code2Wav config: {_MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV}={raw_value!r}"
+        ) from exc
+    if n_timesteps <= 0:
+        raise ValueError(f"MiniCPM-o Code2Wav token2wav_n_timesteps must be positive, got {n_timesteps}")
+    return n_timesteps
 
 
 def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
@@ -761,7 +776,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             token2wav = Token2wav(
                 str(token2wav_path),
                 float16=use_float16,
-                n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
+                n_timesteps=_resolve_token2wav_n_timesteps(extra),
             )
         finally:
             torch.set_default_dtype(previous_dtype)

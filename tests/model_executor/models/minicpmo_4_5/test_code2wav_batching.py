@@ -10,6 +10,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    _resolve_token2wav_n_timesteps,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -156,6 +157,23 @@ def _model():
     model = MiniCPMO45Code2Wav(vllm_config=_config())
     model.backend = backend
     return model, token2wav
+
+
+def test_token2wav_step_count_defaults_to_checkpoint_quality() -> None:
+    assert _resolve_token2wav_n_timesteps({}) == 10
+    assert _resolve_token2wav_n_timesteps({"token2wav_n_timesteps": 8}) == 8
+
+
+def test_token2wav_step_count_environment_override_wins(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS", "6")
+    assert _resolve_token2wav_n_timesteps({"token2wav_n_timesteps": 8}) == 6
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-int"])
+def test_invalid_token2wav_step_count_is_rejected(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS", value)
+    with pytest.raises(ValueError, match="MiniCPM-o Code2Wav"):
+        _resolve_token2wav_n_timesteps({})
 
 
 def _info(

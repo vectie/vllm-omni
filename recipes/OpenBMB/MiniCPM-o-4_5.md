@@ -148,6 +148,7 @@ three values without editing the deploy YAML:
 VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES=8 \
 VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES=25 \
 VLLM_OMNI_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES=3 \
+VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS=10 \
 vllm serve openbmb/MiniCPM-o-4_5 --omni \
     --trust-remote-code --host 0.0.0.0 --port 8099
 ```
@@ -162,6 +163,12 @@ only if per-chunk RTF remains above the target. Keep the default as the
 baseline, change one variable at a time, and re-run the required audio-quality
 evaluation before promoting a setting. Both chunk sizes must be positive and
 left-context frames non-negative.
+
+Code2Wav uses 10 diffusion steps by default. Once chunk geometry is settled,
+sweep the step count separately (for example 8 and 6 against the 10-step
+baseline). Fewer steps reduce vocoder work and may reduce audio quality, so a
+candidate must pass both Seed-TTS metrics and the full two-percentage-point
+quality gate before promotion. Step counts must be positive.
 
 Video-MME is available as a native benchmark dataset. Download the licensed
 videos according to the official Video-MME instructions, place the MP4 files

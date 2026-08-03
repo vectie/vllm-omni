@@ -179,6 +179,30 @@ add `--video-mme-inline-local-video` for small smoke runs. The saved JSON
 contains overall accuracy plus official duration, domain, sub-category, and
 task-type breakdowns.
 
+After producing baseline and candidate result files for each required suite,
+enforce the two-percentage-point rule with the fail-closed comparator:
+
+```bash
+python -m vllm_omni.benchmarks.quality_gate \
+    baseline-daily-omni.json candidate-daily-omni.json \
+    --require-metric daily_omni_accuracy_incl_http_fail \
+    --max-regression-pp 2
+
+python -m vllm_omni.benchmarks.quality_gate \
+    baseline-video-mme.json candidate-video-mme.json \
+    --require-metric video_mme_accuracy_incl_http_fail \
+    --max-regression-pp 2
+
+python -m vllm_omni.benchmarks.quality_gate \
+    baseline-seed-tts.json candidate-seed-tts.json \
+    --require-metric seed_tts_content_error_mean \
+    --require-metric seed_tts_sim_mean \
+    --max-regression-pp 2
+```
+
+The comparator also requires identical evaluated counts, preventing a faster
+candidate from passing by dropping failed or difficult requests.
+
 #### Verification
 
 **Quick smoke test (text-only output)**:

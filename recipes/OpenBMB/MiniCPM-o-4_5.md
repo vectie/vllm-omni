@@ -136,6 +136,27 @@ tail latency because this profile bounds each stage to four sequences while
 main's Thinker admits 16. Global TPOT/ITL remains zero when serving emits text
 as one aggregated chunk, so the table reports Stage 0 metrics.
 
+#### Chunk-latency tuning
+
+The default Talker-to-Code2Wav window is 25 codec frames with 3 frames of
+left context. Controlled sweeps can override these values without editing the
+deploy YAML:
+
+```bash
+VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES=20 \
+VLLM_OMNI_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES=3 \
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+    --trust-remote-code --host 0.0.0.0 --port 8099
+```
+
+Use `vllm bench serve --percentile-metrics audio_ttfp,audio_rtf,audio_chunk_rtf`
+to compare runs. `audio_chunk_rtf` measures every post-TTFP delivery interval
+against that chunk's playable duration; values below 1 keep pace with realtime.
+Smaller chunks can improve delivery cadence but increase Code2Wav invocation
+and transfer overhead. Keep the default as the baseline, change one variable at
+a time, and re-run the required audio-quality evaluation before promoting a
+setting. Chunk frames must be positive and left-context frames non-negative.
+
 #### Verification
 
 **Quick smoke test (text-only output)**:

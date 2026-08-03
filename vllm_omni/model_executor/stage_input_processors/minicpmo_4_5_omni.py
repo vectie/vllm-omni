@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -22,6 +23,8 @@ _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
 _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
+_MINICPMO45_CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES"
+_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES"
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -130,8 +133,25 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
     raw_config = getattr(connector, "config", {}) or {}
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
-    chunk_frames = int(config.get("codec_chunk_frames", 25))
-    left_context_frames = int(config.get("codec_left_context_frames", 3))
+
+    def resolve_int(env_name: str, config_name: str, default: int) -> int:
+        env_value = os.environ.get(env_name)
+        raw_value = env_value if env_value not in (None, "") else config.get(config_name, default)
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid MiniCPM-o codec chunk config: {env_name}={raw_value!r}") from exc
+
+    chunk_frames = resolve_int(
+        _MINICPMO45_CODEC_CHUNK_FRAMES_ENV,
+        "codec_chunk_frames",
+        25,
+    )
+    left_context_frames = resolve_int(
+        _MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES_ENV,
+        "codec_left_context_frames",
+        3,
+    )
     if chunk_frames <= 0 or left_context_frames < 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "

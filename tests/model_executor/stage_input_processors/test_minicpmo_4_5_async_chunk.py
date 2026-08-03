@@ -89,6 +89,36 @@ def test_first_chunk_threshold_is_25_generated_codes(count: int, emitted: bool) 
         assert payload.meta.code_flat_numel == 28
 
 
+def test_codec_chunk_geometry_can_be_overridden_for_sweeps(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "10")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES", "1")
+    manager = _manager()
+    request = _request("req")
+
+    assert tts2code2wav_async_chunk(manager, _delta(*range(9)), request, False) is None
+    payload = tts2code2wav_async_chunk(manager, _delta(9), request, False)
+
+    assert payload is not None
+    assert _codes(payload) == [4218, *range(10)]
+    assert payload.meta.codec_chunk_frames == 10
+    assert payload.meta.codec_left_context_frames == 1
+    assert payload.meta.left_context_size == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "0"),
+        ("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "not-an-int"),
+        ("VLLM_OMNI_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES", "-1"),
+    ],
+)
+def test_invalid_codec_chunk_sweep_override_is_rejected(monkeypatch, name: str, value: str) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match="Invalid MiniCPM-o codec chunk config"):
+        tts2code2wav_async_chunk(_manager(), _delta(*range(25)), _request("req"), False)
+
+
 def test_steady_chunk_has_three_code_overlap_and_25_new_codes() -> None:
     manager = _manager()
     request = _request("req")

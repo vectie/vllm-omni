@@ -273,7 +273,8 @@ vllm bench serve --omni \
     --model openbmb/MiniCPM-o-4_5 \
     --dataset-name seed-tts \
     --dataset-path /data/benchmarks/seed-tts-eval \
-    --seed-tts-wer-eval \
+    --seed-tts-wer-eval --seed-tts-sim-eval \
+    --seed-tts-official-export-dir /data/results/baseline/seed-tts-en \
     --num-prompts 1000 --max-concurrency 1 \
     --percentile-metrics ttft,audio_ttfp,audio_rtf,audio_chunk_rtf \
     --save-result --result-filename seed-tts.json
@@ -283,6 +284,40 @@ Use the official dataset size present in the selected Seed-TTS split if it is
 not 1000; the quality comparator requires the candidate to use the same count
 as its baseline.
 
+The in-process `--seed-tts-sim-eval` metric is a fast WavLM mean-pooling
+proxy. It is useful while sweeping but is not the official Seed-TTS SIM
+protocol. For promotion, run the official evaluator against the exported
+`{utterance_id}.wav` files. `cal_wer.sh` and `cal_sim.sh` both write
+`wav_res_ref_text.wer`, so preserve each report before running the next:
+
+```bash
+cd /opt/seed-tts-eval
+export ARNOLD_WORKER_GPU=2
+
+bash cal_wer.sh \
+    /data/benchmarks/seed-tts-eval/en/meta.lst \
+    /data/results/baseline/seed-tts-en en
+cp /data/results/baseline/seed-tts-en/wav_res_ref_text.wer \
+    /data/results/baseline/seed-tts-en-wer.txt
+
+bash cal_sim.sh \
+    /data/benchmarks/seed-tts-eval/en/meta.lst \
+    /data/results/baseline/seed-tts-en \
+    /models/wavlm_large_finetune.pth
+cp /data/results/baseline/seed-tts-en/wav_res_ref_text.wer \
+    /data/results/baseline/seed-tts-en-sim.txt
+
+python -m vllm_omni.benchmarks.seed_tts_official_result \
+    seed-tts.json \
+    --wer-report /data/results/baseline/seed-tts-en-wer.txt \
+    --sim-report /data/results/baseline/seed-tts-en-sim.txt \
+    --output baseline-seed-tts-official.json
+```
+
+Repeat for the candidate using the same meta file and evaluated count. The
+importer refuses reports without both a summary and per-utterance rows, labels
+the exact protocol in JSON, and never overwrites the original serving result.
+
 After producing baseline and candidate result files for each required suite,
 enforce the two-percentage-point rule with the fail-closed comparator:
 
@@ -290,17 +325,22 @@ enforce the two-percentage-point rule with the fail-closed comparator:
 python -m vllm_omni.benchmarks.quality_gate \
     baseline-daily-omni.json candidate-daily-omni.json \
     --require-metric daily_omni_accuracy_incl_http_fail \
+    --require-evaluated-count daily_omni_evaluated=1197 \
     --max-regression-pp 2
 
 python -m vllm_omni.benchmarks.quality_gate \
     baseline-video-mme.json candidate-video-mme.json \
     --require-metric video_mme_accuracy_incl_http_fail \
+    --require-evaluated-count video_mme_evaluated=2700 \
     --max-regression-pp 2
 
 python -m vllm_omni.benchmarks.quality_gate \
-    baseline-seed-tts.json candidate-seed-tts.json \
+    baseline-seed-tts-official.json candidate-seed-tts-official.json \
     --require-metric seed_tts_content_error_mean \
     --require-metric seed_tts_sim_mean \
+    --require-evaluated-count seed_tts_content_evaluated=1000 \
+    --require-evaluated-count seed_tts_sim_evaluated=1000 \
+    --require-seed-tts-official \
     --max-regression-pp 2
 ```
 

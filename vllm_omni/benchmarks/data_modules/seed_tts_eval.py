@@ -10,11 +10,11 @@ https://github.com/zhaochenyang20/seed-tts-eval):
   preserving ``'``) and EN lowercasing / ZH per-character spacing. Supports jiwer 3.x
   (``compute_measures``) and 4.x (``process_words``).
 
-- **SIM** (speaker similarity proxy): cosine similarity of L2-normalized mean-pooled **WavLM**
+- **SIM proxy** (opt-in): cosine similarity of L2-normalized mean-pooled **WavLM**
   embeddings (reference prompt WAV vs. synthesized PCM), 16 kHz. Official ``cal_sim.sh`` uses
   UniSpeech ``verification_pair_list_v2.py`` with a **fine-tuned** WavLM SV checkpoint — set
-  ``SEED_TTS_WAVLM_MODEL`` to another HF id if you need closer parity. Disable with
-  ``SEED_TTS_SIM_EVAL=0``. Optional: ``SEED_TTS_SIM_DEVICE`` (e.g. ``cpu``) to avoid GPU
+  ``SEED_TTS_WAVLM_MODEL`` to another HF id if you need closer parity. Enable with
+  ``SEED_TTS_SIM_EVAL=1``. Optional: ``SEED_TTS_SIM_DEVICE`` (e.g. ``cpu``) to avoid GPU
   issues when Whisper already uses CUDA; ``SEED_TTS_WAVLM_MIN_SAMPLES`` pads very short
   waveforms so the WavLM CNN front-end does not fail.
 
@@ -39,6 +39,9 @@ Env: ``SEED_TTS_EVAL_DEVICE`` (e.g. ``cuda:0``, ``cpu``); ``SEED_TTS_HF_WHISPER_
 defaults to ``openai/whisper-large-v3`` (override for debugging only). Set
 ``SEED_TTS_WER_SAVE_AUDIO_DIR`` to save the captured 24 kHz mono WAV used by
 WER evaluation for each synthesized utterance.
+Set ``SEED_TTS_OFFICIAL_EXPORT_DIR`` (or use the benchmark CLI option) to
+also save ``{utterance_id}.wav`` files accepted directly by the official
+``cal_wer.sh`` and ``cal_sim.sh`` scripts.
 Streaming PCM is decoded using ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` /
 ``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` (default: 24 kHz mono).
 """
@@ -112,6 +115,24 @@ def _save_seed_tts_eval_audio(
         return None
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{index:05d}_{_safe_filename_part(utterance_id)}_{_safe_filename_part(locale)}"
+    path = output_dir / f"{stem}.wav"
+    path.write_bytes(pcm_s16le_mono_to_wav_bytes(pcm, sample_rate=24000))
+    return str(path)
+
+
+def _save_seed_tts_official_audio(
+    pcm: bytes,
+    *,
+    output_dir: Path | None,
+    utterance_id: Any,
+) -> str | None:
+    if output_dir is None:
+        return None
+    raw_id = str(utterance_id or "").strip()
+    stem = raw_id[:-4] if raw_id.lower().endswith(".wav") else raw_id
+    if not stem or stem in (".", "..") or Path(stem).name != stem or "\\" in stem:
+        raise ValueError(f"Unsafe Seed-TTS utterance id for official export: {raw_id!r}")
+    output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"{stem}.wav"
     path.write_bytes(pcm_s16le_mono_to_wav_bytes(pcm, sample_rate=24000))
     return str(path)
@@ -559,8 +580,12 @@ def compute_seed_tts_wer_metrics(
     utmos_on = _eval_submetric_enabled("SEED_TTS_UTMOS_EVAL", default=False)
     save_audio_raw = os.environ.get("SEED_TTS_WER_SAVE_AUDIO_DIR", "").strip()
     save_audio_dir = Path(save_audio_raw).expanduser() if save_audio_raw else None
+    official_export_raw = os.environ.get("SEED_TTS_OFFICIAL_EXPORT_DIR", "").strip()
+    official_export_dir = Path(official_export_raw).expanduser() if official_export_raw else None
     saved_audio = 0
     save_audio_failed = 0
+    official_exported = 0
+    official_export_failed = 0
 
     for index, (req, out) in enumerate(zip(input_requests, outputs, strict=True)):
         assert isinstance(req, SeedTTSSampleRequest)
@@ -609,6 +634,21 @@ def compute_seed_tts_wer_metrics(
             save_audio_failed += 1
             logger.warning(
                 "Seed-TTS WER audio save failed for utterance=%s: %s",
+                req.seed_tts_utterance_id,
+                e,
+            )
+        try:
+            official_audio_path = _save_seed_tts_official_audio(
+                pcm,
+                output_dir=official_export_dir,
+                utterance_id=req.seed_tts_utterance_id,
+            )
+            if official_audio_path:
+                official_exported += 1
+        except (OSError, ValueError) as e:
+            official_export_failed += 1
+            logger.warning(
+                "Seed-TTS official audio export failed for utterance=%s: %s",
                 req.seed_tts_utterance_id,
                 e,
             )
@@ -766,9 +806,11 @@ def compute_seed_tts_wer_metrics(
         "seed_tts_no_pcm": no_pcm,
         "seed_tts_asr_failed": asr_failed,
         "seed_tts_content_metric": "wer",
+        "seed_tts_content_protocol": "seed-tts-eval-in-tree-aligned",
         "seed_tts_sim_evaluated": len(sim_values),
         "seed_tts_sim_mean": statistics.fmean(sim_values) if sim_values else None,
         "seed_tts_sim_median": statistics.median(sim_values) if sim_values else None,
+        "seed_tts_sim_protocol": "wavlm-mean-pool-proxy" if sim_values else None,
         "seed_tts_sim_failed": sim_failed,
         "seed_tts_sim_skipped_no_ref": sim_skipped_no_ref,
         "seed_tts_utmos_evaluated": len(utmos_values),
@@ -777,6 +819,8 @@ def compute_seed_tts_wer_metrics(
         "seed_tts_utmos_failed": utmos_failed,
         "seed_tts_saved_audio": saved_audio,
         "seed_tts_save_audio_failed": save_audio_failed,
+        "seed_tts_official_exported": official_exported,
+        "seed_tts_official_export_failed": official_export_failed,
     }
     if save_audio_dir is not None:
         result["seed_tts_save_audio_dir"] = str(save_audio_dir)

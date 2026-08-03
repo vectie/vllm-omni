@@ -17,8 +17,14 @@ from vllm_omni.benchmarks.patch.patch import (
 
 
 def main(args: argparse.Namespace) -> dict[str, Any]:
-    if getattr(args, "seed_tts_wer_eval", False):
+    seed_tts_sim_eval = getattr(args, "seed_tts_sim_eval", False)
+    official_export_dir = getattr(args, "seed_tts_official_export_dir", None)
+    if getattr(args, "seed_tts_wer_eval", False) or seed_tts_sim_eval or official_export_dir:
         os.environ["SEED_TTS_WER_EVAL"] = "1"
+    if seed_tts_sim_eval:
+        os.environ["SEED_TTS_SIM_EVAL"] = "1"
+    if official_export_dir:
+        os.environ["SEED_TTS_OFFICIAL_EXPORT_DIR"] = str(official_export_dir)
     if getattr(args, "seed_tts_wer_save_items", False):
         os.environ["SEED_TTS_WER_SAVE_ITEMS"] = "1"
     if getattr(args, "daily_omni_save_eval_items", False):

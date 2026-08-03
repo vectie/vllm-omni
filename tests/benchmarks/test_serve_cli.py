@@ -57,6 +57,8 @@ def test_extend_omni_choices_updates_tracking_parser_shadow(dataset_name: str) -
         (["--print-stage"], "print_stage", True),
         (["--daily-omni-input-mode", "audio"], "daily_omni_input_mode", "audio"),
         (["--seed-tts-locale", "zh"], "seed_tts_locale", "zh"),
+        (["--seed-tts-sim-eval"], "seed_tts_sim_eval", True),
+        (["--seed-tts-official-export-dir", "/tmp/seed"], "seed_tts_official_export_dir", "/tmp/seed"),
         (["--video-mme-duration", "short"], "video_mme_duration", "short"),
     ],
 )
@@ -83,6 +85,8 @@ def test_add_omni_args_preserves_implicit_defaults() -> None:
     assert args.print_stage is False
     assert args.daily_omni_input_mode == "all"
     assert args.seed_tts_locale == "en"
+    assert args.seed_tts_sim_eval is False
+    assert args.seed_tts_official_export_dir is None
     assert args.video_mme_duration == "all"
     assert args.explicit_keys == set()
 

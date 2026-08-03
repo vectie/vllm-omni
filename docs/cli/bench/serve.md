@@ -61,6 +61,15 @@ Print per-stage benchmark metrics for --omni serving when stage metrics are retu
 - `--save-result`
 Specify to save benchmark results to a json file
 
+- `--seed-tts-sim-eval`
+Enable the in-process WavLM mean-pooling SIM proxy and PCM capture for
+Seed-TTS. This is intended for fast sweeps; official promotion scoring should
+use the exported audio with the upstream Seed-TTS evaluator.
+
+- `--seed-tts-official-export-dir`
+Save Seed-TTS responses as `{utterance_id}.wav`, ready for the official
+`cal_wer.sh` and `cal_sim.sh` scripts.
+
 - `--save-detailed`
 "When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc."

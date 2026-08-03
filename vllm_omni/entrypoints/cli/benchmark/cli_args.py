@@ -171,6 +171,24 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         "Optional: SEED_TTS_EVAL_DEVICE, SEED_TTS_HF_WHISPER_MODEL.",
     )
     group.add_argument(
+        "--seed-tts-sim-eval",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Seed-TTS speaker-similarity scoring with WavLM. This also enables PCM capture/WER "
+            "evaluation. Set SEED_TTS_SIM_DEVICE and SEED_TTS_WAVLM_MODEL to override the evaluator."
+        ),
+    )
+    group.add_argument(
+        "--seed-tts-official-export-dir",
+        type=str,
+        default=None,
+        help=(
+            "Save synthesized audio as {utterance_id}.wav under this directory for the official "
+            "BytedanceSpeech/seed-tts-eval cal_wer.sh and cal_sim.sh scripts. Enables PCM capture."
+        ),
+    )
+    group.add_argument(
         "--seed-tts-wer-save-items",
         action="store_true",
         default=False,

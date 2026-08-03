@@ -27,15 +27,15 @@ _SR = 24_000
 _BPS = _SR * 2  # 48 000
 
 
-def test_chunk_rtfs_measure_delivery_cadence_and_exclude_ttfp() -> None:
-    # Each emitted chunk carries 100 ms of audio. TTFP is 2 s but excluded;
-    # the following 50 ms and 200 ms gaps therefore yield RTFs 0.5 and 2.0.
+def test_chunk_rtfs_include_first_chunk_ttfp_interval() -> None:
+    # Each emitted chunk carries 100 ms of audio. TTFP is 2 s, followed by
+    # 50 ms and 200 ms gaps, yielding RTFs 20, 0.5, and 2.0.
     rtfs = compute_chunk_rtfs(
         chunk_arrival_times_s=[2.0, 2.05, 2.25],
         chunk_bytes=[_BPS // 10] * 3,
         sample_rate=_SR,
     )
-    assert rtfs == pytest.approx([0.5, 2.0])
+    assert rtfs == pytest.approx([20.0, 0.5, 2.0])
 
 
 def test_chunk_rtfs_use_each_delivered_chunks_duration() -> None:
@@ -44,14 +44,24 @@ def test_chunk_rtfs_use_each_delivered_chunks_duration() -> None:
         chunk_bytes=[_BPS // 10, _BPS // 5, _BPS // 20],
         sample_rate=_SR,
     )
-    assert rtfs == pytest.approx([0.5, 4.0])
+    assert rtfs == pytest.approx([0.0, 0.5, 4.0])
+
+
+def test_single_chunk_rtf_uses_request_start_as_origin() -> None:
+    rtfs = compute_chunk_rtfs(
+        chunk_arrival_times_s=[0.05],
+        chunk_bytes=[_BPS],
+        sample_rate=_SR,
+    )
+    assert rtfs == pytest.approx([0.05])
 
 
 @pytest.mark.parametrize(
     ("arrivals", "sizes", "sample_rate"),
     [
-        ([0.0], [_BPS], _SR),
+        ([], [], _SR),
         ([0.0, 0.1], [_BPS], _SR),
+        ([-0.1], [_BPS], _SR),
         ([0.1, 0.0], [_BPS, _BPS], _SR),
         ([0.0, 0.1], [_BPS, _BPS], 0),
     ],

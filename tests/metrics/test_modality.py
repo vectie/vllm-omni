@@ -346,6 +346,7 @@ class TestObserveAudioStreamingFinalize:
         assert chunk_rtf_calls == [
             ("observe_audio_chunk_rtf", "1", "0", pytest.approx(1.0)),
             ("observe_audio_chunk_rtf", "1", "0", pytest.approx(1.0)),
+            ("observe_audio_chunk_rtf", "1", "0", pytest.approx(1.0)),
         ]
 
     def test_late_chunk_emits_nonzero_underrun_and_no_continuity_inc(self):

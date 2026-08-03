@@ -209,8 +209,11 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 ```
 
 Use `vllm bench serve --percentile-metrics audio_ttfp,audio_rtf,audio_chunk_rtf`
-to compare runs. `audio_chunk_rtf` measures every post-TTFP delivery interval
-against that chunk's playable duration; values below 1 keep pace with realtime.
+to compare runs. `audio_chunk_rtf` measures every chunk's delivery interval
+against its playable duration; for the first chunk the interval is request
+start to TTFP. Values below 1 keep pace with realtime. Saved results
+include each request's raw `audio_ttfps` and `audio_chunk_rtfs` arrays as well
+as the aggregate percentiles.
 Smaller steady chunks can improve delivery cadence but increase Code2Wav
 invocation and transfer overhead. Start by sweeping only the initial chunk
 (for example 8, 12, 16, then 25 as the baseline), then sweep the steady chunk

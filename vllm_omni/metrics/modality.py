@@ -55,7 +55,7 @@ _audio_rtf_family = Histogram(
 )
 _audio_chunk_rtf_family = Histogram(
     defs.AUDIO_CHUNK_RTF_METRIC,
-    "Per-audio-chunk delivery RTF (inter-arrival time / playable chunk duration); excludes the first chunk.",
+    "Per-audio-chunk delivery RTF (delivery interval / playable chunk duration); first interval is TTFP.",
     labelnames=_stage_labels,
     buckets=defs.RTF_BUCKETS,
 )

@@ -439,8 +439,8 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_duration: float = 0.0
     audio_frames: int = 0
     audio_rtf: float = 0.0
-    #: Delivery-cadence RTF for every audio chunk after the first. The first
-    #: interval is represented by audio_ttfp instead.
+    #: Delivery RTF for every audio chunk. The first uses request start to
+    #: first packet; later chunks use consecutive packet arrival intervals.
     audio_chunk_rtfs: list[float] = field(default_factory=list)
     image_count: int = 0
     image_generation_time_ms: float = 0.0
@@ -1641,6 +1641,8 @@ async def benchmark(
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
             "ttfts": [output.ttft for output in outputs],
+            "audio_ttfps": [output.audio_ttfp for output in outputs],
+            "audio_chunk_rtfs": [output.audio_chunk_rtfs for output in outputs],
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],

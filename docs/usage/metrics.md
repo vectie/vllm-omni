@@ -44,7 +44,7 @@ Emitted at request finalize, except for `audio_ttfp_s` (streaming-hook at the fi
 | `vllm:omni_audio_ttfp_s` | Histogram | — | Time from request arrival to first audio packet/frame |
 | `vllm:omni_audio_duration_s` | Histogram | — | Audio content duration (`audio_frames / sample_rate`) |
 | `vllm:omni_audio_rtf` | Histogram | — | Real-time factor (`stage_gen_time_s / audio_duration_s`); streaming TTS SLO red line `< 1`; uses `RTF_BUCKETS` |
-| `vllm:omni_audio_chunk_rtf` | Histogram | — | Per-chunk delivery cadence (`inter-arrival time / playable chunk duration`), excluding the first chunk because it is measured by TTFP; `< 1` means faster than realtime; uses `RTF_BUCKETS` |
+| `vllm:omni_audio_chunk_rtf` | Histogram | — | Per-chunk delivery RTF (`delivery interval / playable chunk duration`); the first interval is request start to TTFP and later intervals are packet-to-packet; `< 1` means faster than realtime; uses `RTF_BUCKETS` |
 | `vllm:omni_audio_frames_total` | Counter | — | Cumulative audio frame count; throughput via `rate()` |
 | `vllm:omni_audio_underrun_s` | Histogram | — | Per-request worst-case player deficit; `> 0` indicates listener heard silent gaps |
 | `vllm:omni_audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when the request's worst underrun stayed below `threshold_ms` |
@@ -52,7 +52,7 @@ Emitted at request finalize, except for `audio_ttfp_s` (streaming-hook at the fi
 
 The continuity math comes from `vllm_omni/benchmarks/audio_continuity.py::compute_continuity_stats` so the server-side observation aligns with the bench-side definition.
 
-`vllm bench serve --percentile-metrics audio_chunk_rtf` reports the same delivery-cadence definition across all measured PCM/WAV chunks. Raw PCM speech streams and decoded WAV chunks are supported; compressed chunks are omitted because encoded byte length does not represent playable audio duration.
+`vllm bench serve --percentile-metrics audio_chunk_rtf` reports the same delivery definition across all measured PCM/WAV chunks. Saved results include raw `audio_ttfps` and per-request `audio_chunk_rtfs` arrays. Raw PCM speech streams and decoded WAV chunks are supported; compressed chunks are omitted because encoded byte length does not represent playable audio duration.
 
 ## Cross-Stage Transfer Metrics (`vllm:omni_`)
 

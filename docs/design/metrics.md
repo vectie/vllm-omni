@@ -176,7 +176,7 @@ Labels: `{model_name, stage, replica}` plus the listed extra label.
 | `vllm:omni_audio_ttfp_s` | Histogram | — | Time from request arrival to first audio packet/frame |
 | `vllm:omni_audio_duration_s` | Histogram | — | Audio content duration (`audio_frames / sample_rate`) |
 | `vllm:omni_audio_rtf` | Histogram | — | Real-time factor `stage_gen_time_s / audio_duration_s` (SLO `< 1`); uses `RTF_BUCKETS` |
-| `vllm:omni_audio_chunk_rtf` | Histogram | — | Per-chunk delivery cadence (`inter-arrival time / playable chunk duration`), excluding the first chunk; uses `RTF_BUCKETS` |
+| `vllm:omni_audio_chunk_rtf` | Histogram | — | Per-chunk delivery RTF (`delivery interval / playable chunk duration`); the first interval is TTFP and later intervals are packet-to-packet; uses `RTF_BUCKETS` |
 | `vllm:omni_audio_frames_total` | Counter | — | Cumulative audio frames generated |
 | `vllm:omni_audio_underrun_s` | Histogram | — | Per-request worst-case player deficit; `> 0` indicates listener heard silent gaps |
 | `vllm:omni_audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when the request's worst underrun stayed below `threshold_ms` |

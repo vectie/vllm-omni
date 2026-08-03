@@ -45,6 +45,9 @@ also provided.
   [`vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py`](../../vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py)
 - Upstream model card:
   [`openbmb/MiniCPM-o-4_5`](https://huggingface.co/openbmb/MiniCPM-o-4_5)
+- Ascend compatibility and A3 topology:
+  [vLLM-Ascend installation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html),
+  [vLLM-Ascend quick start](https://docs.vllm.ai/projects/ascend/en/latest/quick_start.html)
 - Integration PR:
   [vllm-project/vllm-omni#3642](https://github.com/vllm-project/vllm-omni/pull/3642)
 
@@ -69,6 +72,58 @@ reference-voice prompt features. `minicpmo_4_5.yaml` remains the stable
 single-GPU entry point; `minicpmo_4_5_2gpu.yaml` is the recommended
 two-GPU profile. The removed fused two-stage implementation is not retained as
 a fallback because it would duplicate state machines and correctness paths.
+
+## Ascend NPU / 910C qualification
+
+MiniCPM-o 4.5 is listed as supported on Ascend NPU and ships an NPU-aware
+Talker/Code2Wav adapter. The NPU platform overlay runs the Thinker and Talker
+with PIECEWISE ACL graphs while keeping the dynamic, request-owned Code2Wav
+stage eager.
+
+Treat a reported "910C" chip name as hardware discovery, not as the complete
+runtime selection. Confirm the server product and topology with `npu-smi info`.
+If it is an Atlas A3 product, use the A3 vLLM-Ascend image/software row and
+allocate at least two NPUs as required by the vLLM-Ascend A3 quick start. Keep
+vLLM, vLLM-Ascend, PyTorch, torch-npu, CANN, and NNAL on one documented
+compatibility row; for source builds, use the vLLM commit recorded by the
+checked-out vLLM-Ascend tree in `.github/vllm-main-verified.commit`.
+
+On a two-NPU host, start with the supplied split layout:
+
+```bash
+npu-smi info
+git -C /workspace/vllm-ascend rev-parse HEAD
+git -C /workspace/vllm-omni rev-parse HEAD
+
+VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES=25 \
+VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES=25 \
+VLLM_OMNI_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES=3 \
+VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS=10 \
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5_2gpu.yaml \
+    --trust-remote-code \
+    --allowed-local-media-path /data/benchmarks \
+    --interleave-mm-strings \
+    --host 0.0.0.0 --port 8099
+```
+
+The baseline intentionally preserves checkpoint-quality settings. Qualify one
+change at a time in this order: initial chunk (TTFP), steady chunk (per-chunk
+RTF), Code2Wav steps (RTF/quality), then concurrency and stage memory limits
+(TTFT/throughput). Run each candidate from a fresh server process so graph and
+prompt caches do not contaminate the comparison. Promote only candidates that:
+
+1. complete every request with no missing audio chunks or server errors;
+2. improve the target latency distribution over three repeated runs;
+3. keep Daily-Omni, Seed-TTS, and Video-MME evaluated counts identical to the
+   baseline; and
+4. pass the fail-closed two-percentage-point quality gate below.
+
+The vLLM-Ascend fork should remain model-agnostic until an NPU profiler trace
+attributes material time to a generic Ascend operator or graph/runtime path.
+MiniCPM codec policy, vocoder steps, and inter-stage chunking belong here in
+vLLM-Omni. This prevents unprofiled model-specific patches from leaking into
+the hardware plugin.
 
 ## GPU
 
@@ -191,6 +246,39 @@ Start the server with `--allowed-local-media-path /data/Video-MME/videos`, or
 add `--video-mme-inline-local-video` for small smoke runs. The saved JSON
 contains overall accuracy plus official duration, domain, sub-category, and
 task-type breakdowns.
+
+Run Daily-Omni with the MiniCPM interleaving protocol and Seed-TTS with content
+and speaker-similarity evaluation enabled:
+
+```bash
+vllm bench serve --omni \
+    --backend openai-chat-omni \
+    --endpoint /v1/chat/completions \
+    --model openbmb/MiniCPM-o-4_5 \
+    --dataset-name daily-omni \
+    --dataset-path liarliar/Daily-Omni \
+    --daily-omni-video-dir /data/benchmarks/Daily-Omni/Videos \
+    --daily-omni-input-mode all \
+    --daily-omni-pack-mode minicpm-interleave \
+    --num-prompts 1197 --max-concurrency 1 \
+    --percentile-metrics ttft,audio_ttfp,audio_rtf,audio_chunk_rtf \
+    --save-result --result-filename daily-omni.json
+
+vllm bench serve --omni \
+    --backend openai-chat-omni \
+    --endpoint /v1/chat/completions \
+    --model openbmb/MiniCPM-o-4_5 \
+    --dataset-name seed-tts \
+    --dataset-path /data/benchmarks/seed-tts-eval \
+    --seed-tts-wer-eval \
+    --num-prompts 1000 --max-concurrency 1 \
+    --percentile-metrics ttft,audio_ttfp,audio_rtf,audio_chunk_rtf \
+    --save-result --result-filename seed-tts.json
+```
+
+Use the official dataset size present in the selected Seed-TTS split if it is
+not 1000; the quality comparator requires the candidate to use the same count
+as its baseline.
 
 After producing baseline and candidate result files for each required suite,
 enforce the two-percentage-point rule with the fail-closed comparator:

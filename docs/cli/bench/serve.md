@@ -53,7 +53,7 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
         "Comma-separated list of selected metrics to report percentiles."
                     "This argument specifies the metrics to report percentiles."
                     'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
-                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
+                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_chunk_rtf", "audio_duration". '
 
 - `--print-stage`
 Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.

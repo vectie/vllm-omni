@@ -93,7 +93,9 @@ def test_update_omni_help_updates_upstream_actions() -> None:
     update_omni_help(parser)
 
     actions = {action.dest: action for action in parser._actions}
-    assert all(metric in actions["percentile_metrics"].help for metric in ("ttfc", "tpop", "audio_rtf"))
+    assert all(
+        metric in actions["percentile_metrics"].help for metric in ("ttfc", "tpop", "audio_rtf", "audio_chunk_rtf")
+    )
     assert "probabilities are renormalized" in actions["random_mm_limit_mm_per_prompt"].help
     assert "Currently allows for 3 modalities" in actions["random_mm_bucket_config"].help
 

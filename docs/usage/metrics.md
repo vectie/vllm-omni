@@ -52,6 +52,8 @@ Emitted at request finalize, except for `audio_ttfp_s` (streaming-hook at the fi
 
 The continuity math comes from `vllm_omni/benchmarks/audio_continuity.py::compute_continuity_stats` so the server-side observation aligns with the bench-side definition.
 
+`vllm bench serve --percentile-metrics audio_chunk_rtf` reports the same delivery-cadence definition across all measured PCM/WAV chunks. Raw PCM speech streams and decoded WAV chunks are supported; compressed chunks are omitted because encoded byte length does not represent playable audio duration.
+
 ## Cross-Stage Transfer Metrics (`vllm:omni_`)
 
 Per-physical-transfer histograms tracking the data hop between adjacent stages. Labels `{model_name, from_stage, from_replica, to_stage, to_replica}` let dashboards attribute latency to specific replica edges. `from_replica` / `to_replica` are resolved from the orchestrator's sticky-routing binding (`stage_pool.get_bound_replica_id(request_id)`), so no extra plumbing through `TransferEdgeStats` is needed.

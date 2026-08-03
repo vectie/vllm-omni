@@ -59,6 +59,7 @@ def _make_output(prompt_len: int, output_tokens: int = 10) -> MixRequestFuncOutp
     output.itl = [0.1] * max(output_tokens - 1, 0)
     output.audio_ttfp = 0.0
     output.audio_rtf = 0.0
+    output.audio_chunk_rtfs = []
     output.audio_duration = 0.0
     output.audio_frames = 0
     output.input_audio_duration = 0.0
@@ -126,6 +127,32 @@ def test_audio_continuity_aggregation():
     assert p99 is not None and p99 > 0.4
 
 
+def test_audio_chunk_rtf_aggregation_flattens_all_chunks():
+    """Chunk percentiles must weight individual chunks, not request averages."""
+    first = _make_output(100)
+    first.audio_chunk_rtfs = [0.5, 1.0]
+    second = _make_output(100)
+    second.audio_chunk_rtfs = [2.0]
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[first, second],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0, 99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_chunk_rtf"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    assert metrics.mean_audio_chunk_rtf == pytest.approx((0.5 + 1.0 + 2.0) / 3)
+    assert metrics.median_audio_chunk_rtf == pytest.approx(1.0)
+    assert dict(metrics.percentiles_audio_chunk_rtf)[99.0] > 1.9
+
+
 # ============================================================================
 # TTFT suppression for pure-audio (TTS) benchmarks
 # ============================================================================
@@ -161,6 +188,7 @@ def _make_tts_output(prompt_len: int) -> MixRequestFuncOutput:
     output.itl = []
     output.audio_ttfp = 0.05
     output.audio_rtf = 0.2
+    output.audio_chunk_rtfs = [0.3, 0.4]
     output.audio_duration = 5.0
     output.audio_frames = 120000
     output.input_audio_duration = 0.0
@@ -168,7 +196,14 @@ def _make_tts_output(prompt_len: int) -> MixRequestFuncOutput:
     return output
 
 
-_TTS_PERCENTILE_METRICS = ["ttft", "e2el", "audio_rtf", "audio_ttfp", "audio_duration"]
+_TTS_PERCENTILE_METRICS = [
+    "ttft",
+    "e2el",
+    "audio_rtf",
+    "audio_chunk_rtf",
+    "audio_ttfp",
+    "audio_duration",
+]
 
 
 def test_tts_benchmark_omits_ttft(capsys):
@@ -192,6 +227,7 @@ def test_tts_benchmark_omits_ttft(capsys):
     out = capsys.readouterr().out
     assert "Time to First Token" not in out, "TTS bench must not surface a meaningless TTFT"
     assert "Time to First Packet" in out, "audio TTFP must still be reported"
+    assert "Per-chunk Audio Delivery RTF" in out, "audio chunk RTF must be reported"
     assert "End-to-end Latency" in out, "e2el must still be reported"
 
 

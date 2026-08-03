@@ -11,7 +11,7 @@ import time
 import traceback
 import wave
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
@@ -35,7 +35,7 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
-from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
+from vllm_omni.benchmarks.audio_continuity import compute_chunk_rtfs, compute_continuity_stats
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
@@ -412,6 +412,9 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_duration: float = 0.0
     audio_frames: int = 0
     audio_rtf: float = 0.0
+    #: Delivery-cadence RTF for every audio chunk after the first. The first
+    #: interval is represented by audio_ttfp instead.
+    audio_chunk_rtfs: list[float] = field(default_factory=list)
     image_count: int = 0
     image_generation_time_ms: float = 0.0
     image_pixels: int = 0
@@ -733,6 +736,8 @@ async def async_request_openai_chat_omni_completions(
         wav_audio_params: tuple[int, int, int] | None = None
         wav_inconsistent_chunk_count = 0
         first_inconsistent_wav_params: tuple[int, int, int] | None = None
+        wav_chunk_arrival_times_s: list[float] = []
+        wav_chunk_pcm_sizes: list[int] = []
         # For non-wav responses, accumulate encoded bytes then decode once.
         audio_bytes_buffer = bytearray()
         st = time.perf_counter()
@@ -747,6 +752,7 @@ async def async_request_openai_chat_omni_completions(
         output.audio_duration = 0.0
         output.audio_frames = 0
         output.audio_rtf = 0.0
+        output.audio_chunk_rtfs = []
         output.text_latency = 0.0
         output.output_tokens = 0
         output.error = ""
@@ -846,9 +852,11 @@ async def async_request_openai_chat_omni_completions(
                                                             if first_inconsistent_wav_params is None:
                                                                 first_inconsistent_wav_params = params
                                                             continue
-                                                        wav_pcm_buffer.extend(
-                                                            wav_reader.readframes(wav_reader.getnframes())
-                                                        )
+                                                        pcm_chunk = wav_reader.readframes(wav_reader.getnframes())
+                                                        wav_pcm_buffer.extend(pcm_chunk)
+                                                        if pcm_chunk:
+                                                            wav_chunk_arrival_times_s.append(timestamp - st)
+                                                            wav_chunk_pcm_sizes.append(len(pcm_chunk))
                                                 except Exception as ex:
                                                     logger.warning("Failed to parse wav audio chunk: %s", ex)
                                             else:
@@ -931,6 +939,15 @@ async def async_request_openai_chat_omni_completions(
                         output.audio_frames = audio_frames
                         audio_duration = output.audio_duration
                         output.audio_rtf = defs.compute_audio_rtf(audio_generate_time, audio_duration)
+                        if response_format == "wav" and wav_audio_params is not None:
+                            channels, sample_width, frame_rate = wav_audio_params
+                            output.audio_chunk_rtfs = compute_chunk_rtfs(
+                                chunk_arrival_times_s=wav_chunk_arrival_times_s,
+                                chunk_bytes=wav_chunk_pcm_sizes,
+                                sample_rate=frame_rate,
+                                sample_width=sample_width,
+                                channels=channels,
+                            )
                         if audio_duration <= 0:
                             logger.warning("Audio duration is zero")
                         if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
@@ -1203,6 +1220,13 @@ async def async_request_openai_audio_speech(
                     float(total_samples) / float(sample_rate) if total_samples > 0 and sample_rate > 0 else 0.0
                 )
                 output.audio_rtf = defs.compute_audio_rtf(output.latency, output.audio_duration)
+                output.audio_chunk_rtfs = compute_chunk_rtfs(
+                    chunk_arrival_times_s=chunk_arrival_times_s,
+                    chunk_bytes=chunk_sizes,
+                    sample_rate=sample_rate,
+                    sample_width=sample_width,
+                    channels=channels,
+                )
                 if output.audio_duration <= 0:
                     logger.warning("Audio duration is zero")
 
@@ -1664,7 +1688,7 @@ async def benchmark(
         is_text_token_metric = not (metric_attribute_name == "e2el" or metric_attribute_name.startswith("audio"))
         if is_text_token_metric and getattr(metrics, "total_output", 0) == 0:
             return
-        is_audio_rtf = metric_attribute_name == defs.AUDIO_RTF
+        is_audio_rtf = metric_attribute_name in (defs.AUDIO_RTF, defs.AUDIO_CHUNK_RTF)
         is_audio_duration_or_underrun = metric_attribute_name in (defs.AUDIO_DURATION, defs.AUDIO_UNDERRUN)
 
         suffix = "_ms"

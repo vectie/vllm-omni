@@ -14,6 +14,7 @@ connectors:
       connector_get_max_wait: 300
       # Sweep without editing this file via
       # VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES and
+      # VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES and
       # VLLM_OMNI_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES.
       codec_chunk_frames: 25
       codec_left_context_frames: 3

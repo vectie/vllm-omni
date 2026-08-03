@@ -139,11 +139,14 @@ as one aggregated chunk, so the table reports Stage 0 metrics.
 #### Chunk-latency tuning
 
 The default Talker-to-Code2Wav window is 25 codec frames with 3 frames of
-left context. Controlled sweeps can override these values without editing the
-deploy YAML:
+left context. The first window defaults to the same 25 frames, but can be made
+smaller independently to reduce TTFP without forcing every later Code2Wav
+invocation to use the less efficient size. Controlled sweeps can override all
+three values without editing the deploy YAML:
 
 ```bash
-VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES=20 \
+VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES=8 \
+VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES=25 \
 VLLM_OMNI_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES=3 \
 vllm serve openbmb/MiniCPM-o-4_5 --omni \
     --trust-remote-code --host 0.0.0.0 --port 8099
@@ -152,10 +155,13 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
 Use `vllm bench serve --percentile-metrics audio_ttfp,audio_rtf,audio_chunk_rtf`
 to compare runs. `audio_chunk_rtf` measures every post-TTFP delivery interval
 against that chunk's playable duration; values below 1 keep pace with realtime.
-Smaller chunks can improve delivery cadence but increase Code2Wav invocation
-and transfer overhead. Keep the default as the baseline, change one variable at
-a time, and re-run the required audio-quality evaluation before promoting a
-setting. Chunk frames must be positive and left-context frames non-negative.
+Smaller steady chunks can improve delivery cadence but increase Code2Wav
+invocation and transfer overhead. Start by sweeping only the initial chunk
+(for example 8, 12, 16, then 25 as the baseline), then sweep the steady chunk
+only if per-chunk RTF remains above the target. Keep the default as the
+baseline, change one variable at a time, and re-run the required audio-quality
+evaluation before promoting a setting. Both chunk sizes must be positive and
+left-context frames non-negative.
 
 Video-MME is available as a native benchmark dataset. Download the licensed
 videos according to the official Video-MME instructions, place the MP4 files

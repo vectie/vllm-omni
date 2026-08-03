@@ -105,11 +105,32 @@ def test_codec_chunk_geometry_can_be_overridden_for_sweeps(monkeypatch) -> None:
     assert payload.meta.left_context_size == 1
 
 
+def test_initial_codec_chunk_can_be_smaller_than_steady_chunks(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "8")
+    manager = _manager()
+    request = _request("req")
+
+    assert tts2code2wav_async_chunk(manager, _delta(*range(7)), request, False) is None
+    first = tts2code2wav_async_chunk(manager, _delta(7), request, False)
+    assert first is not None
+    assert _codes(first) == [4218, 4218, 4218, *range(8)]
+    assert first.meta.codec_chunk_frames == 8
+
+    assert tts2code2wav_async_chunk(manager, _delta(*range(8, 32)), request, False) is None
+    steady = tts2code2wav_async_chunk(manager, _delta(32), request, False)
+    assert steady is not None
+    assert _codes(steady) == [5, 6, 7, *range(8, 33)]
+    assert steady.meta.codec_chunk_frames == 25
+    assert steady.meta.chunk_seq == 1
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
         ("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "0"),
         ("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "not-an-int"),
+        ("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "0"),
+        ("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "not-an-int"),
         ("VLLM_OMNI_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES", "-1"),
     ],
 )

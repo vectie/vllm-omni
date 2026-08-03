@@ -5,7 +5,7 @@ from typing import Any
 
 from vllm.benchmarks.serve import main_async
 
-# Import patch to register daily-omni dataset and omni backends
+# Import patch to register Omni datasets and backends
 # This monkey-patches vllm.benchmarks.datasets.get_samples before it's used
 # Must be imported before any vllm.benchmarks module usage
 import vllm_omni.benchmarks.patch.patch  # noqa: F401
@@ -23,6 +23,8 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["SEED_TTS_WER_SAVE_ITEMS"] = "1"
     if getattr(args, "daily_omni_save_eval_items", False):
         os.environ["DAILY_OMNI_SAVE_EVAL_ITEMS"] = "1"
+    if getattr(args, "video_mme_save_eval_items", False):
+        os.environ["VIDEO_MME_SAVE_EVAL_ITEMS"] = "1"
     set_print_stage(getattr(args, "print_stage", False))
     args.extra_body = maybe_enable_stage_metrics(
         getattr(args, "extra_body", None),

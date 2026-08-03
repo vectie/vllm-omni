@@ -157,6 +157,28 @@ and transfer overhead. Keep the default as the baseline, change one variable at
 a time, and re-run the required audio-quality evaluation before promoting a
 setting. Chunk frames must be positive and left-context frames non-negative.
 
+Video-MME is available as a native benchmark dataset. Download the licensed
+videos according to the official Video-MME instructions, place the MP4 files
+under one local directory using their `videoID` names, and run:
+
+```bash
+vllm bench serve --omni \
+    --backend openai-chat-omni \
+    --endpoint /v1/chat/completions \
+    --model openbmb/MiniCPM-o-4_5 \
+    --dataset-name video-mme \
+    --dataset-path lmms-lab/Video-MME \
+    --video-mme-video-dir /data/Video-MME/videos \
+    --num-prompts 2700 \
+    --max-concurrency 1 \
+    --save-result
+```
+
+Start the server with `--allowed-local-media-path /data/Video-MME/videos`, or
+add `--video-mme-inline-local-video` for small smoke runs. The saved JSON
+contains overall accuracy plus official duration, domain, sub-category, and
+task-type breakdowns.
+
 #### Verification
 
 **Quick smoke test (text-only output)**:

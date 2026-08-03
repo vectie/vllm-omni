@@ -47,6 +47,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.benchmarks.data_modules.video_mme_dataset import VideoMMEDataset, VideoMMESampleRequest
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.utils import coerce_positive_int_scalar
 
@@ -165,8 +166,8 @@ def _merge_extra_body_mm_kwargs(base: dict | None, overlay: dict | None) -> dict
 
 
 def _attach_daily_omni_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
-    """Apply per-request OpenAI fields (``mm_processor_kwargs``, messages) for Daily-Omni."""
-    if not isinstance(sample, DailyOmniSampleRequest):
+    """Apply per-request OpenAI fields for MCQ multimodal benchmarks."""
+    if not isinstance(sample, (DailyOmniSampleRequest, VideoMMESampleRequest)):
         return
     rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
     if sample.omni_chat_messages is not None:
@@ -226,6 +227,7 @@ def get_samples(args, tokenizer):
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
     )
+    is_video_mme = args.dataset_name == "video-mme"
     is_seed_tts = args.dataset_name in (
         "seed-tts",
         "seed-tts-text",
@@ -236,11 +238,36 @@ def get_samples(args, tokenizer):
 
     # Check if we need to handle omni-related backends/datasets
     is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni"]
-    is_omni_dataset = is_daily_omni or is_seed_tts or args.dataset_name == "random-mm"
+    is_omni_dataset = is_daily_omni or is_video_mme or is_seed_tts or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
         return get_samples_old(args, tokenizer)
+
+    if is_video_mme:
+        if args.backend not in ("openai-chat-omni", "video-mme"):
+            raise ValueError("Video-MME requires --backend openai-chat-omni")
+        dataset = VideoMMEDataset(
+            annotations_json=getattr(args, "video_mme_annotations_json", None),
+            dataset_path=getattr(args, "dataset_path", None) or VideoMMEDataset.DEFAULT_HF_DATASET_ID,
+            dataset_split=getattr(args, "hf_split", None) or "test",
+            dataset_subset=getattr(args, "hf_subset", None) or "videomme",
+            video_dir=getattr(args, "video_mme_video_dir", None),
+            duration=getattr(args, "video_mme_duration", "all"),
+            inline_local_video=getattr(args, "video_mme_inline_local_video", False),
+            random_seed=args.seed,
+            no_stream=getattr(args, "no_stream", False),
+            trust_remote_code=getattr(args, "trust_remote_code", False),
+            disable_shuffle=getattr(args, "disable_shuffle", False),
+        )
+        output_len = getattr(args, "output_len", None) or getattr(args, "hf_output_len", None)
+        return dataset.sample(
+            tokenizer=tokenizer,
+            num_requests=args.num_prompts,
+            output_len=output_len,
+            request_id_prefix=args.request_id_prefix,
+            no_oversample=args.no_oversample,
+        )
 
     # Handle Daily-Omni dataset
     if is_daily_omni:
@@ -1291,6 +1318,10 @@ ASYNC_REQUEST_FUNCS["daily-omni"] = async_request_openai_chat_omni_completions
 if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("daily-omni")
 
+ASYNC_REQUEST_FUNCS["video-mme"] = async_request_openai_chat_omni_completions
+if "video-mme" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("video-mme")
+
 # ruff: noqa: E402
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
@@ -1642,6 +1673,25 @@ async def benchmark(
     if _daily_acc is not None:
         result.update(_daily_acc)
         print_daily_omni_accuracy_summary(_daily_acc)
+
+    from vllm_omni.benchmarks.data_modules.video_mme_eval import (
+        compute_video_mme_accuracy_metrics,
+        print_video_mme_accuracy_summary,
+    )
+
+    _save_video_mme_items = os.environ.get("VIDEO_MME_SAVE_EVAL_ITEMS", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    _video_mme_acc = compute_video_mme_accuracy_metrics(
+        input_requests,
+        outputs,
+        include_per_item=_save_video_mme_items,
+    )
+    if _video_mme_acc is not None:
+        result.update(_video_mme_acc)
+        print_video_mme_accuracy_summary(_video_mme_acc)
 
     if _seed_tts_capture_pcm_for_wer():
         from vllm_omni.benchmarks.data_modules.seed_tts_eval import (

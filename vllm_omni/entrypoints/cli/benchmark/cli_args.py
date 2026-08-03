@@ -179,8 +179,45 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_video_mme_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add options for the official Video-MME multiple-choice benchmark."""
+    group = parser.add_argument_group("Video-MME Dataset Options")
+    group.add_argument(
+        "--video-mme-annotations-json",
+        type=str,
+        default=None,
+        help="Optional official-format local annotations JSON. If omitted, annotations are loaded from "
+        "lmms-lab/Video-MME via datasets.",
+    )
+    group.add_argument(
+        "--video-mme-video-dir",
+        type=str,
+        default=None,
+        help="Required local directory containing licensed Video-MME MP4 files, normally named by videoID.",
+    )
+    group.add_argument(
+        "--video-mme-duration",
+        choices=["all", "short", "medium", "long"],
+        default="all",
+        help="Restrict questions to an official Video-MME duration bucket.",
+    )
+    group.add_argument(
+        "--video-mme-inline-local-video",
+        action="store_true",
+        default=False,
+        help="Embed local MP4 files as data URLs instead of requiring --allowed-local-media-path on the server.",
+    )
+    group.add_argument(
+        "--video-mme-save-eval-items",
+        action="store_true",
+        default=False,
+        help="Store per-question gold/prediction rows in the benchmark result JSON.",
+    )
+
+
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
+    "video-mme",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -248,6 +285,7 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
+    add_video_mme_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)

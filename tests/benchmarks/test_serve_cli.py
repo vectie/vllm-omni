@@ -22,6 +22,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
     "dataset_name",
     [
         "daily-omni",
+        "video-mme",
         "seed-tts",
         "seed-tts-text",
         "seed-tts-design",
@@ -56,6 +57,7 @@ def test_extend_omni_choices_updates_tracking_parser_shadow(dataset_name: str) -
         (["--print-stage"], "print_stage", True),
         (["--daily-omni-input-mode", "audio"], "daily_omni_input_mode", "audio"),
         (["--seed-tts-locale", "zh"], "seed_tts_locale", "zh"),
+        (["--video-mme-duration", "short"], "video_mme_duration", "short"),
     ],
 )
 def test_add_omni_args_registers_arguments_on_tracking_parser(
@@ -81,6 +83,7 @@ def test_add_omni_args_preserves_implicit_defaults() -> None:
     assert args.print_stage is False
     assert args.daily_omni_input_mode == "all"
     assert args.seed_tts_locale == "en"
+    assert args.video_mme_duration == "all"
     assert args.explicit_keys == set()
 
 
@@ -98,6 +101,15 @@ def test_update_omni_help_updates_upstream_actions() -> None:
     )
     assert "probabilities are renormalized" in actions["random_mm_limit_mm_per_prompt"].help
     assert "Currently allows for 3 modalities" in actions["random_mm_bucket_config"].help
+
+
+def test_extend_omni_choices_adds_video_mme() -> None:
+    parser = TrackingArgumentParser()
+    parser.add_argument("--dataset-name", choices=["random"])
+    parser.add_argument("--backend", choices=["openai-chat-omni"])
+    extend_omni_choices(parser)
+    args = parser.parse_args(["--dataset-name", "video-mme", "--backend", "openai-chat-omni"])
+    assert args.dataset_name == "video-mme"
 
 
 @pytest.mark.parametrize(

@@ -30,7 +30,7 @@ def _sample_value(output: str, line_prefix: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Family registration — 7 audio families served from modality.py
+# Family registration — 8 audio families served from modality.py
 # ---------------------------------------------------------------------------
 
 
@@ -38,6 +38,7 @@ _EXPECTED_FAMILIES = [
     defs.AUDIO_TTFP_S,
     defs.AUDIO_DURATION_S,
     defs.AUDIO_RTF_METRIC,
+    defs.AUDIO_CHUNK_RTF_METRIC,
     defs.AUDIO_FRAMES_METRIC,
     defs.AUDIO_UNDERRUN_S,
     defs.AUDIO_CONTINUITY_OK_METRIC,
@@ -51,6 +52,7 @@ class TestRegistration:
         mod.observe_audio_ttfp("s", "r", 0.1)
         mod.observe_audio_duration("s", "r", 1.0)
         mod.observe_audio_rtf("s", "r", 0.5)
+        mod.observe_audio_chunk_rtf("s", "r", 0.5)
         mod.inc_audio_frames("s", "r", 1)
         mod.observe_audio_underrun("s", "r", 0.01)
         mod.inc_audio_continuity_ok("s", "r", 100)
@@ -87,6 +89,13 @@ class TestAudio:
         out = generate_latest(REGISTRY).decode()
         prefix = f'{defs.AUDIO_RTF_METRIC}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
         assert _sample_value(out, prefix) == 0.45
+
+    def test_audio_chunk_rtf_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "talker_chunk_rtf", "0"
+        mod.observe_audio_chunk_rtf(stage, replica, 0.75)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.AUDIO_CHUNK_RTF_METRIC}_sum{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == 0.75
 
     def test_audio_frames_inc(self, mod: OmniModalityMetrics) -> None:
         stage, replica = "talker_frames", "0"
@@ -173,6 +182,9 @@ class _StubModMetrics:
 
     def observe_audio_rtf(self, s, r, rtf):
         self.calls.append(("observe_audio_rtf", s, r, rtf))
+
+    def observe_audio_chunk_rtf(self, s, r, rtf):
+        self.calls.append(("observe_audio_chunk_rtf", s, r, rtf))
 
     def observe_audio_underrun(self, s, r, u):
         self.calls.append(("observe_audio_underrun", s, r, u))
@@ -330,6 +342,11 @@ class TestObserveAudioStreamingFinalize:
         # 0 underrun -> observe with 0.0, continuity_ok incremented at threshold 100.
         assert ("observe_audio_underrun", "1", "0", 0.0) in stub.calls
         assert ("inc_audio_continuity_ok", "1", "0", 100) in stub.calls
+        chunk_rtf_calls = [c for c in stub.calls if c[0] == "observe_audio_chunk_rtf"]
+        assert chunk_rtf_calls == [
+            ("observe_audio_chunk_rtf", "1", "0", pytest.approx(1.0)),
+            ("observe_audio_chunk_rtf", "1", "0", pytest.approx(1.0)),
+        ]
 
     def test_late_chunk_emits_nonzero_underrun_and_no_continuity_inc(self):
         stub = _StubModMetrics()
@@ -382,6 +399,13 @@ class TestBucketSelection:
         out = generate_latest(REGISTRY).decode()
         rtf_marker = f'{defs.AUDIO_RTF_METRIC}_bucket{{le="0.9"'
         assert rtf_marker in out, "audio_rtf should use RTF_BUCKETS containing le=0.9"
+
+    def test_audio_chunk_rtf_uses_rtf_buckets(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "talker_chunk_buckets", "0"
+        mod.observe_audio_chunk_rtf(stage, replica, 0.5)
+        out = generate_latest(REGISTRY).decode()
+        rtf_marker = f'{defs.AUDIO_CHUNK_RTF_METRIC}_bucket{{le="0.9"'
+        assert rtf_marker in out, "audio_chunk_rtf should use RTF_BUCKETS containing le=0.9"
 
     def test_audio_ttfp_uses_seconds_buckets(self, mod: OmniModalityMetrics) -> None:
         stage, replica = "talker_seconds", "0"

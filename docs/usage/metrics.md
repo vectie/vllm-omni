@@ -37,13 +37,14 @@ Defined in `vllm_omni/metrics/prometheus.py`. Track request lifecycle across the
 
 ## Audio Modality Metrics (`vllm:omni_`)
 
-Emitted at request finalize, except for `audio_ttfp_s` (streaming-hook at the first audio packet) and `audio_underrun_s` / `audio_continuity_ok_total` (streaming finalize, after the chunk stream is exhausted). All carry `{model_name, stage, replica}` plus the listed extra label.
+Emitted at request finalize, except for `audio_ttfp_s` (streaming-hook at the first audio packet) and `audio_chunk_rtf` / `audio_underrun_s` / `audio_continuity_ok_total` (streaming finalize, after the chunk stream is exhausted). All carry `{model_name, stage, replica}` plus the listed extra label.
 
 | Metric | Type | Extra label | Description |
 |--------|------|-------------|-------------|
 | `vllm:omni_audio_ttfp_s` | Histogram | — | Time from request arrival to first audio packet/frame |
 | `vllm:omni_audio_duration_s` | Histogram | — | Audio content duration (`audio_frames / sample_rate`) |
 | `vllm:omni_audio_rtf` | Histogram | — | Real-time factor (`stage_gen_time_s / audio_duration_s`); streaming TTS SLO red line `< 1`; uses `RTF_BUCKETS` |
+| `vllm:omni_audio_chunk_rtf` | Histogram | — | Per-chunk delivery cadence (`inter-arrival time / playable chunk duration`), excluding the first chunk because it is measured by TTFP; `< 1` means faster than realtime; uses `RTF_BUCKETS` |
 | `vllm:omni_audio_frames_total` | Counter | — | Cumulative audio frame count; throughput via `rate()` |
 | `vllm:omni_audio_underrun_s` | Histogram | — | Per-request worst-case player deficit; `> 0` indicates listener heard silent gaps |
 | `vllm:omni_audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when the request's worst underrun stayed below `threshold_ms` |

@@ -36,6 +36,45 @@ class ContinuityStats:
     is_continuous: bool
 
 
+def compute_chunk_rtfs(
+    chunk_arrival_times_s: list[float],
+    chunk_bytes: list[int],
+    sample_rate: int,
+    sample_width: int = 2,
+    channels: int = 1,
+) -> list[float]:
+    """Compute delivery-cadence RTF for every chunk after the first.
+
+    A chunk's delivery RTF is its wall-clock inter-arrival interval divided
+    by the playable duration carried by that chunk. Values below one mean the
+    stream is delivering audio faster than realtime. The first chunk is
+    intentionally excluded because its interval is TTFP, which has a separate
+    metric.
+
+    Invalid PCM parameters, mismatched timelines, and non-monotonic arrival
+    timestamps return no samples rather than publishing misleading values.
+    Empty chunks are skipped.
+    """
+    n = len(chunk_arrival_times_s)
+    if n < 2 or n != len(chunk_bytes):
+        return []
+
+    bytes_per_s = sample_rate * sample_width * channels
+    if bytes_per_s <= 0:
+        return []
+    if any(current < previous for previous, current in zip(chunk_arrival_times_s, chunk_arrival_times_s[1:])):
+        return []
+
+    chunk_rtfs: list[float] = []
+    for i in range(1, n):
+        duration_s = chunk_bytes[i] / bytes_per_s
+        if duration_s <= 0:
+            continue
+        inter_arrival_s = chunk_arrival_times_s[i] - chunk_arrival_times_s[i - 1]
+        chunk_rtfs.append(inter_arrival_s / duration_s)
+    return chunk_rtfs
+
+
 def compute_continuity_stats(
     chunk_arrival_times_s: list[float],
     chunk_bytes: list[int],

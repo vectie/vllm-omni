@@ -1,6 +1,6 @@
 """OmniModalityMetrics — per-modality Prometheus families (audio path only).
 
-7 audio business-semantic metric families. Text-path metrics (TTFT / ITL /
+8 audio business-semantic metric families. Text-path metrics (TTFT / ITL /
 TPOT / e2e) are NOT here — they come from the upstream
 ``vllm:*{stage="thinker", ...}`` families exposed via the
 ``OmniPrometheusStatLogger`` wrap.
@@ -13,8 +13,8 @@ Contents:
 - ``observe_audio_first_packet``: TTFP emit from the streaming SSE first
   audio packet.
 - ``observe_audio_streaming_finalize``: emits ``audio_underrun_s`` +
-  ``audio_continuity_ok_total`` at SSE close using accumulated per-chunk
-  arrival timestamps.
+  ``audio_continuity_ok_total`` and per-chunk delivery RTF at SSE close using
+  accumulated per-chunk arrival timestamps.
 - ``extract_mm_output`` / ``count_audio_frames`` (from ``metrics.utils``):
   shape-tolerant helpers for the heterogeneous multimodal_output payloads
   emitted by different audio pipelines.
@@ -50,6 +50,12 @@ _audio_duration_family = Histogram(
 _audio_rtf_family = Histogram(
     defs.AUDIO_RTF_METRIC,
     "Audio real-time factor (stage_gen_time_s / audio_duration_s); streaming TTS requires < 1.",
+    labelnames=_stage_labels,
+    buckets=defs.RTF_BUCKETS,
+)
+_audio_chunk_rtf_family = Histogram(
+    defs.AUDIO_CHUNK_RTF_METRIC,
+    "Per-audio-chunk delivery RTF (inter-arrival time / playable chunk duration); excludes the first chunk.",
     labelnames=_stage_labels,
     buckets=defs.RTF_BUCKETS,
 )
@@ -106,6 +112,11 @@ class OmniModalityMetrics:
         if not self._log_stats:
             return
         _audio_rtf_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(rtf)
+
+    def observe_audio_chunk_rtf(self, stage: str, replica: str, rtf: float) -> None:
+        if not self._log_stats:
+            return
+        _audio_chunk_rtf_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(rtf)
 
     def inc_audio_frames(self, stage: str, replica: str, n_frames: int) -> None:
         if not self._log_stats or n_frames <= 0:
@@ -232,7 +243,7 @@ def observe_audio_streaming_finalize(
     sample_rate: int,
     threshold_s: float = defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S,
 ) -> None:
-    """Emit audio_underrun_s + audio_continuity_ok_total at request end.
+    """Emit per-chunk RTF and continuity metrics at request end.
 
     Reuses the math from ``vllm_omni.benchmarks.audio_continuity`` so the
     server-side and bench-side definitions stay aligned. Caller is responsible
@@ -242,7 +253,7 @@ def observe_audio_streaming_finalize(
     if replica_id is None or not chunk_arrival_times_s:
         return
     # Local import to keep the bench module optional at import time.
-    from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
+    from vllm_omni.benchmarks.audio_continuity import compute_chunk_rtfs, compute_continuity_stats
 
     stats = compute_continuity_stats(
         chunk_arrival_times_s=chunk_arrival_times_s,
@@ -252,6 +263,12 @@ def observe_audio_streaming_finalize(
     )
     stage_label = str(stage_id)
     replica_label = str(replica_id)
+    for chunk_rtf in compute_chunk_rtfs(
+        chunk_arrival_times_s=chunk_arrival_times_s,
+        chunk_bytes=chunk_bytes,
+        sample_rate=sample_rate,
+    ):
+        mod_metrics.observe_audio_chunk_rtf(stage_label, replica_label, chunk_rtf)
     mod_metrics.observe_audio_underrun(stage_label, replica_label, stats.max_underrun_s)
     if stats.is_continuous:
         mod_metrics.inc_audio_continuity_ok(stage_label, replica_label, int(threshold_s * 1000))

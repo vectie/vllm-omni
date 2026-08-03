@@ -15,6 +15,7 @@ import pytest
 
 from vllm_omni.benchmarks.audio_continuity import (
     ContinuityStats,
+    compute_chunk_rtfs,
     compute_continuity_stats,
 )
 
@@ -24,6 +25,39 @@ pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 # PCM s16le mono at 24 kHz -> 48 000 bytes/sec, the Qwen3-TTS / VoxCPM2 default.
 _SR = 24_000
 _BPS = _SR * 2  # 48 000
+
+
+def test_chunk_rtfs_measure_delivery_cadence_and_exclude_ttfp() -> None:
+    # Each emitted chunk carries 100 ms of audio. TTFP is 2 s but excluded;
+    # the following 50 ms and 200 ms gaps therefore yield RTFs 0.5 and 2.0.
+    rtfs = compute_chunk_rtfs(
+        chunk_arrival_times_s=[2.0, 2.05, 2.25],
+        chunk_bytes=[_BPS // 10] * 3,
+        sample_rate=_SR,
+    )
+    assert rtfs == pytest.approx([0.5, 2.0])
+
+
+def test_chunk_rtfs_use_each_delivered_chunks_duration() -> None:
+    rtfs = compute_chunk_rtfs(
+        chunk_arrival_times_s=[0.0, 0.1, 0.3],
+        chunk_bytes=[_BPS // 10, _BPS // 5, _BPS // 20],
+        sample_rate=_SR,
+    )
+    assert rtfs == pytest.approx([0.5, 4.0])
+
+
+@pytest.mark.parametrize(
+    ("arrivals", "sizes", "sample_rate"),
+    [
+        ([0.0], [_BPS], _SR),
+        ([0.0, 0.1], [_BPS], _SR),
+        ([0.1, 0.0], [_BPS, _BPS], _SR),
+        ([0.0, 0.1], [_BPS, _BPS], 0),
+    ],
+)
+def test_chunk_rtfs_reject_invalid_timelines(arrivals, sizes, sample_rate) -> None:
+    assert compute_chunk_rtfs(arrivals, sizes, sample_rate) == []
 
 
 def test_empty_timeline_is_continuous() -> None:

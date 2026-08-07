@@ -1405,7 +1405,9 @@ def test_minicpmo_stage0_final_does_not_promote_first_chunk_alignment_tail_to_un
     assert len(state.audio_buffer) == 1
 
 
-def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_embeddings_is_broken():
+def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_embeddings_is_broken(
+    monkeypatch,
+):
     import torch
 
     from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
@@ -1436,10 +1438,13 @@ def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_em
     runtime.stage_model = stage_model
     runtime.thinker = thinker
     runtime.device = "cpu"
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CACHE_CONTROL_EMBEDDINGS", "1")
 
     embeds = runtime._embed_token(11)
+    cached_embeds = runtime._embed_token(11)
 
     assert embeds.shape == (1, 2)
+    assert cached_embeds is embeds
     assert thinker.llm.model.embed_tokens.calls == [[11]]
 
 

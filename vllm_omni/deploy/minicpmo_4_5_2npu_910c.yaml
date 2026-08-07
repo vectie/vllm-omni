@@ -1,0 +1,47 @@
+# Atlas 800I A3 / Ascend 910C optimization candidate.
+#
+# Safe semantic-preserving changes are enabled here. The CFM graph and
+# host-sync relaxation remain environment-gated because they require an A3
+# correctness trace before becoming production defaults:
+#
+#   VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH=1
+#   VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND=auto
+#   VLLM_OMNI_NPU_SYNC_BEFORE_DEVICE_EVENT=0   # TP1 only, validate first
+#
+# Profiling runs should additionally use:
+#
+#   VLLM_OMNI_NPU_PROFILER_AIC_METRICS=PipeUtilization
+#   VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
+
+base_config: minicpmo_4_5_2gpu.yaml
+pipeline: minicpmo_4_5
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      # Top-level connector blocks replace the inherited block, so retain the
+      # production-shaped retry and codec geometry explicitly.
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      raw_tensor_shm: true
+      shm_event_notifications: true
+      # Use a unique value when multiple services share one host.
+      shm_notification_namespace: minicpmo45-910c
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_capture_sizes: [1, 2, 4]
+      - stage_id: 1
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_capture_sizes: [1, 2, 4]

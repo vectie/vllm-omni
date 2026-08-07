@@ -77,3 +77,23 @@ class TestNPUOmniPlatformRecordDeviceEvent:
         mock_torch.npu.Event.assert_called_once()
         mock_event.record.assert_called_once()
         assert result is mock_event
+
+    def test_can_record_event_without_host_sync(self, mocker, monkeypatch):
+        try:
+            from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+        except ModuleNotFoundError:
+            pytest.skip("vllm_ascend not available")
+
+        monkeypatch.setenv("VLLM_OMNI_NPU_SYNC_BEFORE_DEVICE_EVENT", "0")
+        mock_event = mocker.MagicMock()
+        mock_stream = mocker.MagicMock()
+        mock_torch = mocker.MagicMock()
+        mock_torch.npu.current_stream.return_value = mock_stream
+        mock_torch.npu.Event.return_value = mock_event
+        mocker.patch("vllm_omni.platforms.npu.platform.torch", mock_torch)
+
+        result = NPUOmniPlatform.record_device_event()
+
+        mock_stream.synchronize.assert_not_called()
+        mock_event.record.assert_called_once()
+        assert result is mock_event

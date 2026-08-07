@@ -76,11 +76,22 @@ class OmniTransferAdapterBase:
                     logger.warning(f"Error receiving data for {request_id}: {e}")
 
             # Timeout is the fallback for lock-free append/notify races.
-            with self._recv_cond:
-                if not self._pending_load_reqs and not self.stop_event.is_set():
+            if not self._pending_load_reqs and not self.stop_event.is_set():
+                with self._recv_cond:
                     self._recv_cond.wait(timeout=0.1)
-                elif not any_success and not self.stop_event.is_set():
-                    self._recv_cond.wait(timeout=0.001)
+            elif not any_success and not self.stop_event.is_set():
+                wait_for_data = getattr(self.connector, "wait_for_data", None)
+                notifications_enabled = bool(getattr(self.connector, "event_notifications_enabled", False))
+                if notifications_enabled and callable(wait_for_data):
+                    # Do not hold _recv_cond while blocking in select: a local
+                    # load_async() notification must be able to wake promptly.
+                    wait_for_data(timeout=0.001)
+                else:
+                    # SharedMemoryConnector exposes wait_for_data even when
+                    # its optional socket is disabled. Retain the bounded
+                    # fallback instead of turning that case into a tight loop.
+                    with self._recv_cond:
+                        self._recv_cond.wait(timeout=0.001)
 
     def save_loop(self):
         """Loop to send outgoing data."""

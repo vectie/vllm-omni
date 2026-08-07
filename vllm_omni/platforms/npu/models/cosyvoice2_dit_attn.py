@@ -17,8 +17,9 @@ This module:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +28,8 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _PATCHED = False
+_FUSED_SDPA_AVAILABLE: bool | None = None
+_SDPA_BACKEND_ENV = "VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND"
 
 
 def _expand_attn_mask_for_npu(
@@ -62,7 +65,7 @@ def _patched_attention_forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -
     k = self.k_norm(k)
 
     attn_mask = _expand_attn_mask_for_npu(attn_mask, q_len=t, kv_len=t)
-    x = F.scaled_dot_product_attention(
+    x = _npu_sdpa(
         q,
         k,
         v,
@@ -99,7 +102,7 @@ def _patched_attention_forward_chunk(
     kv_len = k.shape[2]
     if attn_mask is not None:
         attn_mask = _expand_attn_mask_for_npu(attn_mask, q_len=t, kv_len=kv_len)
-    x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    x = _npu_sdpa(q, k, v, attn_mask=attn_mask)
     x = x.transpose(1, 2).reshape(b, t, -1)
     x = self.proj(x)
     x = self.proj_drop(x)
@@ -111,13 +114,51 @@ def npu_math_sdpa_context() -> Iterator[None]:
     """Force SDPA MATH backend so Ascend does not call fused FA."""
     try:
         from torch.nn.attention import SDPBackend, sdpa_kernel
-
-        with sdpa_kernel(SDPBackend.MATH):
-            yield
-    except Exception:
+    except (AttributeError, ImportError):
         # Older torch / missing backend enum — just run as-is.
-        with nullcontext():
-            yield
+        yield
+        return
+
+    # Keep the caller's model exception outside the fallback handler. A broad
+    # try/except around ``yield`` can attempt to yield twice while unwinding,
+    # hiding the real NPU failure behind "generator didn't stop after throw".
+    with sdpa_kernel(SDPBackend.MATH):
+        yield
+
+
+def _npu_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    attn_mask: torch.Tensor | None,
+    dropout_p: float = 0.0,
+) -> torch.Tensor:
+    """Use Ascend fused SDPA when supported, with a sticky MATH fallback.
+
+    Older CANN stacks rejected CosyVoice's key-padding mask with ACL 161001.
+    The adapter now expands that mask to a documented FA-compatible shape, so
+    current stacks get one fused probe. A failure is remembered to avoid an
+    exception/retry on every diffusion block and chunk.
+    """
+    global _FUSED_SDPA_AVAILABLE
+    policy = os.environ.get(_SDPA_BACKEND_ENV, "auto").strip().lower()
+    if policy not in {"auto", "fused", "math"}:
+        raise ValueError(f"Invalid {_SDPA_BACKEND_ENV}={policy!r}; expected auto, fused, or math")
+    if policy == "math" or (policy == "auto" and _FUSED_SDPA_AVAILABLE is False):
+        with npu_math_sdpa_context():
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+    try:
+        output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        _FUSED_SDPA_AVAILABLE = True
+        return output
+    except RuntimeError:
+        if policy == "fused":
+            raise
+        _FUSED_SDPA_AVAILABLE = False
+        logger.warning("Ascend fused SDPA probe failed; using sticky MATH fallback", exc_info=True)
+        with npu_math_sdpa_context():
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
 
 
 def _disable_upsample_encoder_compile() -> None:

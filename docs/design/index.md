@@ -5,6 +5,7 @@ This section contains design documents and architecture specifications for vLLM-
 ## Architecture Documents
 
 - [Architecture Overview](architecture_overview.md)
+- [MiniCPM-o 4.5 streaming optimization on Ascend 910C](minicpmo_4_5_ascend_910c_optimization.md)
 
 ## Feature Design Documents
 

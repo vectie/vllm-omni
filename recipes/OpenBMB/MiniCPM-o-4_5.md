@@ -35,6 +35,8 @@ also provided.
     [`vllm_omni/deploy/minicpmo_4_5_3gpu.yaml`](../../vllm_omni/deploy/minicpmo_4_5_3gpu.yaml)
   - Development-only 2-NPU profiler overlay:
     [`vllm_omni/deploy/minicpmo_4_5_2npu_profile.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2npu_profile.yaml)
+  - Atlas A3 / Ascend 910C 2-NPU candidate overlay:
+    [`vllm_omni/deploy/minicpmo_4_5_2npu_910c.yaml`](../../vllm_omni/deploy/minicpmo_4_5_2npu_910c.yaml)
   - 8x RTX 4090 layout:
     [`vllm_omni/deploy/minicpmo_4_5_8x4090.yaml`](../../vllm_omni/deploy/minicpmo_4_5_8x4090.yaml)
 - Online example + Gradio demo:
@@ -50,6 +52,8 @@ also provided.
 - Ascend compatibility and A3 topology:
   [vLLM-Ascend installation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html),
   [vLLM-Ascend quick start](https://docs.vllm.ai/projects/ascend/en/latest/quick_start.html)
+- Performance architecture and 910C promotion gates:
+  [MiniCPM-o 4.5 streaming optimization on Ascend 910C](../../docs/design/minicpmo_4_5_ascend_910c_optimization.md)
 - Integration PR:
   [vllm-project/vllm-omni#3642](https://github.com/vllm-project/vllm-omni/pull/3642)
 
@@ -64,6 +68,7 @@ Code2Wav consumes them through a shared-memory async connector.
 | 1-GPU (default) | GPU 0 | GPU 0 | GPU 0 | 1x large-memory GPU |
 | 2-GPU | GPU 0 | GPU 1 | GPU 1 | 2x large-memory GPU |
 | 3-GPU | GPU 0 | GPU 1 | GPU 2 | 3x GPU |
+| 2-NPU candidate | NPU 0 | NPU 1 | NPU 1 | Atlas A3 / 2x Ascend 910C |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
 
 ### Migration from the fused deployment
@@ -102,7 +107,7 @@ VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES=25 \
 VLLM_OMNI_MINICPMO45_CODEC_LEFT_CONTEXT_FRAMES=3 \
 VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS=10 \
 vllm serve openbmb/MiniCPM-o-4_5 --omni \
-    --deploy-config vllm_omni/deploy/minicpmo_4_5_2gpu.yaml \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5_2npu_910c.yaml \
     --trust-remote-code \
     --allowed-local-media-path /data/benchmarks \
     --interleave-mm-strings \
@@ -136,9 +141,9 @@ mechanism is implemented, but its winning value must be measured on the target
 | Optimization | Current decision | Owner / promotion evidence |
 | --- | --- | --- |
 | Thinker, Talker, Code2Wav stage isolation | Shipped; retain the three-stage topology | vLLM-Omni; end-to-end correctness and stage metrics |
-| Local inter-stage transfer | Shipped with async shared memory; do not add serialization | vLLM-Omni; transfer metrics and profiler trace |
+| Local inter-stage transfer | Async SHM shipped; raw-tensor header/buffer format and event wakeup are opt-in 910C candidates | vLLM-Omni; transfer metrics, CPU utilization, and profiler trace |
 | Thinker/Talker graph execution on NPU | Shipped as PIECEWISE ACL graph mode | vLLM-Omni platform overlay; 910C startup and accuracy gates |
-| Code2Wav graph/compile | Keep eager for request-owned Flow/HiFT caches and variable shapes | Revisit only after a trace identifies stable exact-shape regions |
+| Code2Wav graph/compile | Eager default; exact-shape CFM graph replay is implemented behind `VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH=1` | Long-session cache correctness, trace attribution, and all quality gates |
 | Initial codec chunk | Remote gate: sweep 8/12/16 against 25 | vLLM-Omni policy; TTFP target plus RTF/quality guards |
 | Steady codec chunk | Remote gate after initial chunk settles | vLLM-Omni policy; per-chunk RTF target plus TTFP/quality guards |
 | Code2Wav diffusion steps | Remote gate: sweep 8/6 against 10 | vLLM-Omni policy; RTF target plus official Seed-TTS quality |
@@ -146,6 +151,40 @@ mechanism is implemented, but its winning value must be measured on the target
 | Prefix/Radix caching | Do not enable for this pipeline yet | Requires proof that request-owned audio state and multimodal keys are safe |
 | Async compute/transfer overlap and dedicated NPU streams | Profiler-triggered, not speculative | vLLM-Ascend only when the bottleneck is generic across models |
 | Ascend operator/kernel changes | Profiler-triggered, model-agnostic only | vLLM-Ascend trace, operator table, and cross-model regression evidence |
+
+The native-duplex Stage 0 already preserves a resumable request and its
+scheduler-owned KV state across audio appends. Do not introduce a second
+session abstraction. Append-only validation, TTL/reaping, cancellation,
+pending-input limits, and max-session admission already exist. The next
+multi-session production boundary is fair scheduling and explicit metrics for
+session-held KV memory. The full
+mechanism-level rationale—including the performance ideas extracted from
+Thinking Machines' work and the SGLang streaming-session implementation—is in
+the [910C optimization design](../../docs/design/minicpmo_4_5_ascend_910c_optimization.md).
+
+### Deterministic shadow comparison
+
+For qualification runs, capture exact audio fingerprints in saved benchmark
+JSON without retaining production audio:
+
+```bash
+VLLM_OMNI_BENCH_CAPTURE_OUTPUT_HASHES=1 \
+vllm bench serve --omni ... --save-result
+```
+
+Compare the same prompts and seed across concurrency, graph, and chunking modes:
+
+```bash
+python -m vllm_omni.benchmarks.determinism_gate \
+  baseline.json candidate.json \
+  --field generated_texts \
+  --field audio_content_sha256s \
+  --field audio_chunk_sha256s \
+  --report-json determinism-report.json
+```
+
+This gate is exact and fail-closed. It supplements rather than replaces the
+Daily-Omni, TTS-Seed, and Video-MME two-percentage-point quality gate.
 
 This incorporates the useful SGLang/SGLang-Omni ideas—independent stage
 scheduling, continuous batching, direct local transfer, and overlapping

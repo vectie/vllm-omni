@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import os
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -325,10 +326,30 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _embed_token(self, token_id: int) -> Any:
         import torch
 
+        # Streaming appends repeatedly inject the same small set of control
+        # tokens. Keep their embeddings accelerator-resident so a 200 ms turn
+        # does not pay one tiny embedding launch per delimiter. This is opt-in:
+        # dynamic LoRA/adapters can change embedding weights between requests.
+        # Only enable it for a runtime whose model weights remain immutable.
+        cache_enabled = os.environ.get(
+            "VLLM_OMNI_MINICPMO45_CACHE_CONTROL_EMBEDDINGS",
+            "0",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        cache = getattr(self, "_token_embedding_cache", None) if cache_enabled else None
+        if cache_enabled and cache is None:
+            cache = {}
+            self._token_embedding_cache = cache
+        token_id = int(token_id)
+        if cache is not None and token_id in cache:
+            return cache[token_id]
+
         token = torch.tensor([int(token_id)], dtype=torch.long, device=self._model_device())
         embedder = self._token_embedder()
         embeds = embedder(token)
-        return self._as_2d_tensor(embeds)
+        embeds = self._as_2d_tensor(embeds).detach()
+        if cache is not None:
+            cache[token_id] = embeds
+        return embeds
 
     def _token_embedder(self) -> Any:
         nested_embed = getattr(getattr(getattr(self.thinker, "llm", None), "model", None), "embed_tokens", None)

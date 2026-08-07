@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import io
 import json
 import mimetypes
@@ -54,9 +55,20 @@ from vllm_omni.metrics.utils import coerce_positive_int_scalar
 logger = init_logger(__name__)
 
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
+_CAPTURE_OUTPUT_HASHES_ENV = "VLLM_OMNI_BENCH_CAPTURE_OUTPUT_HASHES"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
 _PRINT_STAGE = False
+
+
+def _capture_output_hashes_enabled() -> bool:
+    """Enable exact output fingerprints for deterministic shadow runs."""
+    return os.environ.get(_CAPTURE_OUTPUT_HASHES_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -460,6 +472,14 @@ class MixRequestFuncOutput(RequestFuncOutput):
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
+    #: Exact content hash used by deterministic shadow qualification. For WAV
+    #: responses this covers concatenated PCM; for other formats, encoded
+    #: audio bytes; for /audio/speech, the raw streamed PCM.
+    audio_content_sha256: str | None = None
+    #: Content hashes for logical chat audio deltas using the same byte domain
+    #: as ``audio_content_sha256``. Raw speech streaming leaves this empty
+    #: because HTTP receive boundaries are not stable packet boundaries.
+    audio_chunk_sha256s: list[str] = field(default_factory=list)
     #: Per-stage snapshot from orchestrator ``metrics["stage_metrics"]`` (merged across SSE chunks).
     stage_metrics: dict[str, dict] | None = None
     stage_id: int | None = None
@@ -767,6 +787,8 @@ async def async_request_openai_chat_omni_completions(
         wav_chunk_pcm_sizes: list[int] = []
         # For non-wav responses, accumulate encoded bytes then decode once.
         audio_bytes_buffer = bytearray()
+        capture_output_hashes = _capture_output_hashes_enabled()
+        audio_chunk_sha256s: list[str] = []
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
@@ -780,6 +802,8 @@ async def async_request_openai_chat_omni_completions(
         output.audio_frames = 0
         output.audio_rtf = 0.0
         output.audio_chunk_rtfs = []
+        output.audio_content_sha256 = None
+        output.audio_chunk_sha256s = []
         output.text_latency = 0.0
         output.output_tokens = 0
         output.error = ""
@@ -882,12 +906,18 @@ async def async_request_openai_chat_omni_completions(
                                                         pcm_chunk = wav_reader.readframes(wav_reader.getnframes())
                                                         wav_pcm_buffer.extend(pcm_chunk)
                                                         if pcm_chunk:
+                                                            if capture_output_hashes:
+                                                                audio_chunk_sha256s.append(
+                                                                    hashlib.sha256(pcm_chunk).hexdigest()
+                                                                )
                                                             wav_chunk_arrival_times_s.append(timestamp - st)
                                                             wav_chunk_pcm_sizes.append(len(pcm_chunk))
                                                 except Exception as ex:
                                                     logger.warning("Failed to parse wav audio chunk: %s", ex)
                                             else:
                                                 audio_bytes_buffer.extend(audio_bytes)
+                                                if capture_output_hashes and audio_bytes:
+                                                    audio_chunk_sha256s.append(hashlib.sha256(audio_bytes).hexdigest())
                                     elif modality == "image":
                                         output.image_count += 1
                                         content_image_ms = _image_generation_ms_from_content(content)
@@ -1004,6 +1034,11 @@ async def async_request_openai_chat_omni_completions(
                                     output.tts_output_pcm_bytes = (waveform * 32767).astype(np.int16).tobytes()
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
+                    if capture_output_hashes:
+                        output.audio_chunk_sha256s = audio_chunk_sha256s
+                        audio_content = bytes(wav_pcm_buffer) if response_format == "wav" else bytes(audio_bytes_buffer)
+                        if audio_content:
+                            output.audio_content_sha256 = hashlib.sha256(audio_content).hexdigest()
                     output.success = True
                 else:
                     output.error = response.reason or ""
@@ -1213,6 +1248,8 @@ async def async_request_openai_audio_speech(
     st = time.perf_counter()
     output.start_time = st
     total_pcm_bytes = 0
+    capture_output_hashes = _capture_output_hashes_enabled()
+    audio_hasher = hashlib.sha256() if capture_output_hashes else None
     capture_wer_pcm = _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False)
     pcm_capture = bytearray() if capture_wer_pcm else None
     chunk_arrival_times_s: list[float] = []
@@ -1229,6 +1266,8 @@ async def async_request_openai_audio_speech(
                         # not defined here; only audio TTFP is meaningful.
                         output.audio_ttfp = timestamp - st
                     total_pcm_bytes += len(chunk)
+                    if audio_hasher is not None:
+                        audio_hasher.update(chunk)
                     chunk_arrival_times_s.append(timestamp - st)
                     chunk_sizes.append(len(chunk))
                     if pcm_capture is not None:
@@ -1247,6 +1286,8 @@ async def async_request_openai_audio_speech(
                     float(total_samples) / float(sample_rate) if total_samples > 0 and sample_rate > 0 else 0.0
                 )
                 output.audio_rtf = defs.compute_audio_rtf(output.latency, output.audio_duration)
+                if audio_hasher is not None and total_pcm_bytes:
+                    output.audio_content_sha256 = audio_hasher.hexdigest()
                 output.audio_chunk_rtfs = compute_chunk_rtfs(
                     chunk_arrival_times_s=chunk_arrival_times_s,
                     chunk_bytes=chunk_sizes,
@@ -1660,6 +1701,14 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+
+    if _capture_output_hashes_enabled():
+        result.update(
+            {
+                "audio_content_sha256s": [output.audio_content_sha256 for output in outputs],
+                "audio_chunk_sha256s": [output.audio_chunk_sha256s for output in outputs],
+            }
+        )
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,

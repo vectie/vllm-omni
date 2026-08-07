@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import nullcontext
 from typing import Any
 
@@ -186,7 +187,16 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         output data.
         """
         try:
-            torch.npu.current_stream().synchronize()
+            # TP/HCCL deployments retain the conservative synchronization by
+            # default. TP1 streaming deployments can opt into event chaining
+            # after validating that no hidden communication stream produced
+            # the tensor, avoiding a host-blocking synchronization per chunk.
+            sync_before_event = os.environ.get(
+                "VLLM_OMNI_NPU_SYNC_BEFORE_DEVICE_EVENT",
+                "1",
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if sync_before_event:
+                torch.npu.current_stream().synchronize()
             event = torch.npu.Event()
             event.record()
             return event

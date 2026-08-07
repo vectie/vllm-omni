@@ -36,6 +36,7 @@ profile admits at most four concurrent sequences per stage.
 | `minicpmo_4_5.yaml` (default) | 1 | Memory-constrained compatibility layout. |
 | `minicpmo_4_5_2gpu.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
+| `minicpmo_4_5_2npu_910c.yaml` | 2 | Atlas A3 / Ascend 910C candidate with raw-tensor SHM and observed-shape graph capture. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
 | `minicpmo_4_5_duplex.yaml` | 1 | Experimental native full-duplex overlay. |
 
@@ -43,6 +44,10 @@ The split pipeline preserves native-duplex epoch/turn identity, segment text,
 turn completion, reference voice, and terminal-audio metadata through
 Code2Wav. Focused CPU regressions cover this envelope; run the Realtime
 scenario below for live barge-in validation on the target GPU.
+
+For the 910C execution policy, persistent-session fast path, deterministic
+shadow gate, and hardware promotion ladder, see the
+[Ascend 910C optimization design](../../../docs/design/minicpmo_4_5_ascend_910c_optimization.md).
 
 Default:
 

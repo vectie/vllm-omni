@@ -6,14 +6,14 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
 
 1. HiFT sine-source downsample — replace the failing 480x ``linear1d``
    downsample with its exact midpoint form while keeping HiFT on NPU.
-2. CosyVoice2 DiT SDPA — force MATH backend (+ DiT attn mask expand) to
-   avoid fused FA rejecting CosyVoice ``(B,1,1,S)`` masks (error 161001).
+2. CosyVoice2 DiT SDPA — expand the DiT attention mask and let the adapter
+   probe fused attention with a sticky MATH fallback for older CANN stacks.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from types import MethodType
 
 import numpy as np
@@ -114,19 +114,23 @@ def patch_step_audio2_hift_for_npu(hift: torch.nn.Module) -> None:
 
 @contextmanager
 def npu_token2wav_sdpa_context() -> Iterator[None]:
-    """Expand CosyVoice masks + force MATH SDPA to avoid FA 161001."""
+    """Install the CosyVoice mask/fused-attention adapter for this process."""
     try:
         from vllm_omni.platforms.npu.models.cosyvoice2_dit_attn import (
             apply_cosyvoice2_dit_attn_npu_patch,
-            npu_math_sdpa_context,
         )
+    except ImportError as exc:
+        logger.debug("CosyVoice2 NPU attention adapter unavailable: %s", exc)
+        yield
+        return
 
+    try:
         apply_cosyvoice2_dit_attn_npu_patch()
-        with npu_math_sdpa_context():
-            yield
-    except Exception:
-        with nullcontext():
-            yield
+    except Exception as exc:
+        # Patching remains best-effort for optional Token2Wav dependencies,
+        # but exceptions raised by the actual model invocation must propagate.
+        logger.warning("Unable to install CosyVoice2 NPU attention adapter: %s", exc)
+    yield
 
 
 def _patched_ensure_models_loaded(self) -> None:

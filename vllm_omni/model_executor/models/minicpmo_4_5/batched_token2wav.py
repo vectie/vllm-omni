@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 _SILENCE_TOKEN = 4218
+logger = logging.getLogger(__name__)
 
 
 def _autocast_disabled(device: torch.device):
@@ -103,7 +107,39 @@ class BatchedToken2Wav(nn.Module):
             token2wav.speech_window.detach().clone(),
             persistent=False,
         )
+        self.register_buffer(
+            "cfm_timeline_base",
+            1 - torch.cos(torch.linspace(0, 1, self.n_timesteps + 1, dtype=torch.float32) * 0.5 * torch.pi),
+            persistent=False,
+        )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+        self._timeline_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
+        self._cfg_workspace: dict[tuple[str, tuple[int, ...], torch.dtype, str, int | None], torch.Tensor] = {}
+        self._npu_cfm_graphs: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+        self._npu_cfm_graph_disabled = False
+
+    def _timeline_for(self, value: torch.Tensor) -> torch.Tensor:
+        key = (value.device.type, value.device.index, value.dtype)
+        timeline = self._timeline_cache.get(key)
+        if timeline is None:
+            timeline = self.cfm_timeline_base.to(device=value.device, dtype=value.dtype)
+            self._timeline_cache[key] = timeline
+        return timeline
+
+    def _cfg_pair(self, name: str, value: torch.Tensor, *, zero_unconditional: bool) -> torch.Tensor:
+        key = (name, tuple(value.shape), value.dtype, value.device.type, value.device.index)
+        pair = self._cfg_workspace.get(key)
+        expected_shape = (int(value.shape[0]) * 2, *value.shape[1:])
+        if pair is None or tuple(pair.shape) != expected_shape:
+            pair = torch.empty(expected_shape, device=value.device, dtype=value.dtype)
+            self._cfg_workspace[key] = pair
+        batch_size = int(value.shape[0])
+        pair[:batch_size].copy_(value)
+        if zero_unconditional:
+            pair[batch_size:].zero_()
+        else:
+            pair[batch_size:].copy_(value)
+        return pair
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -226,7 +262,7 @@ class BatchedToken2Wav(nn.Module):
         )
         return result, cnn_out, att_out
 
-    def _decode_cfm(
+    def _decode_cfm_eager(
         self,
         mu: torch.Tensor,
         speakers: torch.Tensor,
@@ -247,18 +283,11 @@ class BatchedToken2Wav(nn.Module):
                 f'"available":{int(decoder.rand_noise.shape[2])}}}'
             )
         x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
-        timeline = torch.linspace(
-            0,
-            1,
-            self.n_timesteps + 1,
-            device=mu.device,
-            dtype=mu.dtype,
-        )
-        timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
+        timeline = self._timeline_for(mu)
         time = timeline[0].expand(batch_size)
-        mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
-        speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
-        cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
+        mu_cfg = self._cfg_pair("mu", mu, zero_unconditional=True)
+        speakers_cfg = self._cfg_pair("speakers", speakers, zero_unconditional=True)
+        cond_cfg = self._cfg_pair("cond", cond, zero_unconditional=True)
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
         dt = timeline[1] - timeline[0]
@@ -267,9 +296,9 @@ class BatchedToken2Wav(nn.Module):
             old_att = att_cache[step] if att_cache is not None else None
             estimate, step_cnn, step_att = self._estimator_step(
                 estimator,
-                x=torch.cat((x, x), dim=0),
+                x=self._cfg_pair("x", x, zero_unconditional=False),
                 mu=mu_cfg,
-                time=torch.cat((time, time), dim=0),
+                time=self._cfg_pair("time", time, zero_unconditional=False),
                 speakers=speakers_cfg,
                 cond=cond_cfg,
                 cnn_cache=old_cnn,
@@ -284,6 +313,98 @@ class BatchedToken2Wav(nn.Module):
             next_cnn.append(step_cnn)
             next_att.append(step_att)
         return x, torch.stack(next_cnn), torch.stack(next_att)
+
+    @staticmethod
+    def _optional_tensor_signature(value: torch.Tensor | None) -> Any:
+        if value is None:
+            return None
+        return tuple(value.shape), value.dtype, value.device.type, value.device.index
+
+    @staticmethod
+    def _npu_cfm_graph_cache_limit() -> int:
+        raw = os.environ.get("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE", "4")
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning(
+                "Invalid VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE=%r; using 4",
+                raw,
+            )
+            return 4
+
+    def _decode_cfm(
+        self,
+        mu: torch.Tensor,
+        speakers: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        cnn_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        enabled = os.environ.get("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH", "0").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"} or mu.device.type != "npu" or self._npu_cfm_graph_disabled:
+            return self._decode_cfm_eager(
+                mu,
+                speakers,
+                cond,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+            )
+
+        inputs = (mu, speakers, cond, cnn_cache, att_cache)
+        key = tuple(self._optional_tensor_signature(value) for value in inputs)
+        entry = self._npu_cfm_graphs.get(key)
+        if entry is not None:
+            self._npu_cfm_graphs.move_to_end(key)
+            for static, current in zip(entry["inputs"], inputs, strict=True):
+                if static is not None and current is not None:
+                    static.copy_(current)
+            entry["graph"].replay()
+            return tuple(output.clone() for output in entry["outputs"])
+
+        static_inputs = tuple(value.clone() if value is not None else None for value in inputs)
+        static_mu, static_speakers, static_cond, static_cnn, static_att = static_inputs
+        try:
+            with torch.inference_mode():
+                self._decode_cfm_eager(
+                    static_mu,
+                    static_speakers,
+                    static_cond,
+                    cnn_cache=static_cnn,
+                    att_cache=static_att,
+                )
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.inference_mode(), torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
+                outputs = self._decode_cfm_eager(
+                    static_mu,
+                    static_speakers,
+                    static_cond,
+                    cnn_cache=static_cnn,
+                    att_cache=static_att,
+                )
+            graph.replay()
+        except Exception:
+            self._npu_cfm_graph_disabled = True
+            self._npu_cfm_graphs.clear()
+            logger.warning("MiniCPM-o NPU CFM graph capture failed; using eager Code2Wav", exc_info=True)
+            return self._decode_cfm_eager(
+                mu,
+                speakers,
+                cond,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+            )
+
+        self._npu_cfm_graphs[key] = {
+            "graph": graph,
+            "inputs": static_inputs,
+            "outputs": outputs,
+        }
+        max_graphs = self._npu_cfm_graph_cache_limit()
+        while len(self._npu_cfm_graphs) > max_graphs:
+            self._npu_cfm_graphs.popitem(last=False)
+        return tuple(output.clone() for output in outputs)
 
     @staticmethod
     def _split_flow_cache(cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:

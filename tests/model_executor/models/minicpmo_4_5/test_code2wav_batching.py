@@ -265,6 +265,30 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache1[0, 0, 0, 0, 0].item() == 20
 
 
+def test_adapter_reuses_timeline_and_cfg_workspaces():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    value = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    timeline = adapter._timeline_for(value)
+    assert adapter._timeline_for(value) is timeline
+
+    duplicated = adapter._cfg_pair("test", value, zero_unconditional=False)
+    duplicated_ptr = duplicated.data_ptr()
+    torch.testing.assert_close(duplicated[:2], value)
+    torch.testing.assert_close(duplicated[2:], value)
+
+    zeroed = adapter._cfg_pair("test", value + 1, zero_unconditional=True)
+    assert zeroed.data_ptr() == duplicated_ptr
+    torch.testing.assert_close(zeroed[:2], value + 1)
+    torch.testing.assert_close(zeroed[2:], torch.zeros_like(value))
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", 1), ("8", 8), ("bad", 4)])
+def test_npu_cfm_graph_cache_limit_is_bounded(monkeypatch, value: str, expected: int):
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE", value)
+    assert BatchedToken2Wav._npu_cfm_graph_cache_limit() == expected
+
+
 def test_fade_in_out_limits_overlap_to_available_previous_audio():
     speech = torch.arange(6, dtype=torch.float32).reshape(1, -1)
     previous = torch.full((1, 3), 2.0)

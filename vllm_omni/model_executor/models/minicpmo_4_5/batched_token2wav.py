@@ -106,6 +106,7 @@ class BatchedToken2Wav(nn.Module):
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
         self._timeline_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
+        self._timestep_embedding_cache: dict[tuple[Any, ...], torch.Tensor] = {}
         self._cfg_workspace: dict[tuple[str, tuple[int, ...], torch.dtype, str, int | None], torch.Tensor] = {}
         self._npu_cfm_graphs: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self._npu_cfm_graph_disabled = False
@@ -230,13 +231,12 @@ class BatchedToken2Wav(nn.Module):
         *,
         x: torch.Tensor,
         mu: torch.Tensor,
-        time: torch.Tensor,
+        time_embedding: torch.Tensor,
         speakers: torch.Tensor,
         cond: torch.Tensor,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        time_embedding = estimator.t_embedder(time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
@@ -253,6 +253,65 @@ class BatchedToken2Wav(nn.Module):
             att_out,
         )
         return result, cnn_out, att_out
+
+    def _estimator_time_embeddings(
+        self,
+        estimator: nn.Module,
+        timeline: torch.Tensor,
+        cfg_batch_size: int,
+    ) -> torch.Tensor:
+        """Cache graph-safe CFM timestep embeddings for inference.
+
+        CosyVoice's ``TimestepEmbedder`` constructs its sinusoidal frequencies
+        on CPU and calls ``.to(t)`` for every diffusion step. Besides repeating
+        the same host-to-device copy and MLP work for every streamed chunk,
+        that transfer is illegal while an Ascend NPU graph is being captured.
+        Token2wav weights and the CFM timeline are immutable during serving, so
+        compute the step embeddings once and reuse them by shape.
+
+        Lightweight test/dummy estimators that do not expose CosyVoice's
+        embedder attributes keep the generic eager behavior.
+        """
+        embedder = estimator.t_embedder
+        frequency_size = getattr(embedder, "frequency_embedding_size", None)
+        scale = getattr(embedder, "scale", None)
+        mlp = getattr(embedder, "mlp", None)
+        if not isinstance(frequency_size, int) or scale is None or not isinstance(mlp, nn.Module):
+            return torch.stack(
+                [embedder(timeline[step].expand(cfg_batch_size)).unsqueeze(1) for step in range(self.n_timesteps)]
+            )
+
+        key = (
+            id(embedder),
+            cfg_batch_size,
+            timeline.device.type,
+            timeline.device.index,
+            timeline.dtype,
+            self.n_timesteps,
+        )
+        cached = self._timestep_embedding_cache.get(key)
+        if cached is not None:
+            return cached
+
+        half = frequency_size // 2
+        # Match CosyVoice's CPU/default-dtype frequency construction exactly,
+        # but perform its one transfer before any graph capture begins.
+        frequencies = torch.exp(-torch.log(torch.tensor(10000.0)) * torch.arange(half) / half).to(timeline)
+        embeddings: list[torch.Tensor] = []
+        time = timeline[0].expand(cfg_batch_size)
+        dt = timeline[1] - timeline[0]
+        for step in range(self.n_timesteps):
+            arguments = (time * float(scale))[:, None] * frequencies[None]
+            sinusoidal = torch.cat((torch.cos(arguments), torch.sin(arguments)), dim=-1)
+            if frequency_size % 2:
+                sinusoidal = torch.cat((sinusoidal, torch.zeros_like(sinusoidal[:, :1])), dim=-1)
+            embeddings.append(mlp(sinusoidal).unsqueeze(1))
+            time = time + dt
+            if step + 1 < self.n_timesteps:
+                dt = timeline[step + 2] - time[0]
+        cached = torch.stack(embeddings).detach()
+        self._timestep_embedding_cache[key] = cached
+        return cached
 
     def _decode_cfm_eager(
         self,
@@ -276,12 +335,13 @@ class BatchedToken2Wav(nn.Module):
             )
         x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
         timeline = self._timeline_for(mu)
-        time = timeline[0].expand(batch_size)
         mu_cfg = self._cfg_pair("mu", mu, zero_unconditional=True)
         speakers_cfg = self._cfg_pair("speakers", speakers, zero_unconditional=True)
         cond_cfg = self._cfg_pair("cond", cond, zero_unconditional=True)
+        time_embeddings = self._estimator_time_embeddings(estimator, timeline, batch_size * 2)
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
+        time = timeline[0].expand(batch_size)
         dt = timeline[1] - timeline[0]
         for step in range(self.n_timesteps):
             old_cnn = cnn_cache[step] if cnn_cache is not None else None
@@ -290,7 +350,7 @@ class BatchedToken2Wav(nn.Module):
                 estimator,
                 x=self._cfg_pair("x", x, zero_unconditional=False),
                 mu=mu_cfg,
-                time=self._cfg_pair("time", time, zero_unconditional=False),
+                time_embedding=time_embeddings[step],
                 speakers=speakers_cfg,
                 cond=cond_cfg,
                 cnn_cache=old_cnn,

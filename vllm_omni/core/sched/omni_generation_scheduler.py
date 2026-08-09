@@ -434,12 +434,23 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         if self.input_coordinator is None:
-            return super()._free_request(request, delay_free_blocks)
+            result = super()._free_request(request, delay_free_blocks)
+            return self._normalize_free_request_result(result)
 
         try:
-            return super()._free_request(request, delay_free_blocks)
+            result = super()._free_request(request, delay_free_blocks)
+            return self._normalize_free_request_result(result)
         finally:
             self._free_input_coordinator_request(request.request_id)
+
+    @staticmethod
+    def _normalize_free_request_result(
+        result: tuple[dict[str, Any] | None, dict[str, Any] | None] | dict[str, Any] | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Normalize vLLM scheduler cleanup returns across releases."""
+        if isinstance(result, tuple):
+            return result
+        return result, None
 
     def update_from_output(
         self,

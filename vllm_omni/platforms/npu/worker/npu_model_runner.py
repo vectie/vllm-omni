@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from functools import partial
+from inspect import signature
 from typing import Any
 
 import numpy as np
@@ -28,10 +29,75 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 logger = init_logger(__name__)
 
 
+def _profiling_chunk_config(ascend_config: Any) -> Any | None:
+    """Return optional profiling configuration across Ascend releases."""
+    scheduler_config = getattr(ascend_config, "scheduler_config", None)
+    nested = getattr(scheduler_config, "profiling_chunk_config", None)
+    if nested is not None:
+        return nested
+    return getattr(ascend_config, "profiling_chunk_config", None)
+
+
+def _init_context_parallel_profile_batch(
+    runner: Any,
+    num_scheduled_tokens: np.ndarray,
+    num_reqs: int,
+) -> None:
+    """Initialize profile metadata across vLLM-Ascend CP API versions.
+
+    vLLM-Ascend renamed ``use_cp``/``pcp_manager`` to
+    ``use_dcp``/``dcp_manager``.  vLLM-Omni release images can legitimately
+    pair with either side of that transition, so dummy/profile runs must
+    select the manager exposed by the installed backend.
+    """
+    if bool(getattr(runner, "use_dcp", False)):
+        manager = runner.dcp_manager
+        query_lens = manager.query_lens_full
+    elif bool(getattr(runner, "use_cp", False)):
+        manager = runner.pcp_manager
+        query_lens = manager.query_lens_pcp_full
+    else:
+        return
+    manager.init_batch_info(
+        num_scheduled_tokens,
+        num_reqs,
+        runner.input_batch.num_computed_tokens_cpu,
+        runner.input_batch.num_prompt_tokens,
+    )
+    if runner.speculative_config:
+        query_lens.cpu[:num_reqs] = torch.from_numpy(num_scheduled_tokens)
+        query_lens.copy_to_gpu()
+
+
 if is_310p():
     from vllm_ascend._310p.model_runner_310p import NPUModelRunner310 as NPUModelRunner
 else:
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+
+_FULL_GRAPH_UPDATE_ACCEPTS_POSITIONS = (
+    "positions" in signature(NPUModelRunner._update_full_graph_params_if_needed).parameters
+)
+
+
+def _update_full_graph_params_compat(
+    runner: Any,
+    forward_context: Any,
+    num_tokens_padded: int,
+    positions: torch.Tensor | None,
+) -> None:
+    """Update graph parameters across vLLM-Ascend method signatures."""
+    if _FULL_GRAPH_UPDATE_ACCEPTS_POSITIONS:
+        runner._update_full_graph_params_if_needed(
+            forward_context,
+            num_tokens_padded,
+            positions,
+        )
+    else:
+        runner._update_full_graph_params_if_needed(
+            forward_context,
+            num_tokens_padded,
+        )
 
 
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
@@ -191,16 +257,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             force_has_lora=num_active_loras > 0,
             force_num_active_loras=num_active_loras,
         )
-        if self.use_dcp:
-            self.dcp_manager.init_batch_info(
-                num_scheduled_tokens,
-                num_reqs,
-                self.input_batch.num_computed_tokens_cpu,
-                self.input_batch.num_prompt_tokens,
-            )
-            if self.speculative_config:
-                self.dcp_manager.query_lens_full.cpu[:num_reqs] = torch.from_numpy(num_scheduled_tokens)
-                self.dcp_manager.query_lens_full.copy_to_gpu()
+        _init_context_parallel_profile_batch(self, num_scheduled_tokens, num_reqs)
         if cudagraph_runtime_mode is None:
             cudagraph_runtime_mode = _cudagraph_mode
         else:
@@ -466,11 +523,21 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait.
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+            _update_full_graph_params_compat(
+                self,
+                forward_context,
+                num_tokens_padded,
+                positions,
+            )
             model_output = run_model()
         else:
             model_output = run_model()
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+            _update_full_graph_params_compat(
+                self,
+                forward_context,
+                num_tokens_padded,
+                positions,
+            )
 
         # Omni-specific: wrap output if needed
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):

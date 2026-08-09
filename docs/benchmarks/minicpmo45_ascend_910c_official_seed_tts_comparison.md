@@ -131,10 +131,13 @@ VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH=0
 VLLM_OMNI_NPU_SYNC_BEFORE_DEVICE_EVENT=0
 ```
 
-The installed CANN environment does not expose the custom-op package expected
-by vLLM-Ascend, so custom ops were disabled and `fuse_norm_quant` was disabled
-through the Ascend compilation config. These settings define this experiment;
-numbers from a custom-op-capable image must be reported separately.
+The launch profile requested `VLLM_ASCEND_ENABLE_CUSTOM_OPS=0` and
+`fuse_norm_quant=false`, but the installed development vLLM-Ascend build did
+not honor those legacy controls: its engine log reports enabled `norm_quant`
+and `act_quant` fusions and `pass_config.fuse_norm_quant=true`. The same
+observed backend configuration was held fixed within each valid A/B run.
+Results from a different backend build or pass configuration must be reported
+as a separate profile.
 
 ## Hardware topology
 
@@ -190,6 +193,50 @@ Optimized raw results and the healthy final server log are under:
 /workspace/user_data/lunanexa-stack/experiments/minicpmo45-audio-opt-20260810
 ```
 
+## Same-backend allocation-reuse experiment (rejected)
+
+The installed vLLM-Ascend development tree changed after the earlier resident
+server started. A new same-backend control was therefore built from the
+verified compatibility tree, with only `batched_token2wav.py` restored to
+commit `b1192725`. SHA-256 checks confirmed that the control and candidate
+matched for every NPU runner and scheduler compatibility file and differed
+only in the proposed Code2Wav allocation change.
+
+The candidate preallocated all ten CFM step-output buffers as leading-dimension
+stacks, removed the final `torch.stack` copies, and elided single-request flow
+and HIFT cache clones. The idea reduced allocation count, but increased the
+live working set and was slower on this 910C profile.
+
+Three 32-request repetitions per variant used the same process warmup sequence
+and produced identical totals in every run: 4,801 input tokens, 480 output
+tokens, 3,321,600 audio frames, and 138.40 seconds of audio.
+
+| Variant | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Same-backend control | 330.97 ± 11.15 ms | 987.16 ± 8.87 ms | 0.4485 ± 0.0020 | 0.4792 ± 0.0021 | 1,890.08 ± 8.59 ms |
+| Allocation-reuse candidate | 328.31 ± 3.37 ms | 1,015.15 ± 1.22 ms | 0.4900 ± 0.0011 | 0.5307 ± 0.0025 | 2,062.55 ± 5.72 ms |
+
+The fail-closed median gate rejected the candidate:
+
+- whole-audio RTF regressed 9.49%;
+- audio TTFP regressed 3.06%;
+- E2E regressed 9.25%, beyond the 2% guard;
+- TTFT improved 0.39%, which does not compensate for the audio regressions.
+
+The allocation/copy patch was reverted. The backend compatibility fixes were
+retained: legacy/current context-parallel managers, optional profiling config
+locations, the added full-graph `positions` argument, and scheduler
+`_free_request` dict/`None` versus tuple returns. The combined Code2Wav, NPU,
+and scheduler gate passes 48/48 after the rejected candidate-only test is
+removed.
+
+Raw control/candidate results and the machine-readable rejection report are
+under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-audio-opt-20260810/allocation-v2
+```
+
 ## Competition status and next experiment
 
 This result still does not establish a competition pass. Seed-TTS WER and speaker
@@ -200,6 +247,8 @@ videos, while the official run requires all 2,700 questions.
 The immediate next step is quality validation, not another default-on speed
 change: export the fixed Seed-TTS manifest audio, run official WER and speaker
 similarity, then run the complete Daily-Omni and Video-MME suites. Further
-speed work should focus on static Code2Wav cache buckets/output-buffer reuse or
-a custom-op-capable image, and remain off by default until it beats this profile
-without exceeding the two-point quality budget.
+speed work should use NPU profiling to identify a narrower per-step workspace
+strategy, or evaluate a pinned custom-op-capable image. Whole-stack CFM output
+preallocation must not be retried unchanged. Every candidate remains off by
+default until it beats this profile without exceeding the two-point quality
+budget.

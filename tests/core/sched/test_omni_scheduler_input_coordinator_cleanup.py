@@ -93,10 +93,34 @@ def test_ar_free_request_cleans_input_coordinator_on_normal_free() -> None:
     assert scheduler._new_prompt_len_snapshot == {}
 
 
-def test_generation_free_request_cleans_input_coordinator(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("upstream_result", "expected"),
+    [
+        ({"kv": "params"}, ({"kv": "params"}, None)),
+        (None, (None, None)),
+        (({"kv": "params"}, {"ec": "params"}), ({"kv": "params"}, {"ec": "params"})),
+    ],
+)
+def test_generation_free_request_cleans_input_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+    upstream_result,
+    expected,
+) -> None:
     coordinator = FakeInputCoordinator()
     scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
     scheduler.input_coordinator = coordinator
 
     def fake_free_request(self, request, delay_free_blocks=False):
         assert delay_free_blocks is True
+        return upstream_result
+
+    monkeypatch.setattr(gen_sched_mod.VLLMScheduler, "_free_request", fake_free_request)
+
+    result = OmniGenerationScheduler._free_request(
+        scheduler,
+        DummyRequest(),
+        delay_free_blocks=True,
+    )
+
+    assert result == expected
+    assert coordinator.freed == ["req-free"]

@@ -1,27 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
+from typing import Any
+
 from .connectors.base import OmniConnectorBase
-from .connectors.mooncake_store_connector import MooncakeStoreConnector
 from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
-
-try:
-    from vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector import (
-        YuanrongTransferEngineConnector,
-    )
-except ImportError:
-    YuanrongTransferEngineConnector = None
-
-try:
-    from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
-except ImportError:
-    MooncakeTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mooncake) not installed
-
-try:
-    from .connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
-except ImportError:
-    MoriTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mori) not installed
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (
@@ -33,9 +18,41 @@ from .utils.initialization import (
     load_omni_transfer_config,
 )
 
-# Backward-compatible alias: MooncakeConnector was renamed to MooncakeStoreConnector.
-# Keep this alias for at least one release cycle.
-MooncakeConnector = MooncakeStoreConnector
+_LAZY_CONNECTORS = {
+    "MooncakeStoreConnector": (
+        "vllm_omni.distributed.omni_connectors.connectors.mooncake_store_connector",
+        "MooncakeStoreConnector",
+    ),
+    "MooncakeTransferEngineConnector": (
+        "vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector",
+        "MooncakeTransferEngineConnector",
+    ),
+    "MoriTransferEngineConnector": (
+        "vllm_omni.distributed.omni_connectors.connectors.mori_transfer_engine_connector",
+        "MoriTransferEngineConnector",
+    ),
+    "YuanrongTransferEngineConnector": (
+        "vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector",
+        "YuanrongTransferEngineConnector",
+    ),
+}
+
+
+def __getattr__(name: str) -> Any:
+    lookup_name = "MooncakeStoreConnector" if name == "MooncakeConnector" else name
+    target = _LAZY_CONNECTORS.get(lookup_name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute_name = target
+    try:
+        value = getattr(importlib.import_module(module_name), attribute_name)
+    except ImportError:
+        value = None
+    globals()[lookup_name] = value
+    if name == "MooncakeConnector":
+        globals()[name] = value
+    return value
+
 
 __all__ = [
     # Config

@@ -17,9 +17,10 @@ Compares model ``generated_text`` to dataset ``Answer`` (A/B/C/D).
   ``60s`` (``qa.json`` ``video_duration``): ``daily_omni_per_duration*`` metrics and a printed block.
 - **By video category:** mirrors ``--- Accuracy by Video Category ---`` using ``video_category``
   from ``qa.json`` (``daily_omni_per_category*``; empty category is bucketed as ``unknown``).
-- **Correctness:** uses the same ``evaluate_answer`` rule as upstream (truthy extracted letter vs
-  raw ``Answer`` string, both ``strip().upper()``). Rows with empty ``Answer`` are skipped
-  (``no_gold``), matching missing-field skips in the official loop.
+- **Correctness:** uses the same ``evaluate_answer`` rule as upstream after normalizing mirrored
+  datasets that store the full option text (for example ``"B. ..."``) instead of the official
+  single-letter ``Answer``. Rows with empty ``Answer`` are skipped (``no_gold``), matching
+  missing-field skips in the official loop.
 """
 
 from __future__ import annotations
@@ -247,7 +248,11 @@ def compute_daily_omni_accuracy_metrics(
             per_duration[dur_key]["total_ok"] += 1
         if pred is None:
             parse_failed += 1
-        is_correct = evaluate_answer_official(pred, req.daily_omni_gold_answer)
+        # The official qa.json stores ``Answer`` as a single letter, while some
+        # parquet mirrors store the full selected option (``"B. ..."``). Both
+        # encode the same label and must produce identical accuracy.
+        comparison_gold = gold_norm or req.daily_omni_gold_answer
+        is_correct = evaluate_answer_official(pred, comparison_gold)
         if is_correct:
             correct += 1
             per_task[tt]["correct"] += 1

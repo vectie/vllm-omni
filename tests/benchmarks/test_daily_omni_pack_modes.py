@@ -122,6 +122,60 @@ def test_uniform_sample_indices_non_positive_k() -> None:
     assert _uniform_sample_indices(10, -1) == []
 
 
+def test_minicpm_extract_falls_back_to_opencv_without_decord(monkeypatch, tmp_path) -> None:
+    """Ascend/aarch64 images can use the same frame recipe without a decord wheel."""
+    import types
+
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"placeholder")
+    released: list[bool] = []
+
+    class FakeCapture:
+        def __init__(self, _path: str) -> None:
+            self.frame_index = 0
+
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, prop: int) -> float:
+            return 2.0 if prop == 5 else 6.0
+
+        def set(self, _prop: int, value: int) -> bool:
+            self.frame_index = int(value)
+            return True
+
+        def read(self):
+            # BGR values make the RGB conversion observable.
+            frame = np.full((2, 2, 3), [self.frame_index, 2, 3], dtype=np.uint8)
+            return True, frame
+
+        def release(self) -> None:
+            released.append(True)
+
+    fake_cv2 = types.SimpleNamespace(
+        CAP_PROP_FPS=5,
+        CAP_PROP_FRAME_COUNT=7,
+        CAP_PROP_POS_FRAMES=1,
+        COLOR_BGR2RGB=4,
+        VideoCapture=FakeCapture,
+        cvtColor=lambda frame, _code: frame[..., ::-1],
+    )
+    monkeypatch.setitem(sys.modules, "decord", None)
+    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
+
+    frames, audio = DailyOmniDataset._extract_minicpm_frame_audio_segments(
+        video_path,
+        audio_path=None,
+        include_audio=False,
+    )
+
+    assert len(frames) == 3  # 6 frames / 2 fps, sampled at 1 fps.
+    assert frames[0].getpixel((0, 0)) == (3, 2, 0)
+    assert frames[1].getpixel((0, 0)) == (3, 2, 2)
+    assert audio == []
+    assert released == [True]
+
+
 # ---------------------------------------------------------------------------
 # minicpm-interleave packing
 # ---------------------------------------------------------------------------

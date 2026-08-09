@@ -1206,7 +1206,8 @@ class AsyncOmniEngine:
         # rather than as a per-stage config field.
         self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
 
-        # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
+        # Inject pipeline-wide runtime knobs and diffusion-only LoRA knobs from
+        # kwargs when the stage config does not already provide them.
         for cfg in stage_configs:
             try:
                 if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
@@ -1215,15 +1216,13 @@ class AsyncOmniEngine:
                 if global_sleep_mode is not None:
                     if not hasattr(cfg.engine_args, "enable_sleep_mode") or cfg.engine_args.enable_sleep_mode is None:
                         cfg.engine_args.enable_sleep_mode = global_sleep_mode
-                if getattr(cfg, "stage_type", None) != "diffusion":
-                    continue
-                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
-                    cfg.engine_args = OmegaConf.create({})
                 additional_config = kwargs.get("additional_config")
                 if additional_config is not None:
                     current_additional_config = getattr(cfg.engine_args, "additional_config", None)
                     if current_additional_config in (None, {}):
                         cfg.engine_args.additional_config = additional_config
+                if getattr(cfg, "stage_type", None) != "diffusion":
+                    continue
                 if kwargs.get("lora_path") is not None:
                     if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
                         cfg.engine_args.lora_path = kwargs["lora_path"]

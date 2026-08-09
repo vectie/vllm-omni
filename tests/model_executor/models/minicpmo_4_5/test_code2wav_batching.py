@@ -75,6 +75,26 @@ class _FakeEstimator(nn.Module):
         return inputs[:, 1:2]
 
 
+class _CosyVoiceStyleTimestepEmbedder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.frequency_embedding_size = 4
+        self.scale = 1000
+        self.mlp = nn.Sequential(nn.Linear(4, 4), nn.SiLU(), nn.Linear(4, 3))
+        self.calls = 0
+
+    def forward(self, time):
+        self.calls += 1
+        half = self.frequency_embedding_size // 2
+        frequencies = torch.exp(
+            -torch.log(time.new_tensor(10000.0))
+            * torch.arange(half, device=time.device, dtype=time.dtype)
+            / half
+        )
+        arguments = (time * self.scale)[:, None] * frequencies[None]
+        return self.mlp(torch.cat((torch.cos(arguments), torch.sin(arguments)), dim=-1))
+
+
 class _FakeDecoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -281,6 +301,23 @@ def test_adapter_reuses_timeline_and_cfg_workspaces():
     assert zeroed.data_ptr() == duplicated_ptr
     torch.testing.assert_close(zeroed[:2], value + 1)
     torch.testing.assert_close(zeroed[2:], torch.zeros_like(value))
+
+
+def test_adapter_caches_cosyvoice_timestep_embeddings_without_forward_calls():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    estimator = SimpleNamespace(t_embedder=_CosyVoiceStyleTimestepEmbedder())
+    timeline = adapter._timeline_for(torch.zeros(1, dtype=torch.float32))
+
+    expected = torch.stack(
+        [estimator.t_embedder(timeline[step].expand(2)).unsqueeze(1) for step in range(adapter.n_timesteps)]
+    )
+    calls_before_cache = estimator.t_embedder.calls
+    actual = adapter._estimator_time_embeddings(estimator, timeline, 2)
+    cached = adapter._estimator_time_embeddings(estimator, timeline, 2)
+
+    torch.testing.assert_close(actual, expected)
+    assert cached is actual
+    assert estimator.t_embedder.calls == calls_before_cache
 
 
 @pytest.mark.parametrize(("value", "expected"), [("0", 1), ("8", 8), ("bad", 4)])

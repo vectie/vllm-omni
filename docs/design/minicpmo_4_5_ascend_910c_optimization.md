@@ -231,6 +231,25 @@ RTF by 12.72%, whole-audio RTF by 11.52%, audio TTFP by 5.34%, and E2E by
 and no SIM regression. Keep the profile opt-in until the full quality suites
 pass; do not infer full-suite accuracy from the screen.
 
+The more aggressive six-step profile is also explicit opt-in:
+
+```bash
+VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND=auto \
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6.yaml \
+  --trust-remote-code \
+  --allowed-local-media-path /data/benchmarks \
+  --interleave-mm-strings \
+  --host 0.0.0.0 --port 8099
+```
+
+Against the eight-step profile on the measured host, six steps improved median
+per-chunk RTF by 9.54%, whole-audio RTF by 9.35%, audio TTFP by 8.39%, and E2E
+by 8.64%; TTFT improved 0.59%. Its paired eight-prompt official Seed-TTS screen
+kept WER at 0.0000 and changed WavLM SIM from 0.027103 to 0.016932, a 1.02
+percentage-point drop within the 2-point allowance. This is a screen, not a
+full-suite accuracy result, so the default remains ten steps.
+
 Opt-in experiments, one at a time:
 
 ```bash
@@ -268,6 +287,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Sticky fused-to-MATH Ascend SDPA adapter | Implemented, target proof required |
 | Exact-shape CFM graph replay | Implemented, off by default, target proof required |
 | Exact output hash capture and deterministic JSON gate | Implemented |
+| Six- and eight-step CFM deploy profiles | Implemented, opt-in pending full quality suites |
 | Foreground/background scheduler classes | Designed, not implemented |
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |

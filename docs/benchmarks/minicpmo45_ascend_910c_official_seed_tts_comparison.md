@@ -223,6 +223,57 @@ eb30375602233d9c9540b1c763f18eb6531d8672a06e6047efea6a4faad3654f  cfm8-performan
 00b88e046efccaa42db65f61d4ae74e256cc40434319dff87a778ebcd11fa3b9  cfm8-profile-smoke3-warm3.json
 ```
 
+## Opt-in six-step CFM candidate
+
+Code2Wav remained the dominant stage after the eight-step optimization, so the
+next candidate reduced only the Euler flow-matching schedule from eight to six
+evaluations. Transport, codec windows, left context, model weights, request
+order, and sampling parameters stayed fixed. Three runs used the same 32
+Seed-TTS English prompts, three warmups, greedy decoding, and concurrency one.
+Every run completed 32/32 requests, generated exactly 138.40 seconds / 3,321,600
+frames, reported 100% streaming continuity, and measured zero underrun.
+
+| Run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM6 1 | 311.61 ms | 834.69 ms | 0.3628 | 0.3830 | 1547.55 ms |
+| CFM6 2 | 313.21 ms | 829.82 ms | 0.3589 | 0.3788 | 1530.69 ms |
+| CFM6 3 | 314.69 ms | 826.56 ms | 0.3572 | 0.3769 | 1523.17 ms |
+
+The fail-closed three-run median gate required at least 5% improvement on every
+audio/E2E target and allowed at most 2% TTFT regression:
+
+| Gate metric | Eight-step median | Six-step median | Change | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| Per-chunk audio RTF | 0.4187 | 0.3788 | -9.54% | passes 5% target |
+| Whole-audio RTF | 0.3960 | 0.3589 | -9.35% | passes 5% target |
+| Audio TTFP | 905.78 ms | 829.82 ms | -8.39% | passes 5% target |
+| End-to-end latency | 1675.54 ms | 1530.69 ms | -8.64% | passes 5% target |
+| TTFT | 315.07 ms | 313.21 ms | -0.59% | within 2% guard |
+
+A paired eight-prompt official Seed-TTS screen kept Whisper Large v3 WER at
+0.0000 for 8/8 utterances with no request, PCM, ASR, or scoring failure. The
+official fine-tuned WavLM Large speaker score moved from 0.027103 at eight steps
+to 0.016932 at six steps, an absolute drop of 0.010171 (1.02 percentage points),
+inside the competition's 2-point allowance. The six-step profile is therefore
+available at `vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6.yaml`, but remains
+opt-in until the full 1,088-row Seed-TTS run plus Daily-Omni and Video-MME gates
+pass. The conservative 910C profile remains at ten steps. The new YAML itself
+was also started without the timestep environment override and passed an
+eight-request, three-warmup smoke with 8/8 completions, 100% streaming
+continuity, zero underrun, and exactly 32.76 seconds / 786,240 frames of audio.
+
+Raw result checksums:
+
+```text
+d8a4f67e086876c9c9ad2b19714d78b2a6aafac0b83d947ac5ea4ffbcbfc2b90  cfm6-run1.json
+4aefd3a1c414e195fd52b2554bd29d69032607f69b533b8b4b3a7ceffb53ee68  cfm6-run2.json
+a45b5b526871b776cec72883ebe022e932aa3f71a3995e69ea954d4687c56e23  cfm6-run3.json
+181699c2eb017284b53d37e027c900b6784d0aea4828638b3802080c171d30e3  cfm6-performance-gate.json
+d522197f3a7ddf0ee04d1dcf1d903ab6412b93041bc29082960f66713041b99d  cfm6-quality-en8.json
+73349fc0d05d0de98d14067f0f1aea1b3ff4a2955ee63254771f8bf198dad7b1  cfm6-en-8/wav_res_ref_text.sim
+fc3c4c306e1534141a82a456f2655d042c395e0e2e87f4e29eae90f8bf2dd712  cfm6-profile-smoke8.json
+```
+
 ### Rejected shorter initial codec window
 
 Reducing only the initial codec window from 25 to 12 frames improved the

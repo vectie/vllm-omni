@@ -66,6 +66,87 @@ signature is identical for all three prior and all three optimized runs:
 This signature is structural parity, not a substitute for Seed-TTS WER and
 speaker-similarity scoring.
 
+## Accepted CFM-delta cache on refreshed 910C host
+
+A refreshed Atlas A3 host exposed the physical card as two logical
+`Ascend910_9382` devices with 64 GiB each. The same three-stage placement and
+10-step CFM profile were deployed from candidate commit `5cce0948`. A further
+Code2Wav change caches the invariant Euler step widths once per device and
+dtype. It reproduces CosyVoice's accumulated-time recurrence exactly, instead
+of replacing it with direct adjacent timeline differences, and removes two
+tiny eager NPU operations from each non-final CFM step of every streamed
+chunk.
+
+The candidate was measured twice, then removed and the service restarted for
+an interleaved control. The post-restart control reproduced the earlier stable
+baseline, so the candidate was accepted and restored. A third candidate run
+then completed the fail-closed three-run gate. All measured runs used the same
+32 Seed-TTS English requests, three warmups, concurrency one, and the protocol
+below.
+
+| Variant/run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Stable baseline 2 | 322.73 ms | 989.48 ms | 0.4531 | 0.4837 | 1908.46 ms |
+| Interleaved baseline 3 | 317.14 ms | 986.83 ms | 0.4540 | 0.4872 | 1913.33 ms |
+| Delta-cache candidate 1 | 313.19 ms | 956.88 ms | 0.4475 | 0.4797 | 1885.22 ms |
+| Delta-cache candidate 2 | 310.85 ms | 947.02 ms | 0.4407 | 0.4722 | 1859.99 ms |
+| Delta-cache candidate 3 | 323.45 ms | 983.58 ms | 0.4513 | 0.4836 | 1901.00 ms |
+
+| Metric | Stable baseline mean | Candidate mean | Change |
+| --- | ---: | ---: | ---: |
+| TTFT | 319.94 ms | 312.02 ms | -2.47% |
+| Audio TTFP | 988.16 ms | 951.95 ms | -3.66% |
+| Whole-audio RTF | 0.4536 | 0.4441 | -2.08% |
+| Per-chunk audio RTF | 0.4854 | 0.4759 | -1.96% |
+| End-to-end latency | 1910.89 ms | 1872.60 ms | -2.00% |
+| Benchmark duration | 61.16 s | 59.94 s | -2.00% |
+
+The table above uses the two stable baseline and first two candidate runs to
+show the paired steady-state mean. The repository's promotion gate uses all
+three runs per side and compares medians with a 1% minimum improvement. It
+passed every selected target:
+
+| Gate target | Baseline median | Candidate median | Improvement |
+| --- | ---: | ---: | ---: |
+| TTFT | 322.73 ms | 313.19 ms | 2.96% |
+| Audio TTFP | 989.48 ms | 956.88 ms | 3.30% |
+| Whole-audio RTF | 0.4540 | 0.4475 | 1.42% |
+| Per-chunk audio RTF | 0.4872 | 0.4797 | 1.53% |
+| End-to-end latency | 1913.33 ms | 1885.22 ms | 1.47% |
+
+Lower is better. Every run completed 32/32 requests with zero failures, zero
+audio underrun, and 100% streaming continuity. Each produced 4,801 input
+tokens, 480 output tokens, 3,321,600 audio frames, and 138.40 seconds of audio.
+The workload/output-shape signature was identical across every baseline and
+candidate result:
+
+```text
+0c7fdd66996ae513520bfb0f1e0697c8629ac1bc6a8110b48279ffd558fc254e
+```
+
+The first baseline run is preserved with the raw results but excluded from the
+stable mean because one request had a TTFT outlier; including it increases the
+reported candidate advantage. The complete targeted Code2Wav test file passes
+36/36, including an exact-recurrence and cache-identity test. Structural parity
+does not replace the official Seed-TTS WER and speaker-similarity gates.
+
+Raw results and the accepted server log are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-910c-20260810
+```
+
+Result checksums:
+
+```text
+00949474fe7e47053e48d98b00864c7479b41a68eff02e9370e18534de6d94ee  baseline-newserver-run2.json
+e3857d511ea19a554c9718d36a44d3c839e0f205332372ae4c511109262860c3  baseline-newserver-run3-interleaved.json
+e5c89facb530357310cb6d18577f4f44e0ec1052bf0fb54b6e75d9d41ce554f7  delta-cache-run1.json
+3cc324d7539d89af3d48c155e7d513a847e74fab06d28db7d0d07c494c620e32  delta-cache-run2.json
+5330207e2a968a9cdf7878e7fd4d02a0e1232ee796dda570c8294698481b6387  delta-cache-run3.json
+7464973cfb64bbb2139b3afd5892ed84c010602f83eedcb4f3c111fb6144dbe7  delta-cache-performance-gate.json
+```
+
 ## Rejected NPU graph experiment
 
 NPU CFM graph replay remains disabled. The initial graph path failed because

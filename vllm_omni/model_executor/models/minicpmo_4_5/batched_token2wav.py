@@ -106,6 +106,7 @@ class BatchedToken2Wav(nn.Module):
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
         self._timeline_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
+        self._cfm_delta_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
         self._timestep_embedding_cache: dict[tuple[Any, ...], torch.Tensor] = {}
         self._cfg_workspace: dict[tuple[str, tuple[int, ...], torch.dtype, str, int | None], torch.Tensor] = {}
         self._npu_cfm_graphs: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
@@ -118,6 +119,32 @@ class BatchedToken2Wav(nn.Module):
             timeline = self.cfm_timeline_base.to(device=value.device, dtype=value.dtype)
             self._timeline_cache[key] = timeline
         return timeline
+
+    def _cfm_deltas_for(self, timeline: torch.Tensor) -> torch.Tensor:
+        """Cache the invariant Euler step widths without changing rounding.
+
+        CosyVoice derives every next width from the accumulated time rather
+        than taking a direct timeline difference. Reproduce that recurrence
+        once per device/dtype, then reuse the resulting scalars for every
+        streamed chunk. This removes two tiny eager accelerator operations
+        from each non-final CFM step while preserving the original update
+        order and values.
+        """
+        key = (timeline.device.type, timeline.device.index, timeline.dtype)
+        cached = self._cfm_delta_cache.get(key)
+        if cached is not None:
+            return cached
+        time = timeline[0]
+        dt = timeline[1] - timeline[0]
+        deltas: list[torch.Tensor] = []
+        for step in range(self.n_timesteps):
+            deltas.append(dt)
+            time = time + dt
+            if step + 1 < self.n_timesteps:
+                dt = timeline[step + 2] - time
+        cached = torch.stack(deltas).detach()
+        self._cfm_delta_cache[key] = cached
+        return cached
 
     def _cfg_pair(self, name: str, value: torch.Tensor, *, zero_unconditional: bool) -> torch.Tensor:
         key = (name, tuple(value.shape), value.dtype, value.device.type, value.device.index)
@@ -339,10 +366,9 @@ class BatchedToken2Wav(nn.Module):
         speakers_cfg = self._cfg_pair("speakers", speakers, zero_unconditional=True)
         cond_cfg = self._cfg_pair("cond", cond, zero_unconditional=True)
         time_embeddings = self._estimator_time_embeddings(estimator, timeline, batch_size * 2)
+        deltas = self._cfm_deltas_for(timeline)
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
-        time = timeline[0].expand(batch_size)
-        dt = timeline[1] - timeline[0]
         for step in range(self.n_timesteps):
             old_cnn = cnn_cache[step] if cnn_cache is not None else None
             old_att = att_cache[step] if att_cache is not None else None
@@ -358,10 +384,7 @@ class BatchedToken2Wav(nn.Module):
             )
             conditional, unconditional = estimate.split(batch_size, dim=0)
             velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
-            x = x + dt * velocity
-            time = time + dt
-            if step + 1 < self.n_timesteps:
-                dt = timeline[step + 2] - time[0]
+            x = x + deltas[step] * velocity
             next_cnn.append(step_cnn)
             next_att.append(step_att)
         return x, torch.stack(next_cnn), torch.stack(next_att)

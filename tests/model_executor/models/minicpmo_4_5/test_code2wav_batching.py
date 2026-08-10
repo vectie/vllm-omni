@@ -303,6 +303,27 @@ def test_adapter_reuses_timeline_and_cfg_workspaces():
     torch.testing.assert_close(zeroed[2:], torch.zeros_like(value))
 
 
+def test_adapter_caches_cfm_deltas_with_original_recurrence():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    timeline = adapter._timeline_for(torch.zeros(1, dtype=torch.float32))
+
+    time = timeline[0]
+    dt = timeline[1] - timeline[0]
+    expected = []
+    for step in range(adapter.n_timesteps):
+        expected.append(dt)
+        time = time + dt
+        if step + 1 < adapter.n_timesteps:
+            dt = timeline[step + 2] - time
+
+    actual = adapter._cfm_deltas_for(timeline)
+    cached = adapter._cfm_deltas_for(timeline)
+
+    torch.testing.assert_close(actual, torch.stack(expected), rtol=0, atol=0)
+    assert cached is actual
+    torch.testing.assert_close(actual.sum(), timeline[-1] - timeline[0])
+
+
 def test_adapter_caches_cosyvoice_timestep_embeddings_without_forward_calls():
     adapter = BatchedToken2Wav(_FakeToken2Wav())
     estimator = SimpleNamespace(t_embedder=_CosyVoiceStyleTimestepEmbedder())

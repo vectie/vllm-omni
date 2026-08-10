@@ -2203,6 +2203,24 @@ class TestBaseConfigInheritance:
 class TestPlatformOverrides:
     """Test platform-specific deploy config overrides."""
 
+    def test_minicpmo_4_5_910c_cfm8_profile_changes_only_sampler_depth(self):
+        deploy_path = Path(get_deploy_config_path("minicpmo_4_5_2npu_910c_cfm8.yaml"))
+
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.connectors is not None
+        connector = deploy.connectors["connector_of_shared_memory"]
+        assert connector["name"] == "SharedMemoryConnector"
+        assert connector["extra"]["token2wav_n_timesteps"] == 8
+        assert connector["extra"]["codec_chunk_frames"] == 25
+        assert connector["extra"]["codec_left_context_frames"] == 3
+        assert connector["extra"]["raw_tensor_shm"] is True
+        assert connector["extra"]["shm_event_notifications"] is True
+
+        assert deploy.platforms is not None
+        npu_stages = deploy.platforms["npu"]["stages"]
+        assert [stage["stage_id"] for stage in npu_stages] == [0, 1]
+        assert all(stage["max_num_batched_tokens"] == 8192 for stage in npu_stages)
+
     def test_qwen3_tts_rocm_disables_code2wav_outer_cudagraph(self):
         deploy_path = Path(get_deploy_config_path("qwen3_tts.yaml"))
 

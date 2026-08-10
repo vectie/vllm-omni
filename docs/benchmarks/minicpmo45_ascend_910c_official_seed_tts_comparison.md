@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 on Ascend 910C: official Seed-TTS comparison
 
-Date: 2026-08-09; optimization update: 2026-08-10
+Date: 2026-08-09; optimization update: 2026-08-11
 
 This report compares the pinned LunaNexa vLLM-Omni candidate, an optimized
 candidate built from it, and the competition's published Seed-TTS performance
@@ -146,6 +146,91 @@ e5c89facb530357310cb6d18577f4f44e0ec1052bf0fb54b6e75d9d41ce554f7  delta-cache-ru
 5330207e2a968a9cdf7878e7fd4d02a0e1232ee796dda570c8294698481b6387  delta-cache-run3.json
 7464973cfb64bbb2139b3afd5892ed84c010602f83eedcb4f3c111fb6144dbe7  delta-cache-performance-gate.json
 ```
+
+## Opt-in eight-step CFM candidate
+
+Stage timing on the accepted ten-step service showed Code2Wav dominating the
+streaming path: its mean stage time was 1568.69 ms, compared with 269.09 ms
+for stage 0 and 822.45 ms for stage 1. The next candidate therefore reduces
+the Code2Wav Euler flow-matching schedule from ten evaluations to eight. No
+codec-window, context, transport, model-weight, or request setting changes.
+
+The candidate passed a fail-closed three-run median performance gate against
+the accepted ten-step delta-cache runs. Each run used the same 32 Seed-TTS
+English prompts, three warmups, concurrency one, and produced exactly 138.40
+seconds / 3,321,600 frames of audio with 32/32 completions.
+
+| Run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM8 1 | 320.00 ms | 906.57 ms | 0.3961 | 0.4193 | 1675.54 ms |
+| CFM8 2 | 315.07 ms | 903.72 ms | 0.3944 | 0.4172 | 1668.50 ms |
+| CFM8 3 | 314.92 ms | 905.78 ms | 0.3960 | 0.4187 | 1675.80 ms |
+
+| Gate metric | Ten-step median | Eight-step median | Change | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| Per-chunk audio RTF | 0.4797 | 0.4187 | -12.72% | passes 5% target |
+| Whole-audio RTF | 0.4475 | 0.3960 | -11.52% | passes 5% target |
+| Audio TTFP | 956.88 ms | 905.78 ms | -5.34% | passes 5% target |
+| End-to-end latency | 1885.22 ms | 1675.54 ms | -11.12% | passes 5% target |
+| TTFT | 313.19 ms | 315.07 ms | +0.60% | within 2% guard |
+
+Because the change alters the numerical sampler rather than removing redundant
+work, performance parity alone cannot promote it. A paired eight-prompt
+Seed-TTS English screen was run with the official protocols: Whisper Large v3
+for WER and the fine-tuned WavLM Large speaker-verification checkpoint for SIM.
+
+| Quality metric | Ten-step control | Eight-step candidate | Change |
+| --- | ---: | ---: | ---: |
+| WER, lower is better | 0.0000 (8/8) | 0.0000 (8/8) | 0.00 pp |
+| WavLM SIM, higher is better | 0.023218 | 0.027103 | +0.003885 (+0.39 pp) |
+
+Both WER runs exported 8/8 WAVs with no request, PCM, ASR, or scoring failure.
+The WavLM checkpoint mapped with zero missing model keys; the one extra loss
+projection key is unused for inference. A CPU/NPU check on the first candidate
+pair differed by less than 0.001 SIM. The low absolute SIM values therefore
+come from the paired output/reference set rather than an NPU-only numerical
+failure, but this small screen is not a competition accuracy claim.
+
+The downloaded evaluator needed device-neutral `.to(device)` calls and
+Python 3.12 / torchaudio 2.10 import compatibility shims. Those shims do not
+change audio, weights, embeddings, or cosine scoring. The exact upstream
+checkpoints used were:
+
+```text
+51f07e3b94d9e0262a6a675ef5a087be3dd09e8c62e9d886827f44f82fe7f94b  wavlm_large_finetune.pth
+6fb4b3c3e6aa567f0a997b30855859cb81528ee8078802af439f7b2da0bf100f  wavlm_large.pt
+```
+
+This candidate is available as the explicit opt-in deploy profile
+`vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm8.yaml`. The conservative 910C
+profile remains at ten steps until the full 1,088-row Seed-TTS WER/SIM run and
+the required Daily-Omni and Video-MME gates pass. The profile was also started
+without the timestep environment override and passed a post-warmup end-to-end
+smoke: one request completed in 1.70 seconds, generated 3.28 seconds / 78,720
+frames of audio, and preserved streaming continuity.
+
+Raw result checksums:
+
+```text
+3493b6771ce8d1161ada6da4b5115050fb6da0e5cf7bf3df7780624fe5ea4ec2  cfm8-run1.json
+12f6f180f50738855487390c51cd85c997fd8a68124e9d27b563abe4f0eb80f5  cfm8-run2.json
+0799b5e6252dc430239c3c906b39c43bab884754d998f7e8ed01e5febf028e17  cfm8-run3.json
+eb30375602233d9c9540b1c763f18eb6531d8672a06e6047efea6a4faad3654f  cfm8-performance-gate.json
+3f3f385e63319be0e49b02913c3a9f4921791f6e3bf29f8bbeff4959e2ad3dab  cfm8-quality-en8.json
+9f54c870928d02426aa30e4fca1ebef4f6cf74e344bb34aed5f03ab3900e9222  cfm10-quality-en8.json
+444ee7e57ad72f28ecad24ddd19c7f12103a8872b3970844cff528ac48da3f6f  cfm8-en-8/wav_res_ref_text.sim
+94d927fc3e78e83cb00e7bc56ae21fa2090b769fd1cdb759c6339ca5987e0b23  cfm10-en-8/wav_res_ref_text.sim
+00b88e046efccaa42db65f61d4ae74e256cc40434319dff87a778ebcd11fa3b9  cfm8-profile-smoke3-warm3.json
+```
+
+### Rejected shorter initial codec window
+
+Reducing only the initial codec window from 25 to 12 frames improved the
+eight-prompt audio TTFP to 859.98 ms, but mean per-chunk RTF regressed to
+0.7409 and P99 per-chunk RTF reached 3.0611. Whole-audio RTF was 0.4466 and
+all requests completed, so this was a scheduling-quality failure rather than
+a crash. It is rejected because the competition explicitly scores every
+audio chunk's RTF, not only first-packet latency.
 
 ## Rejected NPU graph experiment
 

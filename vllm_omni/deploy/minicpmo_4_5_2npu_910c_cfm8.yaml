@@ -1,0 +1,25 @@
+# Atlas 800I A3 / Ascend 910C reduced-step CFM candidate.
+#
+# This profile keeps the validated 910C transport and stage placement, while
+# reducing MiniCPM-o 4.5 Code2Wav flow-matching from 10 to 8 steps. It is an
+# explicit opt-in because changing the sampler depth can affect audio quality.
+# Promote it to the default 910C profile only after the complete Seed-TTS WER
+# and speaker-similarity gate passes for the target checkpoint.
+
+base_config: minicpmo_4_5_2npu_910c.yaml
+
+# Top-level connector blocks replace the inherited block. Repeat every 910C
+# connector setting here so this profile changes only the CFM step count.
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      raw_tensor_shm: true
+      shm_event_notifications: true
+      shm_notification_namespace: minicpmo45-910c
+      token2wav_n_timesteps: 8

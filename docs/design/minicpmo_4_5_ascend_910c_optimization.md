@@ -212,6 +212,25 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
   --host 0.0.0.0 --port 8099
 ```
 
+The reduced-step Code2Wav candidate is a separate, quality-gated profile:
+
+```bash
+VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND=auto \
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm8.yaml \
+  --trust-remote-code \
+  --allowed-local-media-path /data/benchmarks \
+  --interleave-mm-strings \
+  --host 0.0.0.0 --port 8099
+```
+
+On the measured 910C host this eight-step profile improved median per-chunk
+RTF by 12.72%, whole-audio RTF by 11.52%, audio TTFP by 5.34%, and E2E by
+11.12% versus the accepted ten-step service. TTFT regressed 0.60%, within the
+2% guard. An eight-prompt official Seed-TTS screen showed zero WER regression
+and no SIM regression. Keep the profile opt-in until the full quality suites
+pass; do not infer full-suite accuracy from the screen.
+
 Opt-in experiments, one at a time:
 
 ```bash

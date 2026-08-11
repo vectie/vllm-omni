@@ -2251,6 +2251,21 @@ class TestPlatformOverrides:
         assert connector["extra"]["codec_chunk_frames"] == 25
         assert connector["extra"]["codec_left_context_frames"] == 3
 
+    def test_minicpmo_4_5_910c_prefix_cache_is_thinker_only(self):
+        deploy_path = Path(
+            get_deploy_config_path("minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_prefix_cache.yaml")
+        )
+
+        deploy = load_deploy_config(deploy_path)
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is True
+        assert stages[0].yaml_engine_args["disable_hybrid_kv_cache_manager"] is True
+        assert stages[1].yaml_engine_args["enable_prefix_caching"] is False
+        assert stages[2].yaml_engine_args["enable_prefix_caching"] is False
+
     def test_qwen3_tts_rocm_disables_code2wav_outer_cudagraph(self):
         deploy_path = Path(get_deploy_config_path("qwen3_tts.yaml"))
 

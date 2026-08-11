@@ -1,0 +1,18 @@
+# Atlas 800I A3 / Ascend 910C repeated-multimodal-prefix candidate.
+#
+# Daily-Omni and Video-MME ask multiple questions about the same media.  The
+# media is placed before the question, so stage 0 can reuse both its KV blocks
+# and vLLM-Omni's multimodal hidden-state prefix cache for adjacent questions.
+# Keep this as an explicit opt-in until an A/B run proves accuracy parity and
+# measures the pinned-host-memory cost on the target 910C service.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph.yaml
+
+stages:
+  - stage_id: 0
+    # The base profile disables prefix caching pipeline-wide because Talker and
+    # Code2Wav do not benefit.  Override only the Thinker and use the uniform KV
+    # manager required by vLLM's prefix-cache coordinator.
+    engine_extras:
+      enable_prefix_caching: true
+      disable_hybrid_kv_cache_manager: true

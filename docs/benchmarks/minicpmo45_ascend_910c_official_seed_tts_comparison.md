@@ -274,6 +274,78 @@ d522197f3a7ddf0ee04d1dcf1d903ab6412b93041bc29082960f66713041b99d  cfm6-quality-e
 fc3c4c306e1534141a82a456f2655d042c395e0e2e87f4e29eae90f8bf2dd712  cfm6-profile-smoke8.json
 ```
 
+## Opt-in fixed-width DiT MLP graph partition
+
+The full Code2Wav graph could not tolerate the estimator's internal-format
+Conv2D or growing attention-cache shapes. The narrower partition leaves
+attention and convolution eager and compiles only the affine-free `norm2`,
+modulation, two-layer MLP, gate, and residual expression. It runs only for
+steady streaming chunks with CFG batch 2 and width 50; setup, final, and
+mismatched shapes stay eager. One weight-parameterized TorchAir graph is
+shared by all 16 DiT blocks. Compile and replay failures fall back to eager.
+
+The installed TorchAir build also has an import-order defect when vLLM has
+already registered `npu_define::broadcast`: its converter skips a local
+`op_broadcast` alias that a later converter imports. The adapter repairs that
+missing alias from the registered operator without changing torch-npu.
+Startup logged a successful fixed-width compile, and the first live request
+logged graph replay with no fallback.
+
+Three candidate and three same-era control runs used 32 fixed Seed-TTS English
+prompts, three warmups, concurrency one, greedy decoding, and identical CFM6
+settings. Every run completed 32/32 requests with 100% streaming continuity
+and exactly 138.40 seconds / 3,321,600 frames of audio.
+
+| Run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM6 control 1 | 316.42 ms | 860.70 ms | 0.3825 | 0.4065 | 1628.55 ms |
+| CFM6 control 2 | 312.66 ms | 823.82 ms | 0.3606 | 0.3798 | 1535.94 ms |
+| CFM6 control 3 | 463.18 ms | 975.96 ms | 0.3923 | 0.4182 | 1691.61 ms |
+| MLP graph 1 | 317.85 ms | 848.38 ms | 0.3653 | 0.3853 | 1553.95 ms |
+| MLP graph 2 | 314.51 ms | 842.88 ms | 0.3607 | 0.3807 | 1537.23 ms |
+| MLP graph 3 | 333.34 ms | 858.88 ms | 0.3672 | 0.3852 | 1554.48 ms |
+
+The host produced latency spikes in control run 3, so the result uses the
+predeclared three-run median rather than selecting the best run:
+
+| Gate metric | CFM6 median | MLP graph median | Change |
+| --- | ---: | ---: | ---: |
+| Per-chunk audio RTF | 0.4065 | 0.3852 | -5.25% |
+| P99 per-chunk audio RTF | 1.1587 | 1.1346 | -2.08% |
+| Whole-audio RTF | 0.3825 | 0.3653 | -4.49% |
+| Audio TTFP | 860.70 ms | 848.38 ms | -1.43% |
+| End-to-end latency | 1628.55 ms | 1553.95 ms | -4.58% |
+| TTFT | 316.42 ms | 317.85 ms | +0.45% |
+
+The primary per-chunk metric clears the 5% target, P99 also improves, and TTFT
+stays inside the 2% guard. The other audio/E2E metrics improve but do not all
+clear 5%, so this is an opt-in incremental promotion rather than a new default.
+
+An eight-prompt graph-path quality screen completed 8/8 requests and exported
+all WAVs. Whisper Large v3 WER remained 0.0000 for 8/8 with no ASR or PCM
+failure. Official fine-tuned WavLM Large SIM was 0.018103 versus CFM6's
+0.016932, an improvement of 0.001171 (+0.12 percentage points). The profile is
+`vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph.yaml`. Environment
+variables can override its switch or width for fail-closed operations. A
+profile-only restart (without the graph environment switch) then completed an
+8/8 smoke with the exact 1,197 input-token, 116 output-token, and 786,240-frame
+signature; the service log confirmed graph compilation and replay. The full
+1,088-row Seed-TTS, Daily-Omni, and Video-MME gates remain required.
+
+Raw result checksums:
+
+```text
+cf6bdbf5b7356c6f4c05d6540793ddf7a0ba3c15290af7054663e28c045cc132  cfm6-same-era-control-run1.json
+a11a68f8095ebc40ef1e490a6f4e10aca02a0f67bd525a95bfb4efd2ef6e55d4  cfm6-same-era-control-run2.json
+e341a54432077b4c7209c40d36fce8048df62f269a5afd19f54918b838ca9856  cfm6-same-era-control-run3.json
+d6e4de70dc62bd082c35f076fe1916fa2d53fd6cc44ccc3e53cc63f3b75a800a  cfm6-dit-mlp-graph-run1.json
+153a7004fc6fea076b61680f5c751ed444eb67444ee62c7cdd6151985b4abb4f  cfm6-dit-mlp-graph-run2.json
+c43a425190f8a3ee8053386942f68f92e73e58a131837e9e24c6f43d839b4577  cfm6-dit-mlp-graph-run3.json
+5dc89bf3d864595ac84a3fca73c70aae7309569729561b54c236b078b7757b87  cfm6-dit-mlp-graph-quality-en8.json
+46072dcc2a66ddea019decdeef11eff89e5addb820bfc627360fc70c3732d289  cfm6-dit-mlp-graph-en-8/wav_res_ref_text.sim
+a4c294497a180caf079a4c73d60213ef5514a84ddf4cc7fb394202544bab3e84  cfm6-dit-mlp-graph-profile-smoke8.json
+```
+
 ### Rejected shorter initial codec window
 
 Reducing only the initial codec window from 25 to 12 frames improved the
@@ -283,7 +355,7 @@ all requests completed, so this was a scheduling-quality failure rather than
 a crash. It is rejected because the competition explicitly scores every
 audio chunk's RTF, not only first-packet latency.
 
-## Rejected NPU graph experiment
+## Rejected full-loop NPU graph experiment
 
 NPU CFM graph replay remains disabled. The initial graph path failed because
 the upstream timestep embedder copied a CPU tensor during capture. After the
@@ -294,8 +366,9 @@ to 1.43, per-chunk RTF to 1.60, and raised logical-chip-1 HBM from about 45.4
 GiB to 51.5 GiB. Growing attention-cache shapes are part of the graph key, so
 the observed behavior is consistent with capture churn and cache eviction.
 
-That experimental runtime change was reverted. A viable graph implementation
-needs fixed/padded cache buckets and output-buffer reuse before retesting.
+That full-loop runtime change was reverted. The narrower fixed-width MLP
+partition described above avoids both failure modes; attention-cache bucketing
+would still be required before expanding graph coverage around attention.
 
 ## Pre-optimization reference
 

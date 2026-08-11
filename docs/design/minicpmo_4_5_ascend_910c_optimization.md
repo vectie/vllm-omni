@@ -272,6 +272,26 @@ kept WER at 0.0000 and changed WavLM SIM from 0.027103 to 0.016932, a 1.02
 percentage-point drop within the 2-point allowance. This is a screen, not a
 full-suite accuracy result, so the default remains ten steps.
 
+The fixed-width DiT MLP graph profile layers on top of CFM6:
+
+```bash
+VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND=auto \
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph.yaml \
+  --trust-remote-code \
+  --allowed-local-media-path /data/benchmarks \
+  --interleave-mm-strings \
+  --host 0.0.0.0 --port 8099
+```
+
+This profile keeps attention and Conv2D eager, then replays one shared TorchAir
+graph for the fixed-width post-convolution norm/MLP/residual partition across
+all DiT blocks. Against a same-era CFM6 median it improved mean per-chunk RTF
+by 5.25%, P99 per-chunk RTF by 2.08%, whole-audio RTF by 4.49%, audio TTFP by
+1.43%, and E2E by 4.58%; TTFT regressed 0.45%, inside the 2% guard. Its paired
+EN8 screen kept WER at 0.0000 and improved official WavLM SIM from 0.016932 to
+0.018103. It remains opt-in pending the three full competition suites.
+
 Opt-in experiments, one at a time:
 
 ```bash

@@ -902,10 +902,27 @@ control it improved duration by 17.60%, throughput by 21.35%, mean TTFT by
 The detailed screen result is
 `thinker-c6-candidate-shuffled-c10-first.json` (SHA-256
 `4d7bef032e21c86caae8a525dfa7297578c17a050bceaa1d55b13ca371793cdf`).
-The screen qualifies c6 for the full 1,197-row run; it does not by itself
-promote the profile. The predeclared full-run guard remains zero HTTP failures,
+The screen qualified c6 for the full 1,197-row run but did not by itself
+promote the profile. The predeclared full-run guard was zero HTTP failures,
 accuracy at or above 77.5%, and P99 E2E no more than 2% above the accepted c4
 result (41.457 seconds).
+
+The full run completed all 1,197 requests and improved accuracy from 937 to 942
+correct (78.697%), with two parse failures. It improved duration by 5.38%,
+throughput by 5.69%, mean TTFT by 13.98%, P99 TTFT by 13.35%, and mean E2E by
+5.31%. P99 E2E nevertheless regressed 24.24%, from 40.644 to 50.495 seconds,
+so c6 is not promoted. The detailed result is
+`organizer-protocol-daily-full-1197-c10-thinker-c6.json` (SHA-256
+`e540600ec58d5d01bd102525a9c50eace758cff7135916bddc3f388a48adfe62`).
+
+Unlike the earlier full artifacts, this result contains aligned per-request
+IDs and E2E values. They locate the regression after first token: output length
+correlates 0.896 with post-TTFT time, while input length correlates only 0.060.
+Only 29 responses exceeded eight tokens, but those valid `A. <option text>`
+completions dominate P99. The two 18--19-token responses spent 42--50 seconds
+after first token. The next bounded experiment therefore targets decode
+admission using an exact replay of those 29 prompts; a larger prefill budget is
+not a plausible fix for this tail.
 
 ## Video-MME official-adapter screen
 
@@ -931,8 +948,8 @@ Complete local Video-MME assets are present for 2,700 questions over 900 videos,
 and the official adapter has passed a real-service 32-row screen; its full
 fail-closed run remains required before claiming a three-benchmark competition
 pass. Thinker c10 and c8 were not promoted because their full-run P99 E2E
-regressed 38.03% and 29.79%, respectively. c6 passed the admission screen and
-is undergoing the full Daily-Omni gate.
+regressed 38.03% and 29.79%, respectively. c6 also remains experimental: it
+improved mean and P99 TTFT but regressed full-run P99 E2E by 24.24%.
 
 Further speed work must start from the post-cache trace rather than retry the
 rejected fused Top-P, exponential-race sampler, or whole-stack CFM

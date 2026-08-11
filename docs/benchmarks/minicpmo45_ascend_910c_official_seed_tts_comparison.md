@@ -924,6 +924,33 @@ after first token. The next bounded experiment therefore targets decode
 admission using an exact replay of those 29 prompts; a larger prefill budget is
 not a plausible fix for this tail.
 
+## Thinker c5 final admission point
+
+c5 is the only integer admission point between the accepted c4 profile and c6.
+An exact replay corpus was built from the 29 c6 requests whose output exceeded
+eight tokens (SHA-256
+`425bdc7ad6cdb7d956b7b15ea43b1154dfc923d11554b6a9c2925ac4070b25ea`).
+On this deliberately tail-heavy set, c5 preserved 23/29 accuracy and all 29
+successful requests while reducing P99 E2E from 45.781 to 42.110 seconds
+(-8.02%). It also reduced maximum post-TTFT time from 18.379 to 16.176 seconds.
+The cost was 5.54% lower throughput, 16.19% worse mean TTFT, and 4.18% worse
+mean E2E. The c6 and c5 replay artifacts have SHA-256 values
+`3afac3bd162068c0e11070d0a1b8c63b4169cb6766696392778821ced17797ae`
+and `fe7fa12d6c74b000145705e767592809e2c3017c262a04f24b9aa26b8dab5f75`.
+
+The full c5 run completed all 1,197 requests and passed accuracy at 935/1,197 =
+78.111%, with three parse failures. Against c4 it improved duration by 4.73%,
+throughput by 4.96%, mean TTFT by 9.21%, P99 TTFT by 11.79%, and mean E2E by
+4.69%. P99 E2E still regressed 12.02%, from 40.644 to 45.530 seconds, and
+failed the same 41.457-second guard. The detailed result is
+`organizer-protocol-daily-full-1197-c10-thinker-c5.json` (SHA-256
+`4db216d305bb3484a1f725d10d17a6fab8c64c1940f9fa4f81385a30c049a671`).
+
+The admission sweep is therefore closed: c5, c6, c8, and c10 all improve mean
+performance but fail the predeclared full-run E2E-tail guard. c4 remains the
+competition default. Further admission points would either duplicate an
+already measured integer point or require an unsupported fractional policy.
+
 ## Video-MME official-adapter screen
 
 The first fail-closed real-service screen used the official 2,700-row parquet,
@@ -949,7 +976,9 @@ and the official adapter has passed a real-service 32-row screen; its full
 fail-closed run remains required before claiming a three-benchmark competition
 pass. Thinker c10 and c8 were not promoted because their full-run P99 E2E
 regressed 38.03% and 29.79%, respectively. c6 also remains experimental: it
-improved mean and P99 TTFT but regressed full-run P99 E2E by 24.24%.
+improved mean and P99 TTFT but regressed full-run P99 E2E by 24.24%. c5 reduced
+that regression to 12.02% but still failed the same guard, leaving c4 as the
+accepted competition profile.
 
 Further speed work must start from the post-cache trace rather than retry the
 rejected fused Top-P, exponential-race sampler, or whole-stack CFM

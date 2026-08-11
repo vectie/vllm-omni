@@ -1,0 +1,18 @@
+# Atlas 800I A3 / Ascend 910C competition c4 + 16K prefill candidate.
+#
+# The admission sweep leaves c4 as the only profile satisfying the full-run
+# E2E-tail guard. This overlay preserves c4 decode admission and graphs while
+# doubling only the Stage 0 scheduler token budget, isolating whether fewer
+# multimodal prefill slices improve TTFT without reopening the decode tail.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 16384
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 16384

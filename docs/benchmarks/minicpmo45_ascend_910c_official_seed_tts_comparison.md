@@ -1003,15 +1003,44 @@ artifact contains aligned request IDs, per-request TTFT/E2E values, and all 32
 evaluation records. Its SHA-256 is
 `4770f4becab903be7d34cf2c5e6f776763afdacae3693615b9b2a6849e62338d`.
 
+## Full Video-MME gate
+
+The qualified c4 + 16K competition profile then ran the complete official
+2,700-row set over all 900 videos with the same adapter contract: MiniCPM frame
+packing, 96 frames, no audio or subtitle, greedy 128-token text output, and
+concurrency four. Four preprocessing workers populated the persistent frame
+cache before timing; all 2,700 request objects were constructed before the
+initial endpoint test and three-request warmup.
+
+| Metric | Result |
+| --- | ---: |
+| Accuracy | 1,897/2,700 = 70.259% |
+| Organizer gate | >= 67.0% (pass by 3.259 points) |
+| HTTP successes / failures | 2,700 / 0 |
+| Parse failures | 1 |
+| Duration | 9,379.122 s |
+| Throughput | 0.2879 req/s |
+| Mean / median / P99 TTFT | 12.589 / 13.192 / 17.041 s |
+| Mean / median / P99 E2E | 13.890 / 14.360 / 19.561 s |
+
+The result contains 2,700 unique request IDs and aligned input lengths, output
+lengths, TTFTs, E2Es, generated texts, errors, and evaluation records. Its
+error array is empty and the service remained healthy after the 2.6-hour timed
+run. The detailed artifact is
+`videomme-official-full-2700-c4-prefill16k.json` (SHA-256
+`ade02dd9f01f91e6c8d3b4e650642e6b23c5e7ef35ded28c79831ea7f5a28b4c`).
+The 32-row screen's 68.75% was conservative; the full result improved it by
+1.509 percentage points.
+
 ## Competition status and next experiment
 
 The accepted cache has passed the full 1,088-row Seed-TTS WER and official
-speaker-SIM gate. Daily-Omni has now passed the full 1,197-row organizer gate.
-Complete local Video-MME assets are present for 2,700 questions over 900 videos,
-and the official adapter has passed a real-service 32-row screen; its full
-fail-closed run remains required before claiming a three-benchmark competition
-pass. Thinker c10 and c8 were not promoted because their full-run P99 E2E
-regressed 38.03% and 29.79%, respectively. c6 also remains experimental: it
+speaker-SIM gate. Daily-Omni passed the full 1,197-row organizer gate at
+78.279%, and Video-MME passed the full 2,700-row gate at 70.259%. All three
+specified benchmark gates have therefore passed with complete evaluated counts
+and zero HTTP failures. Thinker c10 and c8 were not promoted because their
+full-run P99 E2E regressed 38.03% and 29.79%, respectively. c6 also remains
+experimental: it
 improved mean and P99 TTFT but regressed full-run P99 E2E by 24.24%. c5 reduced
 that regression to 12.02% but still failed the same guard. The subsequent c4 +
 16K prefill candidate passed the full gate and is now the accepted competition
@@ -1020,7 +1049,7 @@ E2E, and identical aggregate accuracy versus the c4 + 8K control.
 
 Further speed work must start from the post-cache trace rather than retry the
 rejected fused Top-P, exponential-race sampler, or whole-stack CFM
-preallocation candidates. The next
-candidate should target `Multinomial`/event synchronization or a narrower
-fixed-shape DiT partition, and must beat the accepted service in a fresh-process
-three-run A/B before entering full quality qualification.
+preallocation candidates. The next candidate should target a narrower
+fixed-shape DiT partition or Ascend-specific layout/cache kernel, and must beat
+the accepted service in a fresh-process three-run A/B before repeating the
+full quality qualification.

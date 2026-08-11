@@ -393,7 +393,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Sticky fused-to-MATH Ascend SDPA adapter | Implemented, target proof required |
 | Exact-shape CFM graph replay | Implemented, off by default; full-loop capture rejected on measured 910C |
 | Exact output hash capture and deterministic JSON gate | Implemented |
-| Six- and eight-step CFM deploy profiles | Implemented; CFM6 passed the full 1,088-row Seed-TTS WER/SIM gate and the combined competition profile passed Daily-Omni; Video-MME pending |
+| Six- and eight-step CFM deploy profiles | Implemented; the CFM6 competition profile passed full Seed-TTS, Daily-Omni, and Video-MME gates |
 | Talker sliding repetition-frequency cache | Shipped; exact parity and full 1,088-row Seed-TTS WER/SIM gate passed |
 | Fused Ascend Top-P/Top-K adapter | Rejected and removed; BF16 parity drift and 6.96-9.25% serving regressions |
 | Ascend exponential-race Talker sampler | Rejected and removed; 67.23-83.40% isolated latency regressions |
@@ -406,7 +406,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Foreground/background scheduler classes | Designed, not implemented |
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |
-| Fixed-width DiT MLP graph partition around eager convolution | Implemented; full Seed-TTS and Daily-Omni passed, Video-MME pending |
+| Fixed-width DiT MLP graph partition around eager convolution | Implemented; full Seed-TTS, Daily-Omni, and Video-MME gates passed |
 | Broader cache-shape-bucketed DiT graph partitions | Next graph-coverage target |
 | Ascend-specific DiT layout/cache kernels | Profiler-triggered fallback if partitioning cannot remove launch overhead |
 | Deployment-distribution distillation/LoRA | Research fallback, not serving baseline |

@@ -1,0 +1,20 @@
+# Atlas 800I A3 / Ascend 910C competition Thinker c5 tail candidate.
+#
+# c6 improves full-run throughput and both TTFT metrics, but the rare responses
+# that emit the complete option text expose a post-first-token decode tail.
+# c5 is the only remaining bounded point between the accepted c4 profile and
+# c6. Keep the 8,192-token budget fixed so the replay isolates decode admission.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 5
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_capture_sizes: [1, 2, 4, 5]

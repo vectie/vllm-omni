@@ -2329,6 +2329,20 @@ class TestPlatformOverrides:
         }
         assert deploy.stages[1].max_num_seqs == 4
 
+    def test_minicpmo_4_5_910c_thinker_c5_targets_decode_tail(self):
+        deploy_path = Path(
+            get_deploy_config_path("minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_thinker_c5.yaml")
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.stages[0].max_num_seqs == 5
+        assert deploy.stages[0].max_num_batched_tokens == 8192
+        assert deploy.stages[0].compilation_config == {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 2, 4, 5],
+        }
+        assert deploy.stages[1].max_num_seqs == 4
+
     def test_minicpmo_4_5_910c_thinker_c8_prefill16k_changes_only_stage0_budget(self):
         deploy_path = Path(
             get_deploy_config_path(

@@ -83,6 +83,7 @@ logger = logging.getLogger(__name__)
 # Official MiniCPM ``get_video_frame_audio_segments`` default (env ``MAX_NUM_FRAMES``).
 _MINICPM_MAX_NUM_FRAMES = int(os.environ.get("MAX_NUM_FRAMES", "64"))
 _MINICPM_AUDIO_SR = 16000
+_MINICPM_INTERLEAVE_CACHE_VERSION = 1
 
 
 def _daily_omni_hf_cache_root() -> Path:
@@ -843,7 +844,10 @@ class DailyOmniDataset(BenchmarkDataset):
             return self._compose_minicpm_interleaved_multimodal(video_id, video_url)
 
         # Qwen / upstream Daily-Omni: separate video + WAV with ``use_audio_in_video=False``.
-        extra: dict[str, Any] = {"mm_processor_kwargs": {"use_audio_in_video": False}}
+        extra: dict[str, Any] = {
+            "modalities": ["text"],
+            "mm_processor_kwargs": {"use_audio_in_video": False},
+        }
         mode = self.input_mode
 
         if mode == "visual":
@@ -879,6 +883,7 @@ class DailyOmniDataset(BenchmarkDataset):
         """
         del video_url  # Hub HTTP URLs are not used; local extract is required.
         extra: dict[str, Any] = {
+            "modalities": ["text"],
             "mm_processor_kwargs": {
                 "use_audio_in_video": False,
                 "max_slice_nums": 1,
@@ -926,6 +931,20 @@ class DailyOmniDataset(BenchmarkDataset):
             )
             return None
 
+        cache_root: Path | None = None
+        if not self.inline_local_video:
+            assert self.video_dir is not None
+            cache_root = self.video_dir / ".minicpm_daily_omni_interleave" / video_id
+            disk_cached = self._load_minicpm_interleave_disk_cache(
+                cache_root,
+                video_path=video_path,
+                audio_path=audio_path,
+                include_audio=include_audio,
+            )
+            if disk_cached is not None:
+                self._minicpm_interleave_cache[cache_key] = disk_cached
+                return disk_cached
+
         try:
             frames, audio_segments = self._extract_minicpm_frame_audio_segments(
                 video_path,
@@ -954,10 +973,10 @@ class DailyOmniDataset(BenchmarkDataset):
             frames = frames[:n]
             audio_segments = audio_segments[:n]
 
-        cache_root: Path | None = None
-        if not self.inline_local_video:
-            assert self.video_dir is not None
-            cache_root = self.video_dir / ".minicpm_daily_omni_interleave" / video_id
+        if cache_root is not None:
+            # A stale or interrupted cache must not leave surplus segments in
+            # a new payload when source duration or MAX_NUM_FRAMES changes.
+            shutil.rmtree(cache_root, ignore_errors=True)
             cache_root.mkdir(parents=True, exist_ok=True)
 
         parts: list[dict[str, Any]] = []
@@ -1009,6 +1028,14 @@ class DailyOmniDataset(BenchmarkDataset):
         # Inline base64 must not be retained: ~700 Daily-Omni videos would pin GBs of RSS.
         if not self.inline_local_video:
             self._minicpm_interleave_cache[cache_key] = parts
+            assert cache_root is not None
+            self._write_minicpm_interleave_cache_marker(
+                cache_root,
+                video_path=video_path,
+                audio_path=audio_path,
+                frame_count=len(frames),
+                include_audio=include_audio,
+            )
         logger.debug(
             "MiniCPM interleave packed video_id=%r frames=%d include_audio=%s parts=%d",
             video_id,
@@ -1017,6 +1044,93 @@ class DailyOmniDataset(BenchmarkDataset):
             len(parts),
         )
         return parts
+
+    @staticmethod
+    def _media_fingerprint(path: Path | None) -> dict[str, int] | None:
+        if path is None:
+            return None
+        stat = path.stat()
+        return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+    @classmethod
+    def _write_minicpm_interleave_cache_marker(
+        cls,
+        cache_root: Path,
+        *,
+        video_path: Path,
+        audio_path: Path | None,
+        frame_count: int,
+        include_audio: bool,
+    ) -> None:
+        marker = {
+            "version": _MINICPM_INTERLEAVE_CACHE_VERSION,
+            "max_num_frames": _MINICPM_MAX_NUM_FRAMES,
+            "frame_count": frame_count,
+            "audio_count": frame_count if include_audio else 0,
+            "video": cls._media_fingerprint(video_path),
+            "audio": cls._media_fingerprint(audio_path) if include_audio else None,
+        }
+        marker_path = cache_root / ".complete.json"
+        temporary = cache_root / ".complete.json.tmp"
+        temporary.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
+        temporary.replace(marker_path)
+
+    @classmethod
+    def _load_minicpm_interleave_disk_cache(
+        cls,
+        cache_root: Path,
+        *,
+        video_path: Path,
+        audio_path: Path | None,
+        include_audio: bool,
+    ) -> list[dict[str, Any]] | None:
+        """Rehydrate a complete source-matched frame/audio cache without decoding."""
+        marker_path = cache_root / ".complete.json"
+        if not marker_path.is_file():
+            return None
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            frame_count = int(marker["frame_count"])
+            if (
+                marker.get("version") != _MINICPM_INTERLEAVE_CACHE_VERSION
+                or marker.get("max_num_frames") != _MINICPM_MAX_NUM_FRAMES
+                or marker.get("video") != cls._media_fingerprint(video_path)
+                or frame_count <= 0
+                or frame_count > _MINICPM_MAX_NUM_FRAMES
+            ):
+                return None
+            if include_audio and (
+                audio_path is None
+                or marker.get("audio") != cls._media_fingerprint(audio_path)
+                or marker.get("audio_count") != frame_count
+            ):
+                return None
+
+            parts: list[dict[str, Any]] = []
+            for index in range(frame_count):
+                frame_path = cache_root / f"frame_{index:04d}.jpg"
+                if not frame_path.is_file() or frame_path.stat().st_size == 0:
+                    return None
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": frame_path.expanduser().resolve().as_uri()},
+                    }
+                )
+                if include_audio:
+                    audio_segment = cache_root / f"audio_{index:04d}.wav"
+                    if not audio_segment.is_file() or audio_segment.stat().st_size == 0:
+                        return None
+                    parts.append(
+                        {
+                            "type": "audio_url",
+                            "audio_url": {"url": audio_segment.expanduser().resolve().as_uri()},
+                        }
+                    )
+            return parts
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("Ignoring invalid MiniCPM interleave cache marker: %s", marker_path)
+            return None
 
     @staticmethod
     def _extract_minicpm_frame_audio_segments(

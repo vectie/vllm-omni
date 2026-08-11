@@ -210,6 +210,7 @@ class VideoMMEDataset(BenchmarkDataset):
             video_mme_domain=str(row.get("domain") or "").strip(),
             video_mme_sub_category=str(row.get("sub_category") or "").strip(),
             video_mme_task_type=str(row.get("task_type") or "").strip(),
+            omni_extra_body={"modalities": ["text"]},
             omni_chat_messages=messages,
         )
 

@@ -194,6 +194,7 @@ def test_minicpm_interleave_alternates_image_and_audio(monkeypatch, qa_json, vid
         "max_slice_nums": 1,
         "use_image_id": False,
     }
+    assert extra["modalities"] == ["text"]
 
 
 def test_minicpm_interleave_visual_mode_emits_frames_only(monkeypatch, qa_json, video_dir) -> None:
@@ -261,6 +262,37 @@ def test_minicpm_interleave_caches_file_parts_but_not_inline_payloads(monkeypatc
     assert not ds_inline._minicpm_interleave_cache
 
 
+def test_minicpm_interleave_rehydrates_complete_disk_cache(monkeypatch, qa_json, video_dir) -> None:
+    first_calls: list[int] = []
+    first = _make_dataset(qa_json, video_dir, pack_mode="minicpm-interleave", input_mode="all")
+    _stub_extract(monkeypatch, first, first_calls)
+    expected, _extra, _position = first._compose_daily_omni_multimodal(_VIDEO_ID, None)
+    assert len(first_calls) == 1
+
+    second_calls: list[int] = []
+    second = _make_dataset(qa_json, video_dir, pack_mode="minicpm-interleave", input_mode="all")
+    _stub_extract(monkeypatch, second, second_calls)
+    actual, _extra, _position = second._compose_daily_omni_multimodal(_VIDEO_ID, None)
+
+    assert second_calls == []
+    assert actual == expected
+
+
+def test_minicpm_interleave_invalidates_disk_cache_when_media_changes(monkeypatch, qa_json, video_dir) -> None:
+    first = _make_dataset(qa_json, video_dir, pack_mode="minicpm-interleave", input_mode="all")
+    _stub_extract(monkeypatch, first, [])
+    first._compose_daily_omni_multimodal(_VIDEO_ID, None)
+
+    video_path = video_dir / _VIDEO_ID / f"{_VIDEO_ID}_video.mp4"
+    video_path.write_bytes(b"changed-mp4")
+    second_calls: list[int] = []
+    second = _make_dataset(qa_json, video_dir, pack_mode="minicpm-interleave", input_mode="all")
+    _stub_extract(monkeypatch, second, second_calls)
+    second._compose_daily_omni_multimodal(_VIDEO_ID, None)
+
+    assert len(second_calls) == 1
+
+
 def test_minicpm_interleave_missing_local_video_returns_none(qa_json, tmp_path) -> None:
     empty = tmp_path / "empty_videos"
     empty.mkdir()
@@ -292,10 +324,12 @@ def test_minicpm_interleave_keeps_empty_system_message(monkeypatch, qa_json, vid
 def test_qwen_pack_mode_keeps_system_message(qa_json, video_dir) -> None:
     ds = _make_dataset(qa_json, video_dir, pack_mode="qwen", input_mode="all")
 
-    messages = ds._build_daily_omni_openai_messages([], "q?", {"A": "a"})
+    payload, extra, _position = ds._compose_daily_omni_multimodal(_VIDEO_ID, None)
+    messages = ds._build_daily_omni_openai_messages(payload, "q?", {"A": "a"})
 
     assert [m["role"] for m in messages] == ["system", "user"]
     assert "Qwen" in messages[0]["content"][0]["text"]
+    assert extra["modalities"] == ["text"]
 
 
 def test_invalid_pack_mode_rejected(qa_json, video_dir) -> None:

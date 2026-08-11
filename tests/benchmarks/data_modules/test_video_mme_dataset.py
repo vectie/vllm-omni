@@ -11,8 +11,19 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 
 
 class _Tokenizer:
+    all_special_ids: list[int] = []
+    all_special_tokens: list[str] = []
+    is_fast = True
+    vocab_size = 1
+
     def encode(self, text: str) -> list[int]:
         return list(range(len(text.split())))
+
+    def get_vocab(self) -> dict[str, int]:
+        return {"x": 0}
+
+    def __len__(self) -> int:
+        return 1
 
 
 def _write_fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -59,6 +70,7 @@ def test_local_official_json_builds_video_request(tmp_path: Path) -> None:
     assert "Respond with only the letter" in request.prompt
     content = request.omni_chat_messages[0]["content"]
     assert content[0]["video_url"]["url"].startswith("file://")
+    assert request.omni_extra_body == {"modalities": ["text"]}
 
 
 def test_duration_filter_does_not_admit_other_buckets(tmp_path: Path) -> None:

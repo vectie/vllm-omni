@@ -111,8 +111,14 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
     --trust-remote-code \
     --allowed-local-media-path /data/benchmarks \
     --interleave-mm-strings \
+    --stage-init-timeout 900 --init-timeout 1800 \
     --host 0.0.0.0 --port 8099
 ```
+
+The larger initialization timeouts are intentional for the three sequential
+stages. A cold 17 GiB checkpoint read from network/FUSE storage can consume
+most of the default 600-second total before Talker and Code2Wav initialize.
+They do not change request execution or benchmark timing.
 
 The baseline intentionally preserves checkpoint-quality settings. Qualify one
 change at a time in this order: initial chunk (TTFP), steady chunk (per-chunk
@@ -352,6 +358,7 @@ vllm bench serve --omni \
     --videomme-video-dir /data/Video-MME/videos \
     --videomme-pack-mode minicpm-frames \
     --videomme-max-frames 96 \
+    --videomme-preprocess-workers 4 \
     --videomme-duration all \
     --videomme-save-eval-items \
     --num-prompts 2700 --no-oversample \
@@ -365,8 +372,10 @@ vllm bench serve --omni \
 `minicpm-frames` extracts and embeds the sampled frames in each request, so the
 server does not need direct access to the source MP4 directory. The saved JSON
 contains overall accuracy plus official duration, domain, sub-category, and
-task-type breakdowns. The competition reference is 69.0%; the two-point gate
-therefore requires at least 67.0% on all 2,700 questions.
+task-type breakdowns. The bounded preprocessing workers overlap independent
+video decodes into a persistent on-disk frame cache; they do not overlap with
+or enter the measured request interval. The competition reference is 69.0%;
+the two-point gate therefore requires at least 67.0% on all 2,700 questions.
 
 Run Daily-Omni with the MiniCPM interleaving protocol and Seed-TTS with content
 and speaker-similarity evaluation enabled:

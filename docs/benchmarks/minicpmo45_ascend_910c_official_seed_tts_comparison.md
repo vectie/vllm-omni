@@ -759,13 +759,128 @@ translate into a win here. Its global-stream handoff, exponential fill, divide,
 and argmax cost more than the live `multinomial` call at batch one. The opt-in
 implementation and environment flag were removed before service A/B testing.
 
+## Competition-exact Daily-Omni protocol audit
+
+Early Daily-Omni screens were far below the organizer's 79.5% framework
+baseline even though the 1 fps image/audio interleave itself matched MiniCPM.
+The remaining mismatch was in the conversation contract. The client was still
+using Daily-Omni's Qwen instruction, retained an empty system role, allowed 256
+output tokens, and did not reproduce MiniCPM-o's chat-template arguments.
+
+The OpenBMB OmniEvalKit `daily_omni` configuration instead uses its own strict
+MCQ prompt, 128 output tokens, 64 frames at 1 fps, interleaved audio, and no
+system role when the configured system prompt is empty. A later audit of the
+competition's current vLLM-Omni deployment guide found one important adapter
+difference: the competition request pins `enable_thinking=false` but does not
+enable `use_tts_template`. It also pins Stage 0 to greedy decoding with
+`repetition_penalty=1.2` and `max_tokens=128`; the repetition penalty must live
+in the deploy YAML because the Omni stage owns it. The benchmark client now
+matches that contract and keeps `modalities=["text"]`, so Talker and Code2Wav
+do no irrelevant work.
+
+Three concurrency-one screens on the same first 32 questions isolated the
+conversation and deploy-contract changes:
+
+| Protocol | Correct | Accuracy | HTTP / parse failures | Duration | Mean TTFT |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MiniCPM prompt, but template flags omitted | 23/32 | 71.875% | 0 / 0 | 39.65 s | 1,162.13 ms |
+| Direct-HF-adapter template flags (`use_tts_template=true`) | 25/32 | 78.125% | 0 / 0 | 46.01 s | 1,398.70 ms |
+| Competition contract, Stage 0 repetition penalty 1.2 | 27/32 | 84.375% | 0 / 0 | 63.58 s | 1,949.18 ms |
+
+This is an evaluator-correctness fix, not a claimed model-speed improvement.
+It prevents a fast but invalid benchmark from being promoted. The competition
+screen result is `organizer-protocol-daily-32-c1.json` (SHA-256
+`d9d8b1f8055962e39f715f5ff25f719dd21b4cc63cfe9d90f96da4b692fa332e`).
+
+The official Hugging Face `qa.json` contains 1,197 rows over 684 videos
+(SHA-256 `3210a45d42424c7d57c1b40a0b9aa2708fc02fab2364bf01fd7d16e1242e146b`).
+The previous local conversion had 1,196 rows because it deduplicated one
+intentional repeated `(video_id, question)` pair; all 684 video/audio assets
+were already complete. Full qualification now uses the untouched official
+1,197-row annotation rather than explaining away the mismatch.
+
+## Thinker-only repeated-prefix candidate
+
+Daily-Omni and Video-MME place media before the question and revisit the same
+video for multiple questions. An opt-in 910C profile now enables vLLM prefix
+caching and the uniform KV manager on Stage 0 only. Talker and Code2Wav retain
+the inherited disabled setting. This can reuse both KV blocks and
+vLLM-Omni's multimodal hidden-state prefix cache, but it also consumes pinned
+host memory and must not be promoted before a fresh-process A/B measures
+accuracy, cache hits, host/NPU memory, mean latency, and P99 latency. The
+source order is intentionally retained; no benchmark-only grouping is used.
+
+The benchmark now records OpenAI `prompt_tokens_details.cached_tokens` per
+request, so a latency change is not attributed to caching without a real hit.
+On a cache-empty, seeded-shuffle 32-row c1 run, the candidate recorded only
+3/32 hits (9,728 cached prompt tokens). Against the matching accepted service,
+duration regressed 3.25%, mean TTFT regressed 2.90%, and P99 TTFT regressed
+29.83%, with exact 20/32 accuracy parity. A cache-empty c10-first run recorded
+the same three hits. Against a cache-empty accepted reverse control it improved
+throughput by 2.77% and mean E2E by 3.14%, but mean TTFT regressed 0.41% and
+P99 TTFT regressed 8.42%.
+
+The mechanism is useful for a different workload shape. On an explicit
+unshuffled repeated-media c1 screen, 19/32 requests hit (45,184 cached tokens),
+duration improved 42.47%, and mean TTFT improved 42.89%, with exact 27/32
+accuracy parity. A deliberately pre-warmed c10 upper bound hit 32/32 and ran
+12.93x faster. Those are session/repeated-media results, not competition
+results. The candidate remains opt-in and is not promoted into the organizer
+profile because the realistic cache-empty distribution fails the P99 guard.
+
+## Full competition Daily-Omni gate
+
+The accepted competition profile completed the untouched 1,197-row annotation
+at concurrency 10:
+
+| Metric | Result |
+| --- | ---: |
+| Accuracy | 937/1,197 = 78.279% |
+| Organizer gate | >= 77.5% (pass) |
+| HTTP successes / failures | 1,197 / 0 |
+| Parse failures | 3 |
+| Duration | 3,176.65 s |
+| Throughput | 0.3768 req/s |
+| Mean / P99 TTFT | 21.840 / 33.101 s |
+| Mean / P99 E2E | 26.478 / 40.644 s |
+
+The detailed result is
+`organizer-protocol-daily-full-1197-c10.json` (SHA-256
+`49fc5cba86f8a57e72cc43982fae11612eb04460d98a6f9ac4e6ad8a3f584678`).
+It exactly matches the organizer reference count of 937 correct answers.
+
+## Thinker c10 admission experiment
+
+The full run exposed the actual performance bottleneck: the client submits ten
+requests while Stage 0 admits and captures only four sequences. An isolated
+profile raises Stage 0 `max_num_seqs` to 10 and adds decode graph capture sizes
+8 and 10, while retaining the 8,192-token scheduler budget. On cache-empty
+c10-first screens it completed in 78.90 and 78.39 seconds versus 98.04 seconds
+for the accepted reverse control. The first comparison improved throughput by
+24.25%, mean TTFT by 26.64%, P99 TTFT by 18.67%, mean E2E by 15.54%, and P99
+E2E by 20.08%, with exact 20/32 accuracy parity.
+
+The full 1,197-row run showed why the screen is not enough. c10 improved
+duration by 4.41%, throughput by 4.61%, mean TTFT by 20.33%, and mean E2E by
+4.29%. It passed the accuracy gate at 936/1,197 = 78.195%, a 0.084-point
+change from the accepted run, with zero HTTP failures and the same three parse
+failures. However, P99 TTFT regressed 2.39% and P99 E2E regressed 38.03%.
+The detailed result is
+`organizer-protocol-daily-full-1197-c10-thinker-c10.json` (SHA-256
+`93c407d378e8a9111740d29ab4f2afd827e6be53c8a4a0e0e9d6bd487b1fa48f`).
+c10 therefore remains an experiment rather than replacing the accepted
+profile. The next admission point is c8, with the same 8,192-token budget and
+decode graph coverage through batch eight.
+
 ## Competition status and next experiment
 
 The accepted cache has passed the full 1,088-row Seed-TTS WER and official
-speaker-SIM gate. Complete local assets are now present for 1,196 Daily-Omni
-questions over 684 videos and 2,700 Video-MME questions over 900 videos. Those
-two full fail-closed runs remain required before claiming a three-benchmark
-competition pass.
+speaker-SIM gate. Daily-Omni has now passed the full 1,197-row organizer gate.
+Complete local Video-MME assets are present for 2,700 questions over 900 videos,
+and the official adapter is implemented; its full fail-closed run remains
+required before claiming a three-benchmark competition pass. Thinker c10 was
+not promoted because its full-run P99 E2E regressed 38.03%; c8 is the next
+bounded admission experiment.
 
 Further speed work must start from the post-cache trace rather than retry the
 rejected fused Top-P, exponential-race sampler, or whole-stack CFM

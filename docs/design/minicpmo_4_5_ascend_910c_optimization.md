@@ -239,6 +239,22 @@ regressed median per-chunk RTF by 2.66% and E2E by 2.87%. Talker and Code2Wav
 share logical NPU 1, so that synchronization also provides useful pipeline
 pacing on the measured topology.
 
+### 8. Sampling fusion requires live-dtype and service proof
+
+The post-cache Stage-1 trace removed `Bincount` and exposed the remaining
+Top-P/Top-K sampling block. A prototype using Ascend's fused
+`npu_top_k_top_p` operator looked promising in an isolated FP32 benchmark, but
+failed exact mask parity in 2 of 98 BF16 cases and regressed the clean 3x32
+service comparison: median per-chunk RTF +8.94%, whole-audio RTF +9.17%, TTFP
++6.96%, P99 chunk RTF +6.97%, E2E +9.25%, and TTFT +2.46%. The generated
+audio and chunk hashes also changed.
+
+The prototype was removed rather than retained behind a flag. This establishes
+two promotion rules for later custom sampling kernels: parity must be tested in
+the model's live BF16 dtype, and a faster isolated operator is insufficient
+when its stream, workspace, or synchronization behavior makes end-to-end
+serving slower.
+
 ## 910C candidate profile
 
 Use `vllm_omni/deploy/minicpmo_4_5_2npu_910c.yaml` as the candidate overlay:
@@ -350,12 +366,13 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Sticky fused-to-MATH Ascend SDPA adapter | Implemented, target proof required |
 | Exact-shape CFM graph replay | Implemented, off by default; full-loop capture rejected on measured 910C |
 | Exact output hash capture and deterministic JSON gate | Implemented |
-| Six- and eight-step CFM deploy profiles | Implemented, opt-in pending full quality suites |
-| Talker sliding repetition-frequency cache | Shipped; exact parity and 910C EN8 WER screen passed |
+| Six- and eight-step CFM deploy profiles | Implemented; CFM6 passed the full 1,088-row Seed-TTS WER/SIM gate, Daily-Omni and Video-MME pending |
+| Talker sliding repetition-frequency cache | Shipped; exact parity and full 1,088-row Seed-TTS WER/SIM gate passed |
+| Fused Ascend Top-P/Top-K adapter | Rejected and removed; BF16 parity drift and 6.96-9.25% serving regressions |
 | Foreground/background scheduler classes | Designed, not implemented |
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |
-| Fixed-width DiT MLP graph partition around eager convolution | Implemented, opt-in pending full quality suites |
+| Fixed-width DiT MLP graph partition around eager convolution | Implemented; full Seed-TTS passed, Daily-Omni and Video-MME pending |
 | Broader cache-shape-bucketed DiT graph partitions | Next graph-coverage target |
 | Ascend-specific DiT layout/cache kernels | Profiler-triggered fallback if partitioning cannot remove launch overhead |
 | Deployment-distribution distillation/LoRA | Research fallback, not serving baseline |

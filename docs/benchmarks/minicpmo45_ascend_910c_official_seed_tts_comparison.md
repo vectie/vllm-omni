@@ -673,9 +673,7 @@ three-run control:
 TTFT remains inside the 2% guard while all audio and E2E targets improve. An
 eight-prompt Seed-TTS screen then completed 8/8 with the exact 1,197 input,
 116 output, 786,240-frame, and 32.76-second signature. Whisper Large v3 WER
-was 0.0000 for 8/8, with zero request, PCM, ASR, or export failures. Official
-speaker SIM and the full 1,088-row Seed-TTS, Daily-Omni, and Video-MME gates
-remain required.
+was 0.0000 for 8/8, with zero request, PCM, ASR, or export failures.
 
 Raw result checksums:
 
@@ -686,18 +684,73 @@ e4e32e787791daa3f458cca93c00079bab1b1f7ffffef96a9c3d6bf9a0dff52a  talker-frequen
 85fb688b5e9dfac6a407a20ebcefe14fb4d97f7c214684e6e19c34677bbb1024  talker-frequency-cache-quality-en8.json
 ```
 
+## Full Seed-TTS qualification of the accepted cache
+
+The accepted cache profile completed the complete 1,088-row English Seed-TTS
+manifest. All 1,088 requests and all 1,088 audio exports succeeded, with zero
+request, PCM, ASR, or export failures. The run produced 163,442 input tokens,
+16,562 output tokens, 118,310,400 PCM frames, and 4,929.6 seconds of audio.
+
+| Metric | Full 1,088-row result |
+| --- | ---: |
+| Mean TTFT | 579.73 ms |
+| Mean audio TTFP | 1,091.71 ms |
+| Whole-audio RTF | 0.4085 |
+| Per-chunk RTF | 0.4305 |
+| P99 per-chunk RTF | 2.0963 |
+| Mean E2E | 1,812.85 ms |
+| Whisper Large v3 mean WER | 0.03327 |
+| Whisper Large v3 median WER | 0.00000 |
+| Official WavLM speaker SIM | 0.02903 |
+
+The full run therefore promotes the Talker repetition-frequency cache past its
+Seed-TTS quality gate. These absolute WER and SIM values describe this model,
+prompt template, and evaluator combination; the competition comparison must
+use the same evaluator and dataset revision for both framework baseline and
+optimized service.
+
+```text
+2def4ce17d95d16e45fb375bcd02cf24b04121353700c9888bdbdeb076c7f5f8  talker-frequency-cache-quality-full-en-1088.json
+8d22eea2f2bc3c96bd284f4c0918d917d084d8197d1206469abf36bb5fae5a27  wav_res_ref_text.sim
+```
+
+## Post-cache Talker profile and rejected fused Top-P candidate
+
+A second Stage-1-only profile captured exactly 340 Talker codec steps after the
+cache landed. `Bincount` was absent. The largest remaining sampling-related
+host-to-device queue costs were `Multinomial` (89.25 ms across 340 calls),
+`Softmax` (7.10 ms), `Sort` (6.62 ms), `Topk` (5.98 ms), `Cumsum` (5.20 ms),
+and masked fill (6.65 ms). Together, the Top-P/Top-K block accounted for about
+31.55 ms of traced queue time and was the next bounded target.
+
+An experimental adapter around `torch_npu.npu_top_k_top_p` reduced an isolated
+FP32 microbenchmark mean from 446.93 us to 378.17 us (-15.38%). It was not
+accepted. Exact mask parity passed all 98 FP32 and FP16 cases but failed 2 of
+98 BF16 cases, which is the live Talker dtype. More importantly, a clean
+reverse-control 3x32 service comparison showed a median per-chunk RTF
+regression of 8.94%, whole-audio RTF regression of 9.17%, audio TTFP
+regression of 6.96%, P99 chunk RTF regression of 6.97%, and E2E regression of
+9.25%. TTFT also regressed 2.46%, beyond the 2% guard. All paired output and
+chunk hashes differed.
+
+The candidate's eight-row Seed-TTS screen completed with WER 0.0000. Its SIM
+was 0.02053 versus 0.03446 for the matching first eight rows of the accepted
+full run, a 1.39 percentage-point drop. Although that screen stayed inside the
+competition's two-point accuracy allowance, it cannot compensate for BF16
+parity loss and the measured serving regressions. The implementation and its
+runtime flag were fully removed; this is a documented negative result, not a
+dormant feature.
+
 ## Competition status and next experiment
 
-This result still does not establish a competition pass. Seed-TTS WER and speaker
-similarity were not evaluated at full scale, and the full Daily-Omni and
-Video-MME quality gates were not run. The current local Video-MME extraction
-contains only ten videos, while the official run requires all 2,700 questions.
+The accepted cache has passed the full 1,088-row Seed-TTS WER and official
+speaker-SIM gate. Complete local assets are now present for 1,196 Daily-Omni
+questions over 684 videos and 2,700 Video-MME questions over 900 videos. Those
+two full fail-closed runs remain required before claiming a three-benchmark
+competition pass.
 
-The immediate next step is quality validation, not another default-on speed
-change: export the fixed Seed-TTS manifest audio, run official WER and speaker
-similarity, then run the complete Daily-Omni and Video-MME suites. Further
-speed work should use NPU profiling to identify a narrower per-step workspace
-strategy, or evaluate a pinned custom-op-capable image. Whole-stack CFM output
-preallocation must not be retried unchanged. Every candidate remains off by
-default until it beats this profile without exceeding the two-point quality
-budget.
+Further speed work must start from the post-cache trace rather than retry the
+rejected fused Top-P or whole-stack CFM preallocation candidates. The next
+candidate should target `Multinomial`/event synchronization or a narrower
+fixed-shape DiT partition, and must beat the accepted service in a fresh-process
+three-run A/B before entering full quality qualification.

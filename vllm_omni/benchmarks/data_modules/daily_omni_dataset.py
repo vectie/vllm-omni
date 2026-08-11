@@ -888,6 +888,14 @@ class DailyOmniDataset(BenchmarkDataset):
         del video_url  # Hub HTTP URLs are not used; local extract is required.
         extra: dict[str, Any] = {
             "modalities": ["text"],
+            # OmniEvalKit calls MiniCPM-o ``model.chat`` with the model's
+            # fast-mode default and ``use_tts_template=True``. Both flags alter
+            # the assistant prefix, even when the benchmark requests text-only
+            # output and therefore never schedules Talker/Code2Wav.
+            "chat_template_kwargs": {
+                "enable_thinking": False,
+                "use_tts_template": True,
+            },
             "mm_processor_kwargs": {
                 "use_audio_in_video": False,
                 "max_slice_nums": 1,

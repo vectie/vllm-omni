@@ -195,6 +195,10 @@ def test_minicpm_interleave_alternates_image_and_audio(monkeypatch, qa_json, vid
         "use_image_id": False,
     }
     assert extra["modalities"] == ["text"]
+    assert extra["chat_template_kwargs"] == {
+        "enable_thinking": False,
+        "use_tts_template": True,
+    }
 
 
 def test_minicpm_interleave_visual_mode_emits_frames_only(monkeypatch, qa_json, video_dir) -> None:
@@ -336,6 +340,9 @@ def test_qwen_pack_mode_keeps_system_message(qa_json, video_dir) -> None:
 
     assert [m["role"] for m in messages] == ["system", "user"]
     assert "Qwen" in messages[0]["content"][0]["text"]
+    prompt = messages[1]["content"][-1]["text"]
+    assert prompt.startswith("Your task is to accurately answer multiple-choice questions")
+    assert "Only respond with the letter" not in prompt
     assert extra["modalities"] == ["text"]
 
 

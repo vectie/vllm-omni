@@ -13,6 +13,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
+    _apply_repetition_penalty,
+    _apply_repetition_penalty_from_frequencies,
     _max_audio_tokens,
     _restore_weight_norm_weight,
 )
@@ -56,7 +58,9 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._batch_stop_logits = None
     talker._request_generators = {}
     talker._request_audio_states = {}
+    talker._request_repetition_frequencies = {}
     talker._deferred_cleanup_ids = set()
+    talker._codec_vocab_ids = torch.arange(8)
     talker._codec_min_tokens = 50
     talker._codec_seed = 42
     return talker
@@ -82,6 +86,36 @@ def test_audio_token_limit_scales_with_condition_length(
     expected: int,
 ) -> None:
     assert _max_audio_tokens(condition_tokens) == expected
+
+
+def test_device_native_repetition_penalty_matches_bincount_reference() -> None:
+    logits = torch.tensor([[-2.0, -1.0, 0.5, 1.0, 2.0, 3.0, -4.0, 0.25]])
+    history = torch.tensor([1, 1, 3, 5, 1, 7, 5, 5, 5, 2, 4, 4, 6, 0, 2, 2, 3])
+    recent = history[-16:]
+    reference_frequencies = torch.bincount(recent, minlength=logits.shape[-1]).to(logits.dtype)
+    expected = _apply_repetition_penalty_from_frequencies(
+        logits,
+        reference_frequencies,
+        penalty=1.05,
+    )
+
+    actual = _apply_repetition_penalty(logits, history, penalty=1.05, window_size=16)
+
+    assert torch.equal(actual, expected)
+
+
+def test_incremental_repetition_frequencies_match_sliding_window() -> None:
+    talker = _make_talker()
+    logits = torch.zeros(1, 8)
+    history = torch.tensor([0, 1, 1, 2, 3, 5, 5, 5, 7, 0, 2, 4, 6, 6, 6, 1])
+    frequencies = talker._repetition_frequencies("req", history, logits)
+    sampled = torch.tensor(6)
+
+    talker._advance_repetition_frequencies("req", history, sampled, frequencies)
+
+    expected_history = torch.cat([history[-15:], sampled.reshape(1)])
+    expected = torch.bincount(expected_history, minlength=8).to(logits.dtype).reshape(1, -1)
+    assert torch.equal(talker._request_repetition_frequencies["req"], expected)
 
 
 def test_weight_norm_restore_matches_checkpoint_parametrization_in_bfloat16() -> None:
@@ -446,9 +480,11 @@ def test_request_cleanup_evicts_ar_rng_and_decode_state() -> None:
     talker = _make_talker()
     talker._request_generators["req-done"] = torch.Generator()
     talker._request_audio_states["req-done"] = {"step": 1}
+    talker._request_repetition_frequencies["req-done"] = torch.zeros(1, 8)
 
     talker.on_requests_finished(["req-done"])
     talker._flush_deferred_cleanup()
 
     assert "req-done" not in talker._request_generators
     assert "req-done" not in talker._request_audio_states
+    assert "req-done" not in talker._request_repetition_frequencies

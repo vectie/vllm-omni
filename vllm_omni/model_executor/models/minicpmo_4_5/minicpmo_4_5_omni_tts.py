@@ -76,7 +76,20 @@ def _apply_repetition_penalty(
     if penalty == 1.0 or history.numel() == 0:
         return logits
     recent = history.reshape(-1)[-window_size:].to(device=logits.device, dtype=torch.long)
-    frequencies = torch.bincount(recent, minlength=logits.shape[-1]).to(dtype=logits.dtype)
+    vocab_ids = torch.arange(logits.shape[-1], device=logits.device, dtype=torch.long)
+    frequencies = torch.sum(recent[:, None] == vocab_ids, dim=0).to(dtype=logits.dtype)
+    return _apply_repetition_penalty_from_frequencies(logits, frequencies, penalty=penalty)
+
+
+def _apply_repetition_penalty_from_frequencies(
+    logits: torch.Tensor,
+    frequencies: torch.Tensor,
+    *,
+    penalty: float,
+) -> torch.Tensor:
+    """Apply a precomputed frequency penalty without NPU host fallbacks."""
+    if penalty == 1.0:
+        return logits
     alpha = torch.pow(torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype), frequencies)
     return torch.where(logits < 0, logits * alpha, logits / alpha)
 
@@ -135,6 +148,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._batch_stop_logits: torch.Tensor | None = None
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
+        self._request_repetition_frequencies: dict[str, torch.Tensor] = {}
         self._deferred_cleanup_ids: set[str] = set()
 
         tts_config = getattr(config, "tts_config", None)
@@ -155,6 +169,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._codec_min_tokens = int(getattr(tts_config, "min_new_tokens", _CODEC_MIN_TOKENS))
         else:
             self._tts_config = None
+
+        if tts_config is not None:
+            self.register_buffer(
+                "_codec_vocab_ids",
+                torch.arange(self._num_audio_tokens, dtype=torch.long),
+                persistent=False,
+            )
 
         self.has_preprocess = True
         self.has_postprocess = False
@@ -335,6 +356,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 request_states = {}
                 self._request_audio_states = request_states
             request_states[request_id] = state
+            self._request_repetition_frequencies.pop(request_id, None)
             empty_codes = torch.empty(0, dtype=torch.long, device=embeds.device)
             return (
                 input_ids,
@@ -370,6 +392,44 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
+    def _repetition_frequencies(
+        self,
+        request_id: str,
+        history: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        frequencies = self._request_repetition_frequencies.get(request_id)
+        if (
+            frequencies is not None
+            and frequencies.device == logits.device
+            and frequencies.dtype == logits.dtype
+            and frequencies.shape[-1] == logits.shape[-1]
+        ):
+            return frequencies
+        recent = history.reshape(-1)[-_REPETITION_WINDOW:].to(device=logits.device, dtype=torch.long)
+        if recent.numel() == 0:
+            frequencies = logits.new_zeros(logits.shape)
+        else:
+            vocab_ids = self._codec_vocab_ids.to(device=logits.device)
+            frequencies = torch.sum(recent[:, None] == vocab_ids, dim=0, keepdim=True).to(dtype=logits.dtype)
+        self._request_repetition_frequencies[request_id] = frequencies
+        return frequencies
+
+    def _advance_repetition_frequencies(
+        self,
+        request_id: str,
+        history: torch.Tensor,
+        sampled: torch.Tensor,
+        frequencies: torch.Tensor,
+    ) -> None:
+        """Advance the 16-code frequency window using device-native compares."""
+        vocab_ids = self._codec_vocab_ids.to(device=frequencies.device)
+        next_frequencies = frequencies + (vocab_ids == sampled).to(dtype=frequencies.dtype)
+        if history.numel() >= _REPETITION_WINDOW:
+            expired = history.reshape(-1)[-_REPETITION_WINDOW].to(device=frequencies.device)
+            next_frequencies = next_frequencies - (vocab_ids == expired).to(dtype=frequencies.dtype)
+        self._request_repetition_frequencies[request_id] = next_frequencies
+
     def _sample_audio_code(
         self,
         hidden_state: torch.Tensor,
@@ -379,11 +439,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     ) -> torch.Tensor:
         logits = self.head_code[0](hidden_state).float() / self._codec_temperature
         eos_id = self._num_audio_tokens - 1
-        logits = _apply_repetition_penalty(
+        frequencies = self._repetition_frequencies(request_id, history, logits)
+        logits = _apply_repetition_penalty_from_frequencies(
             logits,
-            history,
+            frequencies,
             penalty=self._codec_repetition_penalty,
-            window_size=_REPETITION_WINDOW,
         )
         request_states = getattr(self, "_request_audio_states", {})
         state = request_states.get(request_id)
@@ -399,11 +459,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             min_tokens_to_keep=3,
         )
         probabilities = torch.softmax(logits, dim=-1)
-        return torch.multinomial(
+        sampled = torch.multinomial(
             probabilities,
             num_samples=1,
             generator=self._request_generator(request_id, probabilities.device),
         ).reshape(())
+        self._advance_repetition_frequencies(request_id, history, sampled, frequencies)
+        return sampled
 
     def make_omni_output(
         self,
@@ -576,6 +638,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         for request_id in self._deferred_cleanup_ids:
             self._request_generators.pop(request_id, None)
             request_audio_states.pop(request_id, None)
+            self._request_repetition_frequencies.pop(request_id, None)
         self._deferred_cleanup_ids.clear()
 
     def _dummy_hidden_states(

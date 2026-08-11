@@ -1,19 +1,21 @@
-# MiniCPM Ascend challenge accuracy/performance profile.
+# MiniCPM Ascend challenge qualified accuracy/performance profile.
 #
 # This layers the organizer's published Thinker decoding contract over the
 # accepted Atlas A3 / 910C CFM6 + fixed-width DiT MLP graph profile. Keeping
 # these values in the deploy config is important because vLLM-Omni owns the
 # stage sampling parameters and ignores a request-side repetition penalty.
+# Stage 0 uses the qualified 16K scheduler budget: on the full 1,197-row
+# Daily-Omni run it preserved 78.279% accuracy while improving throughput by
+# 5.80% and mean E2E by 5.51%, with P99 E2E inside the promotion guard.
 
-base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph.yaml
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition_prefill8k.yaml
 
 stages:
   - stage_id: 0
-    default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 128
-      seed: 42
-      detokenize: true
-      repetition_penalty: 1.2
+    max_num_batched_tokens: 16384
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 16384

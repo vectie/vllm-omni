@@ -6,7 +6,7 @@
 # graph sizes. Keep the 8,192-token scheduler budget unchanged so this first
 # A/B isolates admission/graph coverage from a later prefill-budget sweep.
 
-base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition_prefill8k.yaml
 
 stages:
   - stage_id: 0

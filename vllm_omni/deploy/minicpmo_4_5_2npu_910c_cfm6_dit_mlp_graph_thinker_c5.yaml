@@ -5,7 +5,7 @@
 # c5 is the only remaining bounded point between the accepted c4 profile and
 # c6. Keep the 8,192-token budget fixed so the replay isolates decode admission.
 
-base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition_prefill8k.yaml
 
 stages:
   - stage_id: 0

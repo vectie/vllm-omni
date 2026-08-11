@@ -2256,11 +2256,14 @@ class TestPlatformOverrides:
             get_deploy_config_path("minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml")
         )
 
-        deploy = load_deploy_config(deploy_path)
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
         thinker = deploy.stages[0].default_sampling_params
         assert thinker["temperature"] == 0.0
         assert thinker["max_tokens"] == 128
         assert thinker["repetition_penalty"] == 1.2
+        assert deploy.stages[0].max_num_seqs == 4
+        assert deploy.stages[0].max_num_batched_tokens == 16384
+        assert deploy.stages[1].max_num_batched_tokens == 8192
         assert deploy.stages[0].engine_extras["limit_mm_per_prompt"] == {
             "image": 96,
             "audio": 64,
@@ -2343,16 +2346,16 @@ class TestPlatformOverrides:
         }
         assert deploy.stages[1].max_num_seqs == 4
 
-    def test_minicpmo_4_5_910c_competition_prefill16k_preserves_c4_admission(self):
+    def test_minicpmo_4_5_910c_competition_prefill8k_preserves_control(self):
         deploy_path = Path(
             get_deploy_config_path(
-                "minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition_prefill16k.yaml"
+                "minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition_prefill8k.yaml"
             )
         )
 
         deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
         assert deploy.stages[0].max_num_seqs == 4
-        assert deploy.stages[0].max_num_batched_tokens == 16384
+        assert deploy.stages[0].max_num_batched_tokens == 8192
         assert deploy.stages[0].compilation_config == {
             "cudagraph_mode": "FULL_DECODE_ONLY",
             "cudagraph_capture_sizes": [1, 2, 4],

@@ -454,6 +454,99 @@ under:
 /workspace/user_data/lunanexa-stack/experiments/minicpmo45-audio-opt-20260810/allocation-v2
 ```
 
+## Post-CFM6 910C profiling and rejected candidates
+
+A fresh CFM6 service was profiled on the same Atlas A3 / 910C host after the
+six-step profile was accepted. The stage-2 kernel trace attributed 451.6 ms
+of device time as follows:
+
+| Operator family | Device time | Share |
+| --- | ---: | ---: |
+| TransData | 98.33 ms | 21.77% |
+| Transpose | 65.80 ms | 14.57% |
+| MatMulV2 | 45.94 ms | 10.17% |
+| LayerNormV3 | 42.03 ms | 9.31% |
+| Mul | 35.97 ms | 7.97% |
+| Add | 31.68 ms | 7.02% |
+| ConcatD | 26.86 ms | 5.95% |
+| Slice | 24.49 ms | 5.42% |
+| FlashAttention | 16.64 ms | 3.69% |
+| Conv2D | 15.53 ms | 3.44% |
+
+The host trace also reported 2,973 `aclnnCat` calls taking 749 ms, 3,666
+`aclnnAdd` calls taking 497 ms, 3,744 `aclnnAddmm` calls taking 381 ms, and
+1,758 `aclnnAdds` calls taking 319 ms. The next major target is therefore the
+DiT block's layout/construction and launch overhead, not FlashAttention or the
+Conv2D arithmetic alone.
+
+The exact benchmark protocol matters. In particular, MiniCPM-o's TTS template
+kwargs must be nested in the HTTP extra body; the benchmark CLI's top-level
+`--chat-template-kwargs` does not populate the custom Omni backend payload.
+The validated request fragment is:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-chat-omni \
+  --endpoint /v1/chat/completions \
+  --model openbmb/MiniCPM-o-4_5 \
+  --tokenizer /models/OpenBMB/MiniCPM-o-4_5 \
+  --trust-remote-code \
+  --dataset-name seed-tts \
+  --dataset-path /benchmarks/seedtts_testset \
+  --seed-tts-root /benchmarks/seedtts_testset \
+  --seed-tts-locale en \
+  --num-prompts 32 --num-warmups 3 \
+  --max-concurrency 1 --request-rate inf --seed 0 --temperature 0 \
+  --extra-body '{"modalities":["text","audio"],"chat_template_kwargs":{"use_tts_template":true,"enable_thinking":false}}'
+```
+
+Every valid 32-request run produced the same structural signature: 4,801
+input tokens, 480 output tokens, 3,321,600 audio frames, and 138.40 seconds of
+audio. A fresh three-run CFM6 control reproduced that signature:
+
+| Run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Fresh CFM6 1 | 313.68 ms | 824.42 ms | 0.3693 | 0.3948 | 1573.71 ms |
+| Fresh CFM6 2 | 315.70 ms | 836.57 ms | 0.3731 | 0.3983 | 1588.51 ms |
+| Fresh CFM6 3 | 450.54 ms | 965.92 ms | 0.4130 | 0.4295 | 1715.40 ms |
+
+The third run contains a host-latency excursion, so promotion decisions use
+the three-run median and a same-era control rather than selecting the best
+run. The following candidates were rejected and fully reverted:
+
+| Candidate | Per-chunk RTF | Whole RTF | Audio TTFP | E2E | Reason |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Five CFM steps | +1.91% | +3.54% | +13.25% | +4.17% | Slower than fresh CFM6; no quality budget spent |
+| Split K/V cache | +1.90% | +1.66% | +4.79% | +1.58% | More layout/view overhead than concatenation saved |
+| Fused CFG/Euler expression | +1.16% | +1.38% | -0.15% | +1.38% | Small TTFP win, audio/E2E regression |
+| In-place CFG/Euler update | +0.57% | +0.76% | -0.32% | +0.76% | Small TTFP win, audio/E2E regression |
+
+Full-loop NPU graph replay remains rejected. Native `NPUGraph` cannot capture
+the estimator's internal-format Conv2D. Disabling internal formats allowed a
+TorchAir graph to capture, but its first compilation took 108.5 seconds and
+new streaming-cache shapes triggered 10--17 second recompilations. A viable
+implementation needs fixed cache-shape buckets and an eager boundary around
+the convolution path before it can be benchmarked again.
+
+A 25/50-frame chunk experiment kept the first packet at 25 codec frames and
+doubled only steady-state windows. Its eight-request screen preserved 786,240
+frames / 32.76 seconds and continuity, improved whole-audio RTF by 10.08%,
+audio TTFP by 2.04%, and E2E by 10.12%, but regressed mean per-chunk RTF by
+12.41%, P99 per-chunk RTF by 0.25%, and TTFT by 2.26%. It was rejected because
+the competition scores chunk delivery, not only aggregate completion time.
+
+Raw result checksums:
+
+```text
+3f26e832766af342c2901b8a74faddc7bb4ab889fbd164cd4c86e84a2f20fb9d  cfm6-fresh-control-run1.json
+955c87cbebceebfd019d3ed7a0db13ddd3121486e16b98f5cfd715b814c5f38e  cfm6-fresh-control-run2.json
+52ede14e3c277d6bc4e09ef8616984c2dcde088dafd88f8b3249fe1535e05d28  cfm6-fresh-control-run3.json
+7145110de7b5f12cc1d174c9ac2e0b47c5726200351da2373f15692942f38d38  cfm5-run1.json
+8ac7f5b5477c5ba0043509abf541d951fe9e935d62f8fbf26f536ac19898be0c  cfm5-run2.json
+93ffd114d255a0b2cd56d4f590be3a98e5da788e1d3bf74f56b22ab84f8a9004  cfm5-run3.json
+3dfc1e81ca830dad3e86afe34293dd50d9e20e4129ca4e7905d4805bbda25350  cfm6-chunk50-smoke8.json
+```
+
 ## Competition status and next experiment
 
 This result still does not establish a competition pass. Seed-TTS WER and speaker

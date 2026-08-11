@@ -170,6 +170,28 @@ and an NPU trace. Use a unique notification namespace per service on a host.
 - Removing host synchronization before an NPU event is TP=1 experimental work.
   Keep the conservative default for TP/HCCL until ordering is proven.
 
+The measured CFM6 stage-2 trace makes the next implementation boundary
+explicit: TransData plus Transpose consume 36.34% of device time, while host
+launches are dominated by Cat/Add/Addmm/Adds. FlashAttention is only 3.69% and
+Conv2D arithmetic is 3.44%. Optimize the 16-block streaming DiT as a unit:
+
+1. define fixed/padded buckets for `(chunk_width, attention_cache_width)`;
+2. keep internal-format convolution eager, because native graph capture fails
+   on that operator and forcing ND format is slower;
+3. capture attention, normalization, MLP, cache writes, and residual updates
+   between convolution boundaries;
+4. reuse graph input/output buffers without changing the public concatenated
+   cache representation; and
+5. reject any partition that recompiles after warmup or regresses any
+   per-chunk RTF distribution.
+
+Do not retry the measured dead ends unchanged: five CFM steps, split K/V cache
+state, fused or in-place Euler expressions, full-loop TorchAir capture, or a
+25/50-frame competition profile. Their controlled results are recorded in the
+910C benchmark report. The chunk experiment is potentially useful for an
+offline-throughput profile, but it is not eligible for the streaming
+competition profile because mean and P99 per-chunk RTF regressed.
+
 ### 6. Deterministic shadow qualification
 
 Set `VLLM_OMNI_BENCH_CAPTURE_OUTPUT_HASHES=1` to save exact whole-audio and
@@ -285,11 +307,12 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Raw-tensor SHM and event notification | Implemented, opt-in, target proof required |
 | Cached immutable Stage 0 control-token embeddings | Implemented, opt-in for static weights only |
 | Sticky fused-to-MATH Ascend SDPA adapter | Implemented, target proof required |
-| Exact-shape CFM graph replay | Implemented, off by default, target proof required |
+| Exact-shape CFM graph replay | Implemented, off by default; full-loop capture rejected on measured 910C |
 | Exact output hash capture and deterministic JSON gate | Implemented |
 | Six- and eight-step CFM deploy profiles | Implemented, opt-in pending full quality suites |
 | Foreground/background scheduler classes | Designed, not implemented |
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |
-| Ascend-specific custom kernels | Profiler-triggered future work |
+| Bucketed DiT graph partitions around eager convolution | Next major implementation target |
+| Ascend-specific DiT layout/cache kernels | Profiler-triggered fallback if partitioning cannot remove launch overhead |
 | Deployment-distribution distillation/LoRA | Research fallback, not serving baseline |

@@ -620,12 +620,78 @@ Raw result checksums:
 3dfc1e81ca830dad3e86afe34293dd50d9e20e4129ca4e7905d4805bbda25350  cfm6-chunk50-smoke8.json
 ```
 
+## Accepted Talker repetition-frequency cache
+
+A focused Stage-1 trace captured 340 Talker codec steps. `Bincount` ran on AI
+CPU 336 times for 48.14 ms (6.16% of traced device time, 143.3 us average).
+The host trace also recorded 2,732 scalar reads. The longest reads immediately
+followed `torch.multinomial`, while another synchronization occurred inside
+`bincount`. This made the repetition histogram a narrower target than changing
+the Talker transformer or its already-replaying decode graphs.
+
+The accepted implementation stores the exact 16-code frequency vector per
+request and advances it with device-native equality/add/subtract operations.
+It does not change the seed, logits warpers, sampling order, EOS check, codec
+history, or Code2Wav inputs. Focused CPU tests compare both the full penalty
+and incremental window eviction against the former `torch.bincount` result.
+On NPU 1, an isolated 1,000-iteration microbenchmark reduced the hot section
+from 434.77 us mean / 412.48 us P50 to 254.46 us mean / 247.11 us P50, a 41.5%
+mean reduction.
+
+The synchronization was optimized separately and rejected. Skipping
+`sampled.item()` while EOS was masked preserved structure but regressed the
+three-run median whole RTF by 2.77%, chunk RTF by 2.66%, TTFP by 2.37%, and
+E2E by 2.87%. The change was fully reverted before measuring the frequency
+cache; shared Talker/Code2Wav pacing on logical NPU 1 is part of the measured
+system behavior.
+
+The cache candidate used the same CFM6 + fixed-width DiT MLP graph service,
+32 fixed English prompts, three warmups, concurrency one, greedy outer-token
+decoding, and nested MiniCPM-o TTS template body as the fresh control. Every
+run completed 32/32 with 4,801 input tokens, 480 output tokens, 3,321,600
+frames, 138.40 seconds of audio, and 100% streaming continuity.
+
+| Run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | P99 chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cache 1 | 319.42 ms | 829.88 ms | 0.3503 | 0.3699 | 1.1115 | 1488.39 ms |
+| Cache 2 | 713.75 ms | 1225.09 ms | 0.4413 | 0.4691 | 1.9112 | 1887.05 ms |
+| Cache 3 | 319.48 ms | 833.82 ms | 0.3520 | 0.3718 | 1.1049 | 1494.89 ms |
+
+Run 2 is retained as a host/NPU latency excursion rather than discarded. The
+predeclared three-run median remains favorable against the immediately prior
+three-run control:
+
+| Gate metric | Control median | Cache median | Change |
+| --- | ---: | ---: | ---: |
+| Per-chunk audio RTF | 0.3762 | 0.3718 | -1.16% |
+| P99 per-chunk audio RTF | 1.1230 | 1.1115 | -1.03% |
+| Whole-audio RTF | 0.3565 | 0.3520 | -1.24% |
+| Audio TTFP | 835.97 ms | 833.82 ms | -0.26% |
+| End-to-end latency | 1515.55 ms | 1494.89 ms | -1.36% |
+| TTFT | 317.31 ms | 319.48 ms | +0.69% |
+
+TTFT remains inside the 2% guard while all audio and E2E targets improve. An
+eight-prompt Seed-TTS screen then completed 8/8 with the exact 1,197 input,
+116 output, 786,240-frame, and 32.76-second signature. Whisper Large v3 WER
+was 0.0000 for 8/8, with zero request, PCM, ASR, or export failures. Official
+speaker SIM and the full 1,088-row Seed-TTS, Daily-Omni, and Video-MME gates
+remain required.
+
+Raw result checksums:
+
+```text
+4fef770978c2f0512a8379ffbefab3371512fe2211fa33d2a695bdad97910b8d  talker-frequency-cache-run1.json
+299632ce53f79e5afe3191ce818f8b58ea23da1240abc054972d988d617b4c85  talker-frequency-cache-run2.json
+e4e32e787791daa3f458cca93c00079bab1b1f7ffffef96a9c3d6bf9a0dff52a  talker-frequency-cache-run3.json
+85fb688b5e9dfac6a407a20ebcefe14fb4d97f7c214684e6e19c34677bbb1024  talker-frequency-cache-quality-en8.json
+```
+
 ## Competition status and next experiment
 
 This result still does not establish a competition pass. Seed-TTS WER and speaker
-similarity were not evaluated, and the full Daily-Omni and Video-MME quality
-gates were not run. The current local Video-MME extraction contains only ten
-videos, while the official run requires all 2,700 questions.
+similarity were not evaluated at full scale, and the full Daily-Omni and
+Video-MME quality gates were not run. The current local Video-MME extraction
+contains only ten videos, while the official run requires all 2,700 questions.
 
 The immediate next step is quality validation, not another default-on speed
 change: export the fixed Seed-TTS manifest audio, run official WER and speaker

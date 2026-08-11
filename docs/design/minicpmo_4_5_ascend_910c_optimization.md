@@ -218,6 +218,27 @@ length differences, or any exact output mismatch. An exact mismatch is not
 automatically a quality failure; it is a signal to attribute the numerical
 change before using the two-percentage-point aggregate allowance.
 
+### 7. Talker repetition-frequency cache
+
+The MiniCPM-o Talker applies a frequency-aware repetition penalty over the
+last 16 codec IDs. The checkpoint-compatible implementation used
+`torch.bincount` every codec step. On 910C that operator falls back to AI CPU
+and synchronizes the host before the remaining sampling work can proceed.
+
+Keep one float32 frequency vector per live request instead. Initialize it with
+a broadcast equality/reduction, then add the sampled ID and subtract the ID
+leaving the 16-code window with device-native equality operations. The update
+is submitted before the existing sampled-scalar read, so it can overlap the
+required EOS synchronization. Reset the vector on prefill and evict it with
+the request RNG and decode state. This preserves the exact frequency vector,
+sampling distribution, seed, EOS behavior, and 16-code history semantics.
+
+Do not remove the sampled-scalar synchronization as part of this change. A
+separate 3x32 experiment showed that eliding the read while EOS was masked
+regressed median per-chunk RTF by 2.66% and E2E by 2.87%. Talker and Code2Wav
+share logical NPU 1, so that synchronization also provides useful pipeline
+pacing on the measured topology.
+
 ## 910C candidate profile
 
 Use `vllm_omni/deploy/minicpmo_4_5_2npu_910c.yaml` as the candidate overlay:
@@ -330,9 +351,11 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Exact-shape CFM graph replay | Implemented, off by default; full-loop capture rejected on measured 910C |
 | Exact output hash capture and deterministic JSON gate | Implemented |
 | Six- and eight-step CFM deploy profiles | Implemented, opt-in pending full quality suites |
+| Talker sliding repetition-frequency cache | Shipped; exact parity and 910C EN8 WER screen passed |
 | Foreground/background scheduler classes | Designed, not implemented |
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |
-| Bucketed DiT graph partitions around eager convolution | Next major implementation target |
+| Fixed-width DiT MLP graph partition around eager convolution | Implemented, opt-in pending full quality suites |
+| Broader cache-shape-bucketed DiT graph partitions | Next graph-coverage target |
 | Ascend-specific DiT layout/cache kernels | Profiler-triggered fallback if partitioning cannot remove launch overhead |
 | Deployment-distribution distillation/LoRA | Research fallback, not serving baseline |

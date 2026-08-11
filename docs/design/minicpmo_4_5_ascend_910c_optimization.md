@@ -255,6 +255,14 @@ the model's live BF16 dtype, and a faster isolated operator is insufficient
 when its stream, workspace, or synchronization behavior makes end-to-end
 serving slower.
 
+Replacing `torch.multinomial` with vLLM-Ascend's exponential-race
+`random_sample` also failed the isolated gate. At the live 6,562-token shape,
+including the scalar read required by the Talker, it regressed mean latency by
+74.25%, P50 by 67.23%, and P99 by 83.40% across 1,000 measured iterations.
+The generic helper avoids a synchronization that this Talker cannot eliminate,
+then adds global-stream coordination, exponential fill, division, and argmax.
+The opt-in route was removed without spending a service A/B or quality run.
+
 ## 910C candidate profile
 
 Use `vllm_omni/deploy/minicpmo_4_5_2npu_910c.yaml` as the candidate overlay:
@@ -369,6 +377,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Six- and eight-step CFM deploy profiles | Implemented; CFM6 passed the full 1,088-row Seed-TTS WER/SIM gate, Daily-Omni and Video-MME pending |
 | Talker sliding repetition-frequency cache | Shipped; exact parity and full 1,088-row Seed-TTS WER/SIM gate passed |
 | Fused Ascend Top-P/Top-K adapter | Rejected and removed; BF16 parity drift and 6.96-9.25% serving regressions |
+| Ascend exponential-race Talker sampler | Rejected and removed; 67.23-83.40% isolated latency regressions |
 | Foreground/background scheduler classes | Designed, not implemented |
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |

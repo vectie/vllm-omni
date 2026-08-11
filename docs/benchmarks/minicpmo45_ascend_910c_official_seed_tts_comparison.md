@@ -714,7 +714,7 @@ optimized service.
 8d22eea2f2bc3c96bd284f4c0918d917d084d8197d1206469abf36bb5fae5a27  wav_res_ref_text.sim
 ```
 
-## Post-cache Talker profile and rejected fused Top-P candidate
+## Post-cache Talker profile and rejected sampling candidates
 
 A second Stage-1-only profile captured exactly 340 Talker codec steps after the
 cache landed. `Bincount` was absent. The largest remaining sampling-related
@@ -741,6 +741,24 @@ parity loss and the measured serving regressions. The implementation and its
 runtime flag were fully removed; this is a documented negative result, not a
 dormant feature.
 
+The next candidate reused vLLM-Ascend's exponential-race `random_sample`
+implementation to replace `torch.multinomial`. It was tested on idle logical
+NPU 1 with the live 6,562-token probability-vector shape and the required
+scalar read, using 100 warmups plus 1,000 measured iterations. All 1,100 draws
+from each path were valid, but the candidate was substantially slower:
+
+| Sampler path | Mean | P50 | P99 |
+| --- | ---: | ---: | ---: |
+| `torch.multinomial` | 219.98 us | 210.29 us | 245.35 us |
+| Ascend exponential race | 383.33 us | 351.67 us | 449.98 us |
+| Change | +74.25% | +67.23% | +83.40% |
+
+The model already performs the scalar read needed for EOS and request-state
+updates, so the generic sampler's synchronization-avoidance rationale does not
+translate into a win here. Its global-stream handoff, exponential fill, divide,
+and argmax cost more than the live `multinomial` call at batch one. The opt-in
+implementation and environment flag were removed before service A/B testing.
+
 ## Competition status and next experiment
 
 The accepted cache has passed the full 1,088-row Seed-TTS WER and official
@@ -750,7 +768,8 @@ two full fail-closed runs remain required before claiming a three-benchmark
 competition pass.
 
 Further speed work must start from the post-cache trace rather than retry the
-rejected fused Top-P or whole-stack CFM preallocation candidates. The next
+rejected fused Top-P, exponential-race sampler, or whole-stack CFM
+preallocation candidates. The next
 candidate should target `Multinomial`/event synchronization or a narrower
 fixed-shape DiT partition, and must beat the accepted service in a fresh-process
 three-run A/B before entering full quality qualification.

@@ -1,0 +1,19 @@
+# MiniCPM Ascend challenge accuracy/performance profile.
+#
+# This layers the organizer's published Thinker decoding contract over the
+# accepted Atlas A3 / 910C CFM6 + fixed-width DiT MLP graph profile. Keeping
+# these values in the deploy config is important because vLLM-Omni owns the
+# stage sampling parameters and ignores a request-side repetition penalty.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph.yaml
+
+stages:
+  - stage_id: 0
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 128
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.2

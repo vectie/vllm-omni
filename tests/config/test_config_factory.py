@@ -2251,6 +2251,21 @@ class TestPlatformOverrides:
         assert connector["extra"]["codec_chunk_frames"] == 25
         assert connector["extra"]["codec_left_context_frames"] == 3
 
+    def test_minicpmo_4_5_910c_competition_profile_pins_thinker_sampling(self):
+        deploy_path = Path(
+            get_deploy_config_path("minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml")
+        )
+
+        deploy = load_deploy_config(deploy_path)
+        thinker = deploy.stages[0].default_sampling_params
+        assert thinker["temperature"] == 0.0
+        assert thinker["max_tokens"] == 128
+        assert thinker["repetition_penalty"] == 1.2
+        assert deploy.connectors is not None
+        connector = deploy.connectors["connector_of_shared_memory"]
+        assert connector["extra"]["token2wav_n_timesteps"] == 6
+        assert connector["extra"]["npu_dit_mlp_graph"] is True
+
     def test_minicpmo_4_5_910c_prefix_cache_is_thinker_only(self):
         deploy_path = Path(
             get_deploy_config_path("minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_prefix_cache.yaml")
@@ -2265,6 +2280,7 @@ class TestPlatformOverrides:
         assert stages[0].yaml_engine_args["disable_hybrid_kv_cache_manager"] is True
         assert stages[1].yaml_engine_args["enable_prefix_caching"] is False
         assert stages[2].yaml_engine_args["enable_prefix_caching"] is False
+        assert deploy.stages[0].default_sampling_params["repetition_penalty"] == 1.2
 
     def test_qwen3_tts_rocm_disables_code2wav_outer_cudagraph(self):
         deploy_path = Path(get_deploy_config_path("qwen3_tts.yaml"))

@@ -195,10 +195,7 @@ def test_minicpm_interleave_alternates_image_and_audio(monkeypatch, qa_json, vid
         "use_image_id": False,
     }
     assert extra["modalities"] == ["text"]
-    assert extra["chat_template_kwargs"] == {
-        "enable_thinking": False,
-        "use_tts_template": True,
-    }
+    assert extra["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_minicpm_interleave_visual_mode_emits_frames_only(monkeypatch, qa_json, video_dir) -> None:

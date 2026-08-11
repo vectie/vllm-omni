@@ -6,7 +6,7 @@
 # Keep this as an explicit opt-in until an A/B run proves accuracy parity and
 # measures the pinned-host-memory cost on the target 910C service.
 
-base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph.yaml
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml
 
 stages:
   - stage_id: 0

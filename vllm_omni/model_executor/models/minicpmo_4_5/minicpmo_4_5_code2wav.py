@@ -777,6 +777,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
         use_float16 = bool(extra.get("token2wav_float16", False))
+        n_timesteps = _resolve_token2wav_n_timesteps(extra)
+        logger.info(
+            "Initializing MiniCPM-o Code2Wav backend: token2wav_n_timesteps=%d, "
+            "token2wav_float16=%s, platform=%s",
+            n_timesteps,
+            use_float16,
+            "npu" if current_omni_platform.is_npu() else "default",
+        )
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
@@ -786,7 +794,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             token2wav = Token2wav(
                 str(token2wav_path),
                 float16=use_float16,
-                n_timesteps=_resolve_token2wav_n_timesteps(extra),
+                n_timesteps=n_timesteps,
             )
         finally:
             torch.set_default_dtype(previous_dtype)

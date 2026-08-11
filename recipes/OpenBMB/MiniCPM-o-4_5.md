@@ -335,27 +335,38 @@ baseline). Fewer steps reduce vocoder work and may reduce audio quality, so a
 candidate must pass both Seed-TTS metrics and the full two-percentage-point
 quality gate before promotion. Step counts must be positive.
 
-Video-MME is available as a native benchmark dataset. Download the licensed
-videos according to the official Video-MME instructions, place the MP4 files
-under one local directory using their `videoID` names, and run:
+Video-MME is available through the competition's OmniEvalKit-compatible
+adapter. Download the licensed videos according to the official Video-MME
+instructions, place the MP4 files under one local directory using their
+`videoID` names, and download the official 2,700-row parquet annotation file.
+The MiniCPM protocol samples at most 96 frames, sends no audio or subtitles,
+and uses greedy 128-token text output:
 
 ```bash
 vllm bench serve --omni \
     --backend openai-chat-omni \
     --endpoint /v1/chat/completions \
     --model openbmb/MiniCPM-o-4_5 \
-    --dataset-name video-mme \
-    --dataset-path lmms-lab/Video-MME \
-    --video-mme-video-dir /data/Video-MME/videos \
-    --num-prompts 2700 \
-    --max-concurrency 1 \
-    --save-result
+    --dataset-name videomme \
+    --videomme-parquet /data/Video-MME/videomme/test-00000-of-00001.parquet \
+    --videomme-video-dir /data/Video-MME/videos \
+    --videomme-pack-mode minicpm-frames \
+    --videomme-max-frames 96 \
+    --videomme-duration all \
+    --videomme-save-eval-items \
+    --num-prompts 2700 --no-oversample \
+    --num-warmups 3 --max-concurrency 4 \
+    --temperature 0 --output-len 128 \
+    --extra-body '{"modalities":["text"],"enable_thinking":false}' \
+    --save-result --save-detailed \
+    --result-filename videomme.json
 ```
 
-Start the server with `--allowed-local-media-path /data/Video-MME/videos`, or
-add `--video-mme-inline-local-video` for small smoke runs. The saved JSON
+`minicpm-frames` extracts and embeds the sampled frames in each request, so the
+server does not need direct access to the source MP4 directory. The saved JSON
 contains overall accuracy plus official duration, domain, sub-category, and
-task-type breakdowns.
+task-type breakdowns. The competition reference is 69.0%; the two-point gate
+therefore requires at least 67.0% on all 2,700 questions.
 
 Run Daily-Omni with the MiniCPM interleaving protocol and Seed-TTS with content
 and speaker-similarity evaluation enabled:
@@ -366,13 +377,17 @@ vllm bench serve --omni \
     --endpoint /v1/chat/completions \
     --model openbmb/MiniCPM-o-4_5 \
     --dataset-name daily-omni \
-    --dataset-path liarliar/Daily-Omni \
+    --daily-omni-qa-json /data/benchmarks/Daily-Omni/qa.official.1197.json \
     --daily-omni-video-dir /data/benchmarks/Daily-Omni/Videos \
     --daily-omni-input-mode all \
     --daily-omni-pack-mode minicpm-interleave \
-    --num-prompts 1197 --max-concurrency 1 \
-    --percentile-metrics ttft,audio_ttfp,audio_rtf,audio_chunk_rtf \
-    --save-result --result-filename daily-omni.json
+    --daily-omni-save-eval-items \
+    --num-prompts 1197 --no-oversample \
+    --num-warmups 3 --max-concurrency 10 \
+    --temperature 0 --output-len 128 \
+    --extra-body '{"modalities":["text"],"enable_thinking":false}' \
+    --percentile-metrics ttft,e2el \
+    --save-result --save-detailed --result-filename daily-omni.json
 
 vllm bench serve --omni \
     --backend openai-chat-omni \
@@ -437,8 +452,8 @@ python -m vllm_omni.benchmarks.quality_gate \
 
 python -m vllm_omni.benchmarks.quality_gate \
     baseline-video-mme.json candidate-video-mme.json \
-    --require-metric video_mme_accuracy_incl_http_fail \
-    --require-evaluated-count video_mme_evaluated=2700 \
+    --require-metric videomme_accuracy_incl_http_fail \
+    --require-evaluated-count videomme_evaluated=2700 \
     --max-regression-pp 2
 
 python -m vllm_omni.benchmarks.quality_gate \

@@ -882,15 +882,57 @@ result is `organizer-protocol-daily-full-1197-c10-thinker-c8.json` (SHA-256
 c8 therefore remains an optional mean-TTFT/throughput profile. c6 is the next
 bounded experiment for recovering the full-run E2E tail.
 
+## Thinker c6 admission screen
+
+The bounded c6 profile keeps the same 8,192-token Stage 0 scheduler budget and
+adds only batch six to the accepted decode-graph shapes. On the same seeded,
+cache-empty, shuffled 32-row concurrency-ten screen, it preserved exact 20/32
+accuracy and completed all requests. Against the matching accepted c4 reverse
+control it improved duration by 17.60%, throughput by 21.35%, mean TTFT by
+19.53%, P99 TTFT by 7.66%, mean E2E by 14.65%, and P99 E2E by 14.20%.
+
+| Metric | Accepted c4 | c6 | Change |
+| --- | ---: | ---: | ---: |
+| Duration | 98.035 s | 80.783 s | -17.60% |
+| Throughput | 0.3264 req/s | 0.3961 req/s | +21.35% |
+| Mean / P99 TTFT | 23.058 / 32.277 s | 18.555 / 29.806 s | -19.53% / -7.66% |
+| Mean / P99 E2E | 27.973 / 39.132 s | 23.875 / 33.576 s | -14.65% / -14.20% |
+| Accuracy | 20/32 | 20/32 | exact parity |
+
+The detailed screen result is
+`thinker-c6-candidate-shuffled-c10-first.json` (SHA-256
+`4d7bef032e21c86caae8a525dfa7297578c17a050bceaa1d55b13ca371793cdf`).
+The screen qualifies c6 for the full 1,197-row run; it does not by itself
+promote the profile. The predeclared full-run guard remains zero HTTP failures,
+accuracy at or above 77.5%, and P99 E2E no more than 2% above the accepted c4
+result (41.457 seconds).
+
+## Video-MME official-adapter screen
+
+The first fail-closed real-service screen used the official 2,700-row parquet,
+local organizer videos, MiniCPM frame packing, 96 frames, no audio or subtitle,
+greedy decoding, 128 output tokens, and concurrency four. The adapter first
+prewarmed 32 unique videos with four bounded workers. A cold cache completed in
+71 seconds and persisted 96-frame JPEG sets outside the timed request section.
+
+All 32 requests completed, 22 answers were correct (68.75%), and there were no
+HTTP failures. This small screen is above the 67.0% organizer gate but is not a
+substitute for the full 2,700-row accuracy run. Mean/P99 TTFT were
+12.534/19.134 seconds and mean/P99 E2E were 14.278/21.343 seconds. The saved
+artifact contains aligned request IDs, per-request TTFT/E2E values, and all 32
+evaluation records. Its SHA-256 is
+`4770f4becab903be7d34cf2c5e6f776763afdacae3693615b9b2a6849e62338d`.
+
 ## Competition status and next experiment
 
 The accepted cache has passed the full 1,088-row Seed-TTS WER and official
 speaker-SIM gate. Daily-Omni has now passed the full 1,197-row organizer gate.
 Complete local Video-MME assets are present for 2,700 questions over 900 videos,
-and the official adapter is implemented; its full fail-closed run remains
-required before claiming a three-benchmark competition pass. Thinker c10 and
-c8 were not promoted because their full-run P99 E2E regressed 38.03% and
-29.79%, respectively; c6 is the next bounded admission experiment.
+and the official adapter has passed a real-service 32-row screen; its full
+fail-closed run remains required before claiming a three-benchmark competition
+pass. Thinker c10 and c8 were not promoted because their full-run P99 E2E
+regressed 38.03% and 29.79%, respectively. c6 passed the admission screen and
+is undergoing the full Daily-Omni gate.
 
 Further speed work must start from the post-cache trace rather than retry the
 rejected fused Top-P, exponential-race sampler, or whole-stack CFM

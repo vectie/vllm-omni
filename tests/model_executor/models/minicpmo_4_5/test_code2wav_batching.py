@@ -4,9 +4,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    _dit_mlp_residual,
+    _npu_dit_mlp_graph_enabled,
+    _npu_dit_mlp_graph_width,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -306,6 +310,69 @@ def test_adapter_caches_cosyvoice_timestep_embeddings_without_forward_calls():
     torch.testing.assert_close(actual, expected)
     assert cached is actual
     assert estimator.t_embedder.calls == calls_before_cache
+
+
+def test_dit_mlp_residual_matches_eager_block_math():
+    torch.manual_seed(7)
+    x = torch.randn(2, 5, 4)
+    shift = torch.randn(2, 1, 4)
+    scale = torch.randn(2, 1, 4)
+    gate = torch.randn(2, 1, 4)
+    fc1 = nn.Linear(4, 12)
+    fc2 = nn.Linear(12, 4)
+
+    normalized = F.layer_norm(x, (4,), eps=1e-6)
+    expected = x + gate * fc2(F.gelu(fc1(normalized * (1 + scale) + shift), approximate="tanh"))
+    actual = _dit_mlp_residual(
+        x,
+        shift,
+        scale,
+        gate,
+        fc1.weight,
+        fc1.bias,
+        fc2.weight,
+        fc2.bias,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, 50), ("64", 64)])
+def test_npu_dit_mlp_graph_width(monkeypatch, value: str | None, expected: int):
+    if value is None:
+        monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH", value)
+    assert _npu_dit_mlp_graph_width() == expected
+
+
+def test_npu_dit_mlp_graph_config_is_used_without_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH", raising=False)
+
+    assert _npu_dit_mlp_graph_enabled(True) is True
+    assert _npu_dit_mlp_graph_width(64) == 64
+
+
+def test_npu_dit_mlp_graph_environment_overrides_profile(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH", "off")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH", "25")
+
+    assert _npu_dit_mlp_graph_enabled(True) is False
+    assert _npu_dit_mlp_graph_width(50) == 25
+
+
+def test_invalid_npu_dit_mlp_graph_switch_is_rejected(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH", "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_MLP_GRAPH"):
+        _npu_dit_mlp_graph_enabled()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "bad"])
+def test_invalid_npu_dit_mlp_graph_width_is_rejected(monkeypatch, value: str):
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH", value)
+    with pytest.raises(ValueError, match="NPU_DIT_MLP_GRAPH_WIDTH"):
+        _npu_dit_mlp_graph_width()
 
 
 @pytest.mark.parametrize(("value", "expected"), [("0", 1), ("8", 8), ("bad", 4)])

@@ -788,4 +788,8 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+        self.backend = BatchedToken2Wav(
+            token2wav,
+            npu_dit_mlp_graph=extra.get("npu_dit_mlp_graph"),
+            npu_dit_mlp_graph_width=extra.get("npu_dit_mlp_graph_width"),
+        )

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from collections import OrderedDict
@@ -16,6 +17,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 _SILENCE_TOKEN = 4218
+_NPU_DIT_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH"
+_NPU_DIT_MLP_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH"
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +38,69 @@ def _autocast_disabled(device: torch.device):
 
 def tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
     return tuple(value.shape), str(value.dtype), value.device.type
+
+
+def _npu_dit_mlp_graph_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_MLP_GRAPH_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_MLP_GRAPH_ENV}={raw!r}")
+
+
+def _npu_dit_mlp_graph_width(config_value: Any = None) -> int:
+    env_value = os.environ.get(_NPU_DIT_MLP_GRAPH_WIDTH_ENV)
+    raw = env_value if env_value not in (None, "") else (50 if config_value is None else config_value)
+    try:
+        width = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {_NPU_DIT_MLP_GRAPH_WIDTH_ENV}={raw!r}") from exc
+    if width <= 0:
+        raise ValueError(f"{_NPU_DIT_MLP_GRAPH_WIDTH_ENV} must be positive, got {width}")
+    return width
+
+
+def _ensure_torchair_broadcast_alias() -> None:
+    """Repair a TorchAir registration-order incompatibility in vLLM workers.
+
+    vLLM's distributed initialization can register ``npu_define::broadcast``
+    before TorchAir imports its experimental converters. In that order,
+    TorchAir skips defining its module-local ``op_broadcast`` name and a later
+    converter import fails even though the operator itself is available.
+    Populate the missing alias without changing the installed torch-npu tree.
+    """
+    module = importlib.import_module(
+        "torchair._ge_concrete_graph.ge_converter.experimental.hcom_broadcast"
+    )
+    if not hasattr(module, "op_broadcast"):
+        broadcast = torch.ops.npu_define.broadcast
+        module.op_broadcast = getattr(broadcast, "default", broadcast)
+
+
+def _dit_mlp_residual(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    gate: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc1_bias: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    fc2_bias: torch.Tensor,
+) -> torch.Tensor:
+    """Fixed-shape DiT MLP/residual partition used by the NPU graph path."""
+    hidden = F.layer_norm(x, (x.shape[-1],), eps=1e-6)
+    hidden = hidden * (1 + scale) + shift
+    hidden = F.linear(hidden, fc1_weight, fc1_bias)
+    hidden = F.gelu(hidden, approximate="tanh")
+    hidden = F.linear(hidden, fc2_weight, fc2_bias)
+    return x + gate * hidden
 
 
 def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
@@ -64,7 +130,13 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(
+        self,
+        token2wav: Any,
+        *,
+        npu_dit_mlp_graph: Any = None,
+        npu_dit_mlp_graph_width: Any = None,
+    ):
         super().__init__()
         self._token2wav = token2wav
         self.flow = token2wav.flow
@@ -119,6 +191,77 @@ class BatchedToken2Wav(nn.Module):
         self._cfg_workspace: dict[tuple[str, tuple[int, ...], torch.dtype, str, int | None], torch.Tensor] = {}
         self._npu_cfm_graphs: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self._npu_cfm_graph_disabled = False
+        self._npu_dit_mlp_graph_enabled = _npu_dit_mlp_graph_enabled(npu_dit_mlp_graph)
+        self._npu_dit_mlp_graph_width = _npu_dit_mlp_graph_width(npu_dit_mlp_graph_width)
+        self._npu_dit_mlp_graph: Any | None = None
+        self._npu_dit_mlp_graph_disabled = False
+        self._npu_dit_mlp_graph_used = False
+        self._warmup_npu_dit_mlp_graph()
+
+    def _warmup_npu_dit_mlp_graph(self) -> None:
+        """Compile the fixed-width post-convolution partition during startup."""
+        if not self._npu_dit_mlp_graph_enabled:
+            return
+        estimator = getattr(getattr(self.flow, "decoder", None), "estimator", None)
+        blocks = getattr(estimator, "blocks", None)
+        if not blocks:
+            self._npu_dit_mlp_graph_disabled = True
+            logger.warning("MiniCPM-o NPU DiT MLP graph disabled: estimator blocks are unavailable")
+            return
+        block = blocks[0]
+        weight = getattr(getattr(block, "mlp", None), "fc1", None)
+        weight = getattr(weight, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.device.type != "npu":
+            self._npu_dit_mlp_graph_disabled = True
+            logger.warning("MiniCPM-o NPU DiT MLP graph disabled: estimator is not on NPU")
+            return
+        width = self._npu_dit_mlp_graph_width
+        hidden_size = int(weight.shape[1])
+        x = weight.new_zeros((2, width, hidden_size))
+        shift = weight.new_zeros((2, 1, hidden_size))
+        scale = weight.new_zeros((2, 1, hidden_size))
+        gate = weight.new_zeros((2, 1, hidden_size))
+        try:
+            graph_fn = self._get_npu_dit_mlp_graph()
+            if graph_fn is None:
+                return
+            with torch.inference_mode():
+                graph_fn(
+                    x,
+                    shift,
+                    scale,
+                    gate,
+                    block.mlp.fc1.weight,
+                    block.mlp.fc1.bias,
+                    block.mlp.fc2.weight,
+                    block.mlp.fc2.bias,
+                )
+            torch.npu.synchronize()
+            logger.info(
+                "Compiled MiniCPM-o NPU DiT MLP graph partition for CFG batch=2, width=%d, hidden=%d",
+                width,
+                hidden_size,
+            )
+        except Exception:
+            self._npu_dit_mlp_graph = None
+            self._npu_dit_mlp_graph_disabled = True
+            logger.warning("MiniCPM-o NPU DiT MLP graph compilation failed; using eager blocks", exc_info=True)
+
+    def _get_npu_dit_mlp_graph(self):
+        if self._npu_dit_mlp_graph_disabled:
+            return None
+        if self._npu_dit_mlp_graph is None:
+            from torch_npu.dynamo import torchair
+
+            _ensure_torchair_broadcast_alias()
+            compiler_config = torchair.CompilerConfig()
+            self._npu_dit_mlp_graph = torch.compile(
+                _dit_mlp_residual,
+                backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self._npu_dit_mlp_graph
 
     def _timeline_for(self, value: torch.Tensor) -> torch.Tensor:
         key = (value.device.type, value.device.index, value.dtype)
@@ -278,6 +421,41 @@ class BatchedToken2Wav(nn.Module):
         cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
+        graph_width = self._npu_dit_mlp_graph_width
+        use_mlp_graph = (
+            self._npu_dit_mlp_graph_enabled
+            and not self._npu_dit_mlp_graph_disabled
+            and estimator_input.device.type == "npu"
+            and int(estimator_input.shape[0]) == 2
+            and int(estimator_input.shape[2]) == graph_width
+            and cnn_cache is not None
+            and att_cache is not None
+        )
+        if use_mlp_graph:
+            try:
+                graph_fn = self._get_npu_dit_mlp_graph()
+                if graph_fn is not None:
+                    result = self._estimator_blocks_forward_chunk_mlp_graph(
+                        estimator,
+                        estimator_input,
+                        time_embedding,
+                        old_cnn,
+                        old_att,
+                        cnn_out,
+                        att_out,
+                        graph_fn,
+                    )
+                    if not self._npu_dit_mlp_graph_used:
+                        logger.info(
+                            "MiniCPM-o NPU DiT MLP graph replay active for CFG batch=2, width=%d",
+                            graph_width,
+                        )
+                        self._npu_dit_mlp_graph_used = True
+                    return result, cnn_out, att_out
+            except Exception:
+                self._npu_dit_mlp_graph = None
+                self._npu_dit_mlp_graph_disabled = True
+                logger.warning("MiniCPM-o NPU DiT MLP graph execution failed; using eager blocks", exc_info=True)
         result = estimator.blocks_forward_chunk(
             estimator_input,
             time_embedding,
@@ -288,6 +466,64 @@ class BatchedToken2Wav(nn.Module):
             att_out,
         )
         return result, cnn_out, att_out
+
+    @staticmethod
+    def _estimator_blocks_forward_chunk_mlp_graph(
+        estimator: nn.Module,
+        estimator_input: torch.Tensor,
+        time_embedding: torch.Tensor,
+        old_cnn: Any,
+        old_att: Any,
+        cnn_out: torch.Tensor,
+        att_out: torch.Tensor,
+        graph_fn: Any,
+    ) -> torch.Tensor:
+        """Run attention/conv eagerly and replay the fixed-width MLP graph."""
+        hidden = estimator.in_proj(estimator_input.transpose(1, 2))
+        for block_idx, block in enumerate(estimator.blocks):
+            if block.training or block.norm2.weight is not None or block.norm2.bias is not None:
+                raise RuntimeError("MiniCPM-o NPU DiT MLP graph requires eval-mode affine-free norm2")
+            if float(block.norm2.eps) != 1e-6:
+                raise RuntimeError(f"MiniCPM-o NPU DiT MLP graph requires norm2 eps=1e-6, got {block.norm2.eps}")
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                shift_conv,
+                scale_conv,
+                gate_conv,
+            ) = block.adaLN_modulation(time_embedding).chunk(9, dim=-1)
+
+            attention, new_att = block.attn.forward_chunk(
+                block.norm1(hidden) * (1 + scale_msa) + shift_msa,
+                old_att[block_idx],
+                None,
+            )
+            hidden = hidden + gate_msa * attention
+
+            convolution, new_cnn = block.conv.forward_chunk(
+                block.norm3(hidden) * (1 + scale_conv) + shift_conv,
+                old_cnn[block_idx],
+            )
+            hidden = hidden + gate_conv * convolution
+            hidden = graph_fn(
+                hidden,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                block.mlp.fc1.weight,
+                block.mlp.fc1.bias,
+                block.mlp.fc2.weight,
+                block.mlp.fc2.bias,
+            )
+            cnn_out[block_idx].copy_(new_cnn)
+            att_out[block_idx, :, :, : new_att.shape[2], :].copy_(new_att)
+
+        hidden = estimator.final_layer(hidden, time_embedding)
+        return hidden.transpose(1, 2)
 
     def _estimator_time_embeddings(
         self,

@@ -1,0 +1,20 @@
+# Atlas 800I A3 / Ascend 910C competition Thinker c6 admission candidate.
+#
+# c8 retains the desired throughput and TTFT gains but regresses full-run P99
+# E2E when long outputs share a larger decode batch. c6 is the next bounded
+# point between the accepted c4 tail and c8 mean-latency profile. Keep the
+# 8,192-token budget fixed to isolate admission/decode batch size.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 6
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_capture_sizes: [1, 2, 4, 6]

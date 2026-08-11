@@ -2287,6 +2287,20 @@ class TestPlatformOverrides:
         assert stages[2].yaml_engine_args["enable_prefix_caching"] is False
         assert deploy.stages[0].default_sampling_params["repetition_penalty"] == 1.2
 
+    def test_minicpmo_4_5_910c_thinker_c10_matches_client_concurrency(self):
+        deploy_path = Path(
+            get_deploy_config_path("minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_thinker_c10.yaml")
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.stages[0].max_num_seqs == 10
+        assert deploy.stages[0].max_num_batched_tokens == 8192
+        assert deploy.stages[0].compilation_config == {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 2, 4, 8, 10],
+        }
+        assert deploy.stages[1].max_num_seqs == 4
+
     def test_qwen3_tts_rocm_disables_code2wav_outer_cudagraph(self):
         deploy_path = Path(get_deploy_config_path("qwen3_tts.yaml"))
 

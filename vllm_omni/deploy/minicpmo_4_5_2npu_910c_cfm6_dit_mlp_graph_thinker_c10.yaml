@@ -1,0 +1,21 @@
+# Atlas 800I A3 / Ascend 910C competition Thinker-concurrency candidate.
+#
+# The organizer workload submits ten concurrent multimodal requests, while the
+# accepted profile admits and captures only four Thinker sequences. Raise the
+# Stage 0 admission bound to the client concurrency and add matching decode
+# graph sizes. Keep the 8,192-token scheduler budget unchanged so this first
+# A/B isolates admission/graph coverage from a later prefill-budget sweep.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 10
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_capture_sizes: [1, 2, 4, 8, 10]

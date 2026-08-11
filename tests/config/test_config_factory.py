@@ -2261,6 +2261,11 @@ class TestPlatformOverrides:
         assert thinker["temperature"] == 0.0
         assert thinker["max_tokens"] == 128
         assert thinker["repetition_penalty"] == 1.2
+        assert deploy.stages[0].engine_extras["limit_mm_per_prompt"] == {
+            "image": 96,
+            "audio": 64,
+            "video": 1,
+        }
         assert deploy.connectors is not None
         connector = deploy.connectors["connector_of_shared_memory"]
         assert connector["extra"]["token2wav_n_timesteps"] == 6

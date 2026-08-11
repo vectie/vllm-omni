@@ -381,6 +381,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Competition-exact MiniCPM Daily-Omni request contract | Shipped; full gate passed at 937/1,197 = 78.279%, zero HTTP failures |
 | Thinker-only multimodal prefix cache | Measured; retained opt-in for repeated-session media, rejected for competition because cache-empty P99 TTFT regressed 8.42% |
 | Thinker c10 admission/decode graph coverage | Measured; full throughput +4.61% and mean TTFT -20.33%, rejected because P99 TTFT/E2E regressed 2.39%/38.03% |
+| Thinker c8 admission/decode graph coverage | Measured; full throughput +4.97%, mean/P99 TTFT -20.95%/-19.88%, retained opt-in because P99 E2E regressed 29.79% |
 | Foreground/background scheduler classes | Designed, not implemented |
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |

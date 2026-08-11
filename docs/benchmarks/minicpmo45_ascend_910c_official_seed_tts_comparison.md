@@ -872,15 +872,25 @@ c10 therefore remains an experiment rather than replacing the accepted
 profile. The next admission point is c8, with the same 8,192-token budget and
 decode graph coverage through batch eight.
 
+The full c8 run improved duration by 4.74%, throughput by 4.97%, mean TTFT by
+20.95%, P99 TTFT by 19.88%, and mean E2E by 4.61%. Accuracy passed at
+938/1,197 = 78.363%, with zero HTTP failures and two parse failures. It also
+reduced c10's P99 E2E from 56.101 seconds to 52.752 seconds, but that is still
+a 29.79% regression from the accepted c4 run's 40.644 seconds. The detailed
+result is `organizer-protocol-daily-full-1197-c10-thinker-c8.json` (SHA-256
+`bc2ecc0b71cc8a3873c7b2cf53dabafbe53238543d683ef6823652947d57182d`).
+c8 therefore remains an optional mean-TTFT/throughput profile. c6 is the next
+bounded experiment for recovering the full-run E2E tail.
+
 ## Competition status and next experiment
 
 The accepted cache has passed the full 1,088-row Seed-TTS WER and official
 speaker-SIM gate. Daily-Omni has now passed the full 1,197-row organizer gate.
 Complete local Video-MME assets are present for 2,700 questions over 900 videos,
 and the official adapter is implemented; its full fail-closed run remains
-required before claiming a three-benchmark competition pass. Thinker c10 was
-not promoted because its full-run P99 E2E regressed 38.03%; c8 is the next
-bounded admission experiment.
+required before claiming a three-benchmark competition pass. Thinker c10 and
+c8 were not promoted because their full-run P99 E2E regressed 38.03% and
+29.79%, respectively; c6 is the next bounded admission experiment.
 
 Further speed work must start from the post-cache trace rather than retry the
 rejected fused Top-P, exponential-race sampler, or whole-stack CFM

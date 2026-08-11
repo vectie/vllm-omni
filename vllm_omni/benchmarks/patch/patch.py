@@ -477,6 +477,7 @@ def get_samples(args, tokenizer):
             duration_filter=getattr(args, "videomme_duration", "all"),
             use_subtitle=getattr(args, "videomme_use_subtitle", False),
             inline_local_video=getattr(args, "videomme_inline_local_video", False),
+            preprocess_workers=getattr(args, "videomme_preprocess_workers", 1),
             trust_remote_code=getattr(args, "trust_remote_code", False),
             no_stream=getattr(args, "no_stream", False),
             disable_shuffle=getattr(args, "disable_shuffle", False),

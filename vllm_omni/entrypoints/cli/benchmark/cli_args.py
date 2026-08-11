@@ -166,6 +166,12 @@ def add_videomme_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Override max sampled frames (OmniEvalKit defaults: 96 for minicpm-frames, 64 for minicpm-interleave).",
     )
     group.add_argument(
+        "--videomme-preprocess-workers",
+        type=int,
+        default=1,
+        help="Bounded workers for prewarming unique local videos into the persistent frame cache (default: 1).",
+    )
+    group.add_argument(
         "--videomme-duration",
         type=str,
         choices=["all", "short", "medium", "long"],

@@ -23,6 +23,7 @@ import re
 import time
 import zipfile
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -394,6 +395,7 @@ class VideoMMEDataset(BenchmarkDataset):
         duration_filter: VideoMMEDurationFilter = "all",
         use_subtitle: bool = False,
         inline_local_video: bool = False,
+        preprocess_workers: int = 1,
         trust_remote_code: bool = False,
         dataset_subset: str | None = None,
         no_stream: bool = False,
@@ -419,6 +421,9 @@ class VideoMMEDataset(BenchmarkDataset):
         self.duration_filter: VideoMMEDurationFilter = duration_filter
         self.use_subtitle = use_subtitle
         self.inline_local_video = inline_local_video
+        self.preprocess_workers = int(preprocess_workers)
+        if self.preprocess_workers < 1:
+            raise ValueError("preprocess_workers must be >= 1")
         self.trust_remote_code = trust_remote_code
         self.max_frames = int(
             max_frames
@@ -556,6 +561,8 @@ class VideoMMEDataset(BenchmarkDataset):
         if output_len is None:
             output_len = self.DEFAULT_OUTPUT_LEN
 
+        self._prewarm_frame_cache(num_requests)
+
         sampled: list[SampleRequest] = []
         cached_tokenizer = get_cached_tokenizer(tokenizer)
         # A cold frame cache costs a few seconds per video, so the whole set takes tens of
@@ -588,6 +595,53 @@ class VideoMMEDataset(BenchmarkDataset):
         logger.info("Created %d sample requests from Video-MME in %.0fs", len(sampled), time.monotonic() - started)
         self.maybe_oversample_requests(sampled, num_requests, request_id_prefix, no_oversample)
         return sampled
+
+    def _prewarm_frame_cache(self, num_requests: int) -> None:
+        """Decode selected unique videos concurrently before request construction.
+
+        The official set has three questions per video. The existing in-memory
+        and on-disk caches already prevent duplicate decoding; this bounded pool
+        only overlaps independent first decodes. Request order and benchmark
+        timing are unchanged because traffic starts after ``sample`` returns.
+        """
+        if self.preprocess_workers == 1 or self.pack_mode == "video_url" or self.inline_local_video:
+            return
+
+        try:
+            selected = self.data[: min(num_requests, len(self.data))]
+        except (TypeError, AttributeError):
+            # Streaming datasets cannot be indexed without consuming them.
+            logger.warning("Video-MME parallel preprocessing requires an indexable local dataset; using one worker")
+            return
+
+        video_ids: list[str] = []
+        seen: set[str] = set()
+        for item in selected:
+            video_id = self._normalize_fields(self._coerce_row(item))["video_id"]
+            if video_id and video_id not in seen:
+                seen.add(video_id)
+                video_ids.append(video_id)
+        if not video_ids:
+            return
+
+        # Build the nested-path index once; concurrent lazy construction would
+        # redundantly walk the complete 95GB video tree in every worker.
+        self._video_path_index()
+        include_audio = self.pack_mode == "minicpm-interleave"
+        started = time.monotonic()
+        logger.info(
+            "Video-MME prewarming %d unique videos with %d workers",
+            len(video_ids),
+            self.preprocess_workers,
+        )
+        with ThreadPoolExecutor(max_workers=self.preprocess_workers, thread_name_prefix="videomme-prep") as pool:
+            list(
+                pool.map(
+                    lambda video_id: self._get_minicpm_frame_parts(video_id, include_audio=include_audio),
+                    video_ids,
+                )
+            )
+        logger.info("Video-MME frame-cache prewarm finished in %.0fs", time.monotonic() - started)
 
     def _create_sample_request(
         self,

@@ -60,6 +60,29 @@ def test_omnievalkit_timestamp_sampling_caps_long_video_at_96_frames() -> None:
     assert timestamps[-1] < 120.0
 
 
+def test_parallel_prewarm_decodes_each_selected_video_once(monkeypatch) -> None:
+    dataset = VideoMMEDataset.__new__(VideoMMEDataset)
+    dataset.preprocess_workers = 2
+    dataset.pack_mode = "minicpm-frames"
+    dataset.inline_local_video = False
+    dataset.data = [
+        {"videoID": "v1", "question": "q1"},
+        {"videoID": "v1", "question": "q2"},
+        {"videoID": "v2", "question": "q3"},
+    ]
+    warmed: list[tuple[str, bool]] = []
+    monkeypatch.setattr(dataset, "_video_path_index", lambda: {})
+    monkeypatch.setattr(
+        dataset,
+        "_get_minicpm_frame_parts",
+        lambda video_id, *, include_audio: warmed.append((video_id, include_audio)),
+    )
+
+    dataset._prewarm_frame_cache(3)
+
+    assert sorted(warmed) == [("v1", False), ("v2", False)]
+
+
 def _request(request_id: str, gold: str, duration: str) -> VideoMMESampleRequest:
     return VideoMMESampleRequest(
         prompt="question",

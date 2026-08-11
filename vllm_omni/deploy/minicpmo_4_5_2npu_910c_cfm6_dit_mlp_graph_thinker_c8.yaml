@@ -1,0 +1,21 @@
+# Atlas 800I A3 / Ascend 910C competition Thinker c8 admission candidate.
+#
+# The c10 experiment improved full-run throughput and mean TTFT but admitted
+# enough simultaneous long multimodal prefills to regress P99 E2E. Admit eight
+# Thinker sequences and capture the matching decode batch instead. Keep the
+# 8,192-token scheduler budget unchanged so this A/B isolates admission from
+# the later prefill-budget sweep.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_capture_sizes: [1, 2, 4, 8]

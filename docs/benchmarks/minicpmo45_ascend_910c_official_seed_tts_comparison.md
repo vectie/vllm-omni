@@ -828,9 +828,9 @@ accuracy parity. A deliberately pre-warmed c10 upper bound hit 32/32 and ran
 results. The candidate remains opt-in and is not promoted into the organizer
 profile because the realistic cache-empty distribution fails the P99 guard.
 
-## Full competition Daily-Omni gate
+## Full competition Daily-Omni 8K control
 
-The accepted competition profile completed the untouched 1,197-row annotation
+The original c4 + 8K competition control completed the untouched 1,197-row annotation
 at concurrency 10:
 
 | Metric | Result |
@@ -951,6 +951,42 @@ performance but fail the predeclared full-run E2E-tail guard. c4 remains the
 competition default. Further admission points would either duplicate an
 already measured integer point or require an unsupported fractional policy.
 
+## Qualified c4 + 16K Thinker prefill budget
+
+With decode admission fixed at c4, the next candidate doubled only Stage 0's
+`max_num_batched_tokens` from 8,192 to 16,384. On the matching seeded,
+cache-empty 32-row concurrency-ten screen, it preserved 20/32 accuracy and all
+32 successful requests. It improved duration by 21.18%, throughput by 26.88%,
+mean/P99 TTFT by 14.35%/11.20%, and mean/P99 E2E by 21.88%/26.65%. The screen
+artifact is `competition-c4-prefill16k-shuffled-c10-first.json` (SHA-256
+`427276b727c155c612589e06e59b0a8f2c9e17b3db6861a4a699303a97ed4d8f`).
+
+The full 1,197-row qualification passed every predeclared promotion condition:
+
+| Metric | c4 + 8K control | c4 + 16K | Change |
+| --- | ---: | ---: | ---: |
+| Accuracy | 937/1,197 = 78.279% | 937/1,197 = 78.279% | exact aggregate parity |
+| HTTP failures | 0 | 0 | pass |
+| Parse failures | 3 | 4 | accuracy unaffected |
+| Duration | 3,176.652 s | 3,002.472 s | -5.48% |
+| Throughput | 0.3768 req/s | 0.3987 req/s | +5.80% |
+| Mean / P99 TTFT | 21.840 / 33.101 s | 21.318 / 31.653 s | -2.39% / -4.38% |
+| Mean / P99 E2E | 26.478 / 40.644 s | 25.020 / 40.289 s | -5.51% / -0.87% |
+
+The 40.289-second P99 E2E is 1.168 seconds below the predeclared 41.457-second
+guard. Per-request text and correctness are not bit-identical across the two
+batching policies, as expected for load-sensitive inference, but the aggregate
+accuracy is identical and remains 0.779 percentage points above the organizer
+gate. The qualified artifact is
+`organizer-protocol-daily-full-1197-c10-competition-prefill16k.json` (SHA-256
+`156a53c9ee29d4927f75d75d386c88e88fa5265489a2ff73709b3dbc0bb1397e`).
+
+The named `minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml`
+profile now carries c4 + 16K. The prior control remains reproducible as
+`minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition_prefill8k.yaml`, and
+all measured admission and prefix-cache experiments continue to inherit that
+8K replay base.
+
 ## Video-MME official-adapter screen
 
 The first fail-closed real-service screen used the official 2,700-row parquet,
@@ -977,8 +1013,10 @@ fail-closed run remains required before claiming a three-benchmark competition
 pass. Thinker c10 and c8 were not promoted because their full-run P99 E2E
 regressed 38.03% and 29.79%, respectively. c6 also remains experimental: it
 improved mean and P99 TTFT but regressed full-run P99 E2E by 24.24%. c5 reduced
-that regression to 12.02% but still failed the same guard, leaving c4 as the
-accepted competition profile.
+that regression to 12.02% but still failed the same guard. The subsequent c4 +
+16K prefill candidate passed the full gate and is now the accepted competition
+profile, with +5.80% throughput, -5.51% mean E2E, -4.38% P99 TTFT, -0.87% P99
+E2E, and identical aggregate accuracy versus the c4 + 8K control.
 
 Further speed work must start from the post-cache trace rather than retry the
 rejected fused Top-P, exponential-race sampler, or whole-stack CFM

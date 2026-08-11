@@ -337,6 +337,25 @@ by 5.25%, P99 per-chunk RTF by 2.08%, whole-audio RTF by 4.49%, audio TTFP by
 EN8 screen kept WER at 0.0000 and improved official WavLM SIM from 0.016932 to
 0.018103. It remains opt-in pending the three full competition suites.
 
+For the organizer contract, use the qualified c4 + 16K profile rather than the
+generic graph profile:
+
+```bash
+VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND=auto \
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml \
+  --trust-remote-code \
+  --allowed-local-media-path /data/benchmarks \
+  --interleave-mm-strings \
+  --host 0.0.0.0 --port 8099
+```
+
+Its Stage 0 16,384-token scheduler budget passed the full 1,197-row Daily-Omni
+gate at 937 correct (78.279%) with zero HTTP failures. Against the c4 + 8K
+control it improved throughput 5.80%, mean E2E 5.51%, P99 TTFT 4.38%, and P99
+E2E 0.87%. The 8K control remains available as the explicit
+`competition_prefill8k.yaml` replay profile.
+
 Opt-in experiments, one at a time:
 
 ```bash
@@ -374,7 +393,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Sticky fused-to-MATH Ascend SDPA adapter | Implemented, target proof required |
 | Exact-shape CFM graph replay | Implemented, off by default; full-loop capture rejected on measured 910C |
 | Exact output hash capture and deterministic JSON gate | Implemented |
-| Six- and eight-step CFM deploy profiles | Implemented; CFM6 passed the full 1,088-row Seed-TTS WER/SIM gate, Daily-Omni and Video-MME pending |
+| Six- and eight-step CFM deploy profiles | Implemented; CFM6 passed the full 1,088-row Seed-TTS WER/SIM gate and the combined competition profile passed Daily-Omni; Video-MME pending |
 | Talker sliding repetition-frequency cache | Shipped; exact parity and full 1,088-row Seed-TTS WER/SIM gate passed |
 | Fused Ascend Top-P/Top-K adapter | Rejected and removed; BF16 parity drift and 6.96-9.25% serving regressions |
 | Ascend exponential-race Talker sampler | Rejected and removed; 67.23-83.40% isolated latency regressions |
@@ -382,10 +401,12 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Thinker-only multimodal prefix cache | Measured; retained opt-in for repeated-session media, rejected for competition because cache-empty P99 TTFT regressed 8.42% |
 | Thinker c10 admission/decode graph coverage | Measured; full throughput +4.61% and mean TTFT -20.33%, rejected because P99 TTFT/E2E regressed 2.39%/38.03% |
 | Thinker c8 admission/decode graph coverage | Measured; full throughput +4.97%, mean/P99 TTFT -20.95%/-19.88%, retained opt-in because P99 E2E regressed 29.79% |
+| Thinker c6/c5 admission/decode graph coverage | Measured; rejected because full-run P99 E2E regressed 24.24%/12.02% despite mean-latency gains |
+| Thinker c4 + 16K prefill budget | Promoted; full Daily-Omni throughput +5.80%, mean E2E -5.51%, P99 TTFT/E2E -4.38%/-0.87%, identical 78.279% aggregate accuracy |
 | Foreground/background scheduler classes | Designed, not implemented |
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |
-| Fixed-width DiT MLP graph partition around eager convolution | Implemented; full Seed-TTS passed, Daily-Omni and Video-MME pending |
+| Fixed-width DiT MLP graph partition around eager convolution | Implemented; full Seed-TTS and Daily-Omni passed, Video-MME pending |
 | Broader cache-shape-bucketed DiT graph partitions | Next graph-coverage target |
 | Ascend-specific DiT layout/cache kernels | Profiler-triggered fallback if partitioning cannot remove launch overhead |
 | Deployment-distribution distillation/LoRA | Research fallback, not serving baseline |

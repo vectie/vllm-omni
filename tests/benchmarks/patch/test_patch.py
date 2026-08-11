@@ -12,7 +12,11 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
-from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput, async_request_openai_chat_omni_completions
+from vllm_omni.benchmarks.patch.patch import (
+    MixRequestFuncOutput,
+    _apply_usage_to_output,
+    async_request_openai_chat_omni_completions,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -291,6 +295,24 @@ async def test_output_tokens_initialization():
     # Assert
     assert hasattr(output, "output_tokens"), "MixRequestFuncOutput should have output_tokens attribute"
     assert output.output_tokens == 0, "output_tokens should be initialized to 0"
+
+
+def test_apply_usage_captures_prefix_cached_prompt_tokens():
+    output = MixRequestFuncOutput()
+
+    completion_tokens = _apply_usage_to_output(
+        output,
+        {
+            "prompt_tokens": 1024,
+            "prompt_tokens_details": {"cached_tokens": 768},
+            "completion_tokens": 1,
+        },
+    )
+
+    assert completion_tokens == 1
+    assert output.prompt_len == 1024
+    assert output.cached_prompt_tokens == 768
+    assert output.output_tokens == 1
 
 
 # ============================================================================

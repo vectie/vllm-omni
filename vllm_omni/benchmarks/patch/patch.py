@@ -571,6 +571,9 @@ if _serve_mod is not None:
 
 @dataclass
 class MixRequestFuncOutput(RequestFuncOutput):
+    #: Prompt tokens reused by prefix caching, when the server was started
+    #: with ``--enable-prompt-tokens-details``.
+    cached_prompt_tokens: int = 0
     audio_ttfp: float = 0.0
     audio_duration: float = 0.0
     audio_frames: int = 0
@@ -727,6 +730,15 @@ def _apply_usage_to_output(output: MixRequestFuncOutput, usage: dict[str, Any]) 
     """Apply OpenAI ``usage`` fields to the benchmark output."""
     if (pt := coerce_positive_int_scalar(usage.get("prompt_tokens"))) is not None:
         output.prompt_len = pt
+    prompt_details = usage.get("prompt_tokens_details")
+    if isinstance(prompt_details, dict):
+        cached_tokens = prompt_details.get("cached_tokens")
+        if (
+            isinstance(cached_tokens, int)
+            and not isinstance(cached_tokens, bool)
+            and cached_tokens >= 0
+        ):
+            output.cached_prompt_tokens = cached_tokens
     completion_tokens = coerce_positive_int_scalar(usage.get("completion_tokens"))
     if completion_tokens is not None:
         output.output_tokens = max(int(output.output_tokens or 0), completion_tokens)
@@ -1806,6 +1818,9 @@ async def benchmark(
             defs.AVERAGE_PIXELS_PER_IMAGE: getattr(metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
             defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
             "input_lens": [output.prompt_len for output in outputs],
+            "cached_prompt_tokens": [output.cached_prompt_tokens for output in outputs],
+            "prefix_cache_hit_requests": sum(output.cached_prompt_tokens > 0 for output in outputs),
+            "total_cached_prompt_tokens": sum(output.cached_prompt_tokens for output in outputs),
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
             "ttfts": [output.ttft for output in outputs],

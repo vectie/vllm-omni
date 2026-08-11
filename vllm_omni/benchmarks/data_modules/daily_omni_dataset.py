@@ -223,8 +223,9 @@ DAILY_OMNI_SYSTEM_TEXT = (
     "capable of perceiving auditory and visual inputs, as well as generating text and speech."
 )
 
-# MiniCPM-o ``get_sys_prompt(mode="omni")`` without ref-audio is an empty system string
-# (still sent as role=system; see ``_build_daily_omni_openai_messages``).
+# OpenBMB OmniEvalKit omits the system role when ``system_prompt`` is empty.
+# Keeping an empty system message still inserts chat-template control tokens and is
+# therefore not equivalent to the published MiniCPM-o 4.5 evaluation protocol.
 MINICPM_OMNI_SYSTEM_TEXT = ""
 
 
@@ -345,7 +346,10 @@ class DailyOmniDataset(BenchmarkDataset):
     #: Default Hub id for synthetic video URLs when ``qa_json_path`` is used (``dataset_path`` None).
     DEFAULT_HF_DATASET_ID = "liarliar/Daily-Omni"
     IS_MULTIMODAL = True
-    DEFAULT_OUTPUT_LEN = 256
+    # Daily-Omni's adapters and OpenBMB OmniEvalKit use 128 completion tokens
+    # for this MCQ. The strict prompt normally ends after one token, but pinning
+    # the published cap keeps pathological outputs comparable.
+    DEFAULT_OUTPUT_LEN = 128
 
     def __init__(
         self,
@@ -567,7 +571,7 @@ class DailyOmniDataset(BenchmarkDataset):
         Args:
             tokenizer: Tokenizer for computing prompt length
             num_requests: Number of requests to sample
-            output_len: Target output length in tokens (default: 256)
+            output_len: Target output length in tokens (default: 128)
             request_id_prefix: Prefix for request IDs
             no_oversample: If True, do not oversample if fewer examples available
             **kwargs: Additional arguments (ignored)
@@ -645,7 +649,7 @@ class DailyOmniDataset(BenchmarkDataset):
             return None
 
         messages = self._build_daily_omni_openai_messages(mm_payload, question, choice)
-        user_text = self._official_daily_omni_user_prompt(question, choice)
+        user_text = self._daily_omni_user_prompt(question, choice)
         # Text-only length estimate (same as before: no MM token count in bench).
         system_text = self._system_text_for_pack_mode()
         prompt_len = len(tokenizer.encode(f"{system_text}\n{user_text}" if system_text else user_text))
@@ -1250,10 +1254,30 @@ class DailyOmniDataset(BenchmarkDataset):
             return "\n".join(f"{k}. {v}" for k, v in choice.items())
         return str(choice)
 
-    def _official_daily_omni_user_prompt(self, question: str, choice: Any) -> str:
-        """User text block from Daily-Omni ``build_conversation`` (after media parts)."""
-        task_prompt = self._media_desc_for_official_prompt(self.input_mode)
+    def _daily_omni_user_prompt(self, question: str, choice: Any) -> str:
+        """Build the model-specific published Daily-Omni MCQ prompt.
+
+        Daily-Omni's Qwen adapter and OpenBMB's MiniCPM-o evaluator use different
+        instruction text. Packing MiniCPM media with the Qwen prompt can change
+        both answer format and accuracy, so the prompt is part of ``pack_mode``.
+        """
         choices = self._choices_repr_for_official_prompt(choice)
+        if self.pack_mode == "minicpm-interleave":
+            # OpenBMB/OmniEvalKit ``generation_configs.json`` ``daily_omni``.
+            # ``{media}`` is represented by the multimodal content parts that are
+            # prepended to this text in ``_build_daily_omni_openai_messages``.
+            return (
+                "Carefully read the following question and select the letter "
+                "corresponding to the correct answer.Highlight the applicable "
+                "choices without giving explanations.\n"
+                f"{question}\n"
+                "Options:\n"
+                f"{choices}\n"
+                "Please select the correct answer from the options above. Only "
+                "respond with the letter."
+            )
+
+        task_prompt = self._media_desc_for_official_prompt(self.input_mode)
         # Single f-string with explicit newlines avoids accidental implicit concatenation
         # gluing sentences (e.g. ``...media_desc.Select...``) when editing.
         return (
@@ -1273,15 +1297,12 @@ class DailyOmniDataset(BenchmarkDataset):
         choice: Any,
     ) -> list[dict[str, Any]]:
         """Map upstream conversation to OpenAI Chat Completions ``messages``."""
-        user_text = self._official_daily_omni_user_prompt(question, choice)
+        user_text = self._daily_omni_user_prompt(question, choice)
         mm_list: list[dict[str, Any]] = mm_payload if isinstance(mm_payload, list) else [mm_payload]
         user_content: list[dict[str, Any]] = [*mm_list, {"type": "text", "text": user_text}]
         system_text = self._system_text_for_pack_mode()
         messages: list[dict[str, Any]] = []
-        # MiniCPM-o ``get_sys_prompt(mode="omni")`` still emits role=system with empty
-        # content (no ref-audio). Truthiness would drop that role and change chat-template
-        # control tokens; keep the empty system message for minicpm-interleave.
-        if self.pack_mode == "minicpm-interleave" or system_text:
+        if system_text:
             messages.append({"role": "system", "content": [{"type": "text", "text": system_text}]})
         messages.append({"role": "user", "content": user_content})
         return messages

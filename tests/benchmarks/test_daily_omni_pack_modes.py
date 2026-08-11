@@ -2,8 +2,8 @@
 
 The ``minicpm-interleave`` mode is an accuracy-critical protocol: MiniCPM-o only reaches
 OpenBMB's reported Daily-Omni score when frames and 1s audio segments arrive strictly
-interleaved, with ``max_slice_nums=1`` / ``use_image_id=False`` and an empty MiniCPM
-system message (not the Qwen system prompt). These tests pin that contract so a refactor
+interleaved, with ``max_slice_nums=1`` / ``use_image_id=False``, no system role, and
+the OmniEvalKit MCQ prompt (not the Qwen prompt). These tests pin that contract so a refactor
 cannot silently regress the score.
 
 vllm stubs are installed by tests/benchmarks/conftest.py before collection.
@@ -309,16 +309,23 @@ def test_minicpm_interleave_missing_local_video_returns_none(qa_json, tmp_path) 
 # ---------------------------------------------------------------------------
 
 
-def test_minicpm_interleave_keeps_empty_system_message(monkeypatch, qa_json, video_dir) -> None:
-    """Official MiniCPM omni mode still sends role=system with empty content."""
+def test_minicpm_interleave_matches_omnievalkit_prompt(monkeypatch, qa_json, video_dir) -> None:
+    """OmniEvalKit omits an empty system prompt and pins the MCQ wording."""
     ds = _make_dataset(qa_json, video_dir, pack_mode="minicpm-interleave", input_mode="all")
     _stub_extract(monkeypatch, ds, [])
     parts, _extra, _position = ds._compose_daily_omni_multimodal(_VIDEO_ID, None)
 
     messages = ds._build_daily_omni_openai_messages(parts, "q?", {"A": "a"})
 
-    assert [m["role"] for m in messages] == ["system", "user"]
-    assert messages[0]["content"][0]["text"] == ""
+    assert [m["role"] for m in messages] == ["user"]
+    prompt = messages[0]["content"][-1]["text"]
+    assert prompt == (
+        "Carefully read the following question and select the letter corresponding "
+        "to the correct answer.Highlight the applicable choices without giving explanations.\n"
+        "q?\nOptions:\nA. a\n"
+        "Please select the correct answer from the options above. Only respond with the letter."
+    )
+    assert DailyOmniDataset.DEFAULT_OUTPUT_LEN == 128
 
 
 def test_qwen_pack_mode_keeps_system_message(qa_json, video_dir) -> None:

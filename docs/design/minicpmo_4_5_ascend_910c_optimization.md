@@ -374,7 +374,8 @@ Opt-in experiments, one at a time:
 ```bash
 VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH=1
 VLLM_OMNI_NPU_SYNC_BEFORE_DEVICE_EVENT=0  # TP=1 only
-VLLM_OMNI_MINICPMO45_CACHE_CONTROL_EMBEDDINGS=1  # native duplex, static weights only
+# Native duplex profile: duplex_session.cache_control_embeddings=true
+# Keep false when dynamic LoRA/adapters can mutate embedding weights.
 VLLM_OMNI_NPU_PROFILER_AIC_METRICS=PipeUtilization
 VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 ```
@@ -402,7 +403,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Stage 0 scheduler/KV continuity for native duplex | Shipped, experimental lifecycle boundary |
 | Per-chunk RTF, TTFT, TTFP, continuity, and benchmark quality gates | Shipped |
 | Raw-tensor SHM and event notification | Implemented, opt-in, target proof required |
-| Cached immutable Stage 0 control-token embeddings | Implemented, opt-in for static weights only |
+| Cached immutable Stage 0 control-token embeddings | Shipped in the static-weight native-duplex profile; exact operator parity, representative operator sequence -61.35%, resident Stage-0 TTFT mean -8.45% |
 | Sticky fused-to-MATH Ascend SDPA adapter | Implemented, target proof required |
 | Exact-shape CFM graph replay | Implemented, off by default; full-loop capture rejected on measured 910C |
 | Exact output hash capture and deterministic JSON gate | Implemented |

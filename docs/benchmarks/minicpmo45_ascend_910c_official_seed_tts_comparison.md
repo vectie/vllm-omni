@@ -1349,3 +1349,35 @@ control process remained blocked in the GlusterFS `lock_page` path after
 checkpoint loading and was stopped without recording benchmark data. The
 reported comparison therefore remains a real mixed-load screen, not a new
 official competition score.
+
+## Accepted native-duplex control-token embedding cache
+
+MiniCPM-o's persistent Stage-0 append path repeatedly injects the same small
+set of unit and boundary tokens. The existing opt-in cache keeps those token
+embeddings resident on the model device and returns the immutable tensor on
+subsequent appends. It is now exposed as the typed duplex setting
+`cache_control_embeddings` and enabled in the static-weight MiniCPM-o duplex
+profile. The default remains false, and deployments with dynamic LoRA or other
+embedding-weight mutation must not enable it.
+
+An exact-shape 910C operator screen used the checkpoint vocabulary and hidden
+dimensions (`151748 x 4096`, bfloat16) for 1,000 iterations after warmup:
+
+| Operation | Native mean | Cached mean | Change | Max abs delta |
+| --- | ---: | ---: | ---: | ---: |
+| One control-token embedding | 35.36 us | 18.43 us | -47.88% | 0 |
+| Three control embeddings plus concat | 95.95 us | 37.08 us | -61.35% | 0 |
+
+The full duplex service then completed one warmup and three resident requests.
+The warmup request paid graph/session materialization and is excluded. All
+three measured requests returned `ok=true`, the same `listen` decision, and no
+errors. Their Stage-0 TTFT values were 104.85, 97.09, and 98.71 ms: 100.21 ms
+mean and 98.71 ms median. Against the prior resident no-cache screen at
+109.47 ms, that is 8.45% lower mean and 9.83% lower median TTFT. The service
+remained healthy after the runs.
+
+This cache applies only to the native-duplex Stage-0 input builder. It cannot
+change the ordinary competition profile, sampling, Daily-Omni accuracy,
+Seed-TTS audio quality, or Video-MME results. Its promotion gate is therefore
+exact tensor parity plus native-duplex behavioral and latency stability rather
+than a rerun of unrelated ordinary-request suites.

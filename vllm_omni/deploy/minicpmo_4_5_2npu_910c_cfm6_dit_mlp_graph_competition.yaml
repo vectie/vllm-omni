@@ -7,12 +7,22 @@
 # Stage 0 uses the qualified 16K scheduler budget: on the full 1,197-row
 # Daily-Omni run it preserved 78.279% accuracy while improving throughput by
 # 5.80% and mean E2E by 5.51%, with P99 E2E inside the promotion guard.
+# Thinker and the much smaller Talker share NPU 0; Code2Wav owns NPU 1. The
+# reduced KV allocations still cover four 16K Thinker contexts and four 4K
+# Talker contexts, while removing sustained Talker/Code2Wav contention.
 
 base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition_prefill8k.yaml
 
 stages:
   - stage_id: 0
     max_num_batched_tokens: 16384
+    devices: "0"
+    gpu_memory_utilization: 0.72
+  - stage_id: 1
+    devices: "0"
+    gpu_memory_utilization: 0.08
+  - stage_id: 2
+    devices: "1"
 
 platforms:
   npu:

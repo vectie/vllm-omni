@@ -1477,3 +1477,96 @@ and, more importantly, replaces the receiver's production fallback of up to
 one millisecond between failed reads. Notifications therefore remain enabled
 for tail wakeup and idle-CPU behavior; only the raw serialization format is
 rejected.
+
+## Rejected post-cache kernel candidates
+
+Several additional 910C operator screens were completed before changing the
+stage topology. Each used the exact steady Code2Wav shapes and was rejected
+before promotion when its win did not survive the relevant higher-level gate.
+
+- Replacing the accepted TorchAir MLP partition with eager
+  `torch_npu.npu_ffn` took 154.85 us, and graphing that operator took 162.47 us,
+  versus 149.27 us for the accepted graph.
+- Packing the three attention projections reduced isolated eager preparation
+  from 119.40 us to 92.52 us. In the full three-run service A/B, however, mean
+  TTFP regressed 0.38%, P99 TTFP regressed 0.82%, and P99 chunk RTF regressed
+  1.55%. The candidate was reverted.
+- Direct `npu_fusion_attention` replay was slower than native SDPA at every
+  screened live width. Queue-amortized examples were 31.10 versus 37.48 us at
+  width 202 and 35.32 versus 40.99 us at width 502. The two exposed inference
+  attention-score variants were slower again at roughly 110--130 us.
+- A Triton-Ascend kernel fusing packed-QKV splitting, Q/K affine norms, layout,
+  and cache append preserved Q/V exactly and had a 1.53e-5 maximum K delta. It
+  improved the original preparation path by 5--12%, but remained 7--13% slower
+  than the already-rejected packed eager path.
+- FRACTAL_Z reduced an isolated convolution from 64.52 to 27.26 us, but the
+  complete two-convolution block regressed from 225.07 to 253.80 us because
+  its consumers paid the format conversion. FRACTAL_NZ linear weights were
+  also neutral to slower.
+
+The installed torch-npu emits `npu_fusion_attention_v3`, while its bundled
+TorchAir lacks that converter. An inference-only converter prototype mapped
+the dropout-free BNSD call to GE `FlashAttentionScore`; an exact static full
+attention partition then replayed in 123.91 us versus 254.60 us eager with
+bit-identical outputs. It could not be used directly in serving: Seed-TTS
+reference prompts produce variable initial cache lengths, so none of the four
+warmed static lengths replayed. A dynamic graph specialized and recompiled for
+every new length (4--29 seconds per shape), replayed in about 699 us versus
+265 us eager, and produced NaNs. A fixed-capacity scatter-plus-mask graph was
+also rejected: it took 1.72--1.86 ms versus 0.26--0.32 ms eager and introduced
+nontrivial output/cache drift. This closes high-level attention graphing on the
+installed stack; the 51% static-shape result remains useful evidence for a
+future purpose-built CANN operator with a native variable-length interface.
+
+## Accepted Thinker/Talker co-location and device-baseline fix
+
+The accepted two-NPU layout placed Talker and Code2Wav together on NPU 1 even
+though Thinker usually finishes the short TTS text response before most codec
+and audio work. The new competition layout places Thinker and Talker on NPU 0
+and gives Code2Wav exclusive use of NPU 1. Thinker memory utilization is 0.72
+and Talker is 0.08. Startup measured 71,808 Thinker KV tokens and 71,040 Talker
+KV tokens, covering the qualified c4/16K and c4/4K envelopes.
+
+The first launch exposed an independent parallel-initialization race. When the
+parent had no NPU visibility restriction, the runtime stored the baseline as
+`None`; the resolver interpreted that as "read the current environment" after
+the parallel diffusion initializer had temporarily selected NPU 1. Talker's
+requested NPU 0 was consequently remapped onto NPU 1. The runtime now records
+an unrestricted baseline explicitly as an empty string, and the resolver
+preserves the physical IDs from the deployment. The corrected log reports
+Stages 0/1 on NPU 0 and Stage 2 on NPU 1. The focused device-resolution and
+stage-initialization suite passes 45/45.
+
+Both variants were launched as fresh processes from the same source tree and
+ran the exact 32-prompt Seed-TTS protocol three times. Every run completed
+32/32 with zero failures, 100% streaming continuity, 4,801 input tokens, 480
+output tokens, 3,329,280 frames, and 138.72 seconds of audio. The promotion
+comparison uses the three-run median.
+
+| Gate metric | Fresh control | Co-located Talker | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 51.983 s | 47.327 s | -8.96% |
+| Request throughput | 0.6156 req/s | 0.6762 req/s | +9.84% |
+| Median TTFT | 333.54 ms | 321.25 ms | -3.68% |
+| P99 TTFT | 460.37 ms | 459.56 ms | -0.18% |
+| Mean audio TTFP | 858.67 ms | 849.54 ms | -1.06% |
+| P99 audio TTFP | 983.39 ms | 970.25 ms | -1.34% |
+| Mean per-chunk RTF | 0.3993 | 0.3692 | -7.55% |
+| P99 per-chunk RTF | 1.1149 | 1.1195 | +0.42% |
+| Mean E2E | 1,624.04 ms | 1,478.50 ms | -8.96% |
+| P99 E2E | 2,193.40 ms | 1,902.56 ms | -13.26% |
+
+Lower is better except for throughput. The sole regression is the 0.42% P99
+chunk-RTF movement, inside the 2% performance guard. Stage placement and KV
+capacity do not change weights, kernels, sampling, or request content, and the
+identical structural signature confirms that the existing full Seed-TTS,
+Daily-Omni, and Video-MME accuracy qualifications carry forward.
+
+```text
+104dd9236daea0659694cc1243d13c8c5b48c60da1d7ace24a8cccabbc2cecb7  fresh-control-run1.json
+e82b009f8b840459d846d7a8c44a8e01ca9a75db1c8102ccbe60b222eef4f1ff  fresh-control-run2.json
+df5406b0a4e8453dfd11ca7543d51fba7f891ae80da944727f559856bf29336d  fresh-control-run3.json
+a87bdcce96ad1745f6617024712e1d6a5484a3467640f42080b311189cf34776  talker0-candidate-run1.json
+b2ff698a7e0a6760eea4a0bd4820056e55bd0c751de881f827f33f80489ac3e1  talker0-candidate-run2.json
+5329f607c9aa8b234f02fd13330fd71d62fae7bca9d480561f1f9c67c3f42ae9  talker0-candidate-run3.json
+```

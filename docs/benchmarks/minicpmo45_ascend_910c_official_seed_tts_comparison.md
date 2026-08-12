@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 on Ascend 910C: official Seed-TTS comparison
 
-Date: 2026-08-09; optimization update: 2026-08-11
+Date: 2026-08-09; optimization update: 2026-08-12
 
 This report compares the pinned LunaNexa vLLM-Omni candidate, an optimized
 candidate built from it, and the competition's published Seed-TTS performance
@@ -1569,4 +1569,190 @@ df5406b0a4e8453dfd11ca7543d51fba7f891ae80da944727f559856bf29336d  fresh-control-
 a87bdcce96ad1745f6617024712e1d6a5484a3467640f42080b311189cf34776  talker0-candidate-run1.json
 b2ff698a7e0a6760eea4a0bd4820056e55bd0c751de881f827f33f80489ac3e1  talker0-candidate-run2.json
 5329f607c9aa8b234f02fd13330fd71d62fae7bca9d480561f1f9c67c3f42ae9  talker0-candidate-run3.json
+```
+
+## Rejected single-request Code2Wav cache-state packing
+
+The next Code2Wav candidate targeted the batch-of-one path used by the
+concurrency-one competition workload. The control rebuilt batched flow and
+HiFT cache tensors with seven `torch.cat` operations for every streamed chunk,
+even when only one request was active. Two progressively narrower variants
+were tested against a fresh control on the accepted Thinker/Talker co-located
+CFM6 profile.
+
+The first variant skipped both the input cats and the compact output-cache
+clones. It was rejected immediately: retaining detached views kept their
+larger backing tensors alive and increased allocator/lifetime pressure. The
+three-run median serving duration and mean E2E both regressed by about 3.5%,
+and mean audio TTFP regressed by 2.03%.
+
+The second variant removed only the seven redundant input cats and preserved
+the existing compact output clones. It passed an exact two-chunk state and
+audio parity test and completed all three service runs, but its performance
+result was mixed:
+
+| Three-run median metric | Fresh control | Input-only candidate | Change | Direction |
+| --- | ---: | ---: | ---: | --- |
+| Serving duration | 46.416 s | 46.511 s | +0.20% | slower |
+| Request throughput | 0.6894 req/s | 0.6880 req/s | -0.20% | slower |
+| Mean E2E | 1,449.92 ms | 1,453.04 ms | +0.22% | slower |
+| Median E2E | 1,472.86 ms | 1,469.72 ms | -0.21% | faster |
+| P99 E2E | 1,969.68 ms | 1,917.62 ms | -2.64% | faster |
+| Mean TTFT | 324.35 ms | 318.17 ms | -1.91% | faster |
+| Median TTFT | 325.78 ms | 319.48 ms | -1.93% | faster |
+| P99 TTFT | 458.48 ms | 463.08 ms | +1.00% | slower |
+| Mean audio TTFP | 836.42 ms | 832.45 ms | -0.47% | faster |
+| P99 audio TTFP | 998.92 ms | 980.67 ms | -1.83% | faster |
+| Mean whole-audio RTF | 0.3418 | 0.3421 | +0.09% | slower |
+| Median whole-audio RTF | 0.3325 | 0.3365 | +1.19% | slower |
+| P99 whole-audio RTF | 0.4162 | 0.4118 | -1.05% | faster |
+
+Lower is better except for throughput. Every run completed 32/32 requests
+with zero failures and 100% streaming continuity, and produced the identical
+4,801 input tokens, 480 output tokens, 3,329,280 audio frames, and 138.72
+seconds of audio. The saved client artifacts did not contain usable
+per-chunk-RTF samples (`null` for control and zero for the candidate), so that
+metric was not used to promote the change.
+
+The narrowed candidate's modest TTFT and tail-TTFP wins did not survive as a
+throughput, mean-E2E, or whole-audio-RTF improvement. Both variants were
+therefore removed from the runtime and deployment profile. This negative
+result also sets the next Code2Wav boundary: avoid Python-side micro-caches
+whose savings are below run-to-run service noise, and concentrate on measured
+NPU graph/operator work or larger stage scheduling changes.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-single-state-20260812/results
+```
+
+Result checksums:
+
+```text
+888295934fedcb084985679912c22f8fb825b71658db4d9a1a9a9c43ff1708d3  control-run1.json
+e2546312ae653137380b32a30f4d066268b53460380bb68d8f372fe92d6edef2  control-run2.json
+7b4be878c00dad9a92aed0b54c764bd0c948d979d179feb71bd1423bd84c1cd8  control-run3.json
+697e7e0bec5a52cf758430d74a3eb6f2bf3deeca56a04ea4544111c39186cbbf  candidate-run1.json
+1e153f3a927754d9bdca17c035cd340ea3a50ea857dc96c34680fc8d8bb24470  candidate-run2.json
+997493ac54045f1f143264cceb340f3f0fa1518c7d55818b56eee574c910f6a0  candidate-run3.json
+35731529c63e48c4ed8063529038d8926b078515579d94f525d7555c591dfc47  input-only-run1.json
+a2ca2a3f0b92d57f9287ebc787ee10af3219fe27b4d39714ad5a437dbd6de9b8  input-only-run2.json
+ba5ef71705eff7c2e31d9c1fceb5279c8c7dfdd02ede290b9fc3c64e8efb7cb9  input-only-run3.json
+```
+
+## Rejected early Code2Wav prompt prewarm
+
+This candidate tried to overlap Seed-TTS reference-audio prompt preparation
+on NPU 1 with Talker's accumulation of its first 25 codec tokens on NPU 0.
+The stage processor emitted one control-only payload as soon as the first
+codec token arrived. Code2Wav prepared and cached the reference features but
+did not create streaming state or run CFM/HiFT; the first real audio chunk
+kept sequence number zero and followed the unchanged generation path.
+
+The opt-in implementation passed 74 focused tests, including prompt-cache
+reuse, first-chunk ordering, cleanup, and invalid-switch coverage. It was then
+run three times against the same fresh control used for the narrowed
+cache-packing experiment. Every candidate run completed 32/32 requests with
+zero failures and produced the same 4,801 input tokens, 480 output tokens,
+3,329,280 audio frames, and 138.72 seconds of audio.
+
+| Three-run median metric | Fresh control | Prompt-prewarm candidate | Change | Direction |
+| --- | ---: | ---: | ---: | --- |
+| Serving duration | 46.416 s | 47.770 s | +2.92% | slower |
+| Request throughput | 0.6894 req/s | 0.6699 req/s | -2.83% | slower |
+| Mean E2E | 1,449.92 ms | 1,492.28 ms | +2.92% | slower |
+| Median E2E | 1,472.86 ms | 1,486.04 ms | +0.90% | slower |
+| P99 E2E | 1,969.68 ms | 2,002.92 ms | +1.69% | slower |
+| Mean TTFT | 324.35 ms | 326.49 ms | +0.66% | slower |
+| Median TTFT | 325.78 ms | 329.87 ms | +1.26% | slower |
+| P99 TTFT | 458.48 ms | 468.08 ms | +2.09% | slower |
+| Mean audio TTFP | 836.42 ms | 852.87 ms | +1.97% | slower |
+| Median audio TTFP | 840.65 ms | 838.00 ms | -0.32% | faster |
+| P99 audio TTFP | 998.92 ms | 991.09 ms | -0.78% | faster |
+| Mean whole-audio RTF | 0.3418 | 0.3512 | +2.75% | slower |
+| Median whole-audio RTF | 0.3325 | 0.3413 | +2.64% | slower |
+| P99 whole-audio RTF | 0.4162 | 0.4272 | +2.65% | slower |
+
+Lower is better except for throughput. The small median/tail TTFP movements
+did not compensate for regressions in duration, throughput, mean TTFP, E2E,
+TTFT tail, or whole-audio RTF. The additional cross-stage scheduling and IPC
+work costs more than the prompt preparation it overlaps at concurrency one.
+The candidate was therefore removed from both source and deployment state.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-prompt-prewarm-20260812/results
+```
+
+Result checksums:
+
+```text
+aaa02b02a5a0c1a87ffee2cb182f5c38893dd1cd9619fedde655ab9cb8629227  prompt-prewarm-run1.json
+d529dc0388f18e230aa5626f18d6484202ed2d90dc73ffa387e5c5f2cdb7ac0d  prompt-prewarm-run2.json
+43f7a57234642eddee62e7abd34b5624046586ab41b90c293cebe372d64f9f70  prompt-prewarm-run3.json
+```
+
+## Accepted prompt speaker-projection cache
+
+The next candidate removed repeated NPU work without changing stage traffic.
+MiniCPM-o previously normalized the immutable reference-speaker embedding and
+ran `spk_embed_affine_layer` during prompt setup and again for every streamed
+25-frame codec chunk. The prompt cache now stores that projected embedding
+beside the existing speech tokens and mel features, expands it by batch, and
+evicts it through the existing prompt lifecycle.
+
+The implementation preserves the original autocast context and mathematical
+order for each row. It changes no model weight, CFM step, random input,
+sampling operation, codec token, or HiFT operation. The focused Code2Wav suite
+passes 46/46, including an explicit assertion that two streamed chunks do not
+repeat the projection.
+
+Three fresh-process candidate runs used the same 32 fixed English prompts,
+three warmups, concurrency one, CFM6 profile, and nested TTS request body as
+the immediately preceding fresh control. Every run completed 32/32 with zero
+failure and 100% streaming continuity, and produced the identical 4,801 input
+tokens, 480 output tokens, 3,329,280 audio frames, and 138.72 seconds of audio.
+
+| Three-run median metric | Fresh control | Speaker-cache candidate | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 46.416 s | 45.954 s | -1.00% |
+| Request throughput | 0.6894 req/s | 0.6963 req/s | +1.01% |
+| Mean E2E | 1,449.92 ms | 1,435.69 ms | -0.98% |
+| Median E2E | 1,472.86 ms | 1,444.23 ms | -1.94% |
+| P99 E2E | 1,969.68 ms | 1,910.92 ms | -2.98% |
+| Mean TTFT | 324.35 ms | 318.52 ms | -1.80% |
+| Median TTFT | 325.78 ms | 324.49 ms | -0.39% |
+| P99 TTFT | 458.48 ms | 452.63 ms | -1.28% |
+| Mean audio TTFP | 836.42 ms | 828.27 ms | -0.98% |
+| Median audio TTFP | 840.65 ms | 834.45 ms | -0.74% |
+| P99 audio TTFP | 998.92 ms | 970.07 ms | -2.89% |
+| Mean whole-audio RTF | 0.3418 | 0.3383 | -1.02% |
+| Median whole-audio RTF | 0.3325 | 0.3314 | -0.35% |
+| P99 whole-audio RTF | 0.4162 | 0.4126 | -0.86% |
+
+Lower is better except for throughput. Every measured gate moves in the
+desired direction. The fresh control artifacts did not expose usable
+per-chunk-RTF samples, so those values were not used in the matched promotion
+decision; the candidate runs themselves were stable at 0.3576--0.3671 mean
+and 1.0968--1.1085 P99 per-chunk RTF.
+
+Because the output path and structural signature are unchanged, the accepted
+full Seed-TTS, Daily-Omni, and Video-MME qualifications carry forward. This
+candidate is promoted as an always-on prompt-cache optimization rather than a
+deployment switch.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-speaker-projection-cache-20260812/results
+```
+
+Result checksums:
+
+```text
+c62724cc2961ef621a3f823967ae934e7069bb0c2c9f4bbcf790f09b1cacb426  speaker-cache-run1.json
+7b5adf0fa934dcd4564d6fafd1cf1f9e4b60176eee7940722690bc826efd8814  speaker-cache-run2.json
+477b47c9365c8ba2744118f903ac54f3dd7e5431e23d823e4f032669c23ffdd2  speaker-cache-run3.json
 ```

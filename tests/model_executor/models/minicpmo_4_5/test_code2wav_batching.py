@@ -112,10 +112,20 @@ class _FakeFlow(nn.Module):
         self.encoder = _FakeEncoder()
         self.encoder_proj = nn.Identity()
         self.decoder = _FakeDecoder()
-        self.spk_embed_affine_layer = nn.Identity()
+        self.spk_embed_affine_layer = _CountingSpeakerProjection()
 
     def input_embedding(self, tokens):
         return tokens.to(torch.float32).unsqueeze(-1)
+
+
+class _CountingSpeakerProjection(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, value):
+        self.calls += 1
+        return value
 
 
 class _FakeHiFT(nn.Module):
@@ -244,6 +254,7 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     )
 
     assert token2wav.prompt_calls == 1
+    assert token2wav.flow.spk_embed_affine_layer.calls == 1
     assert token2wav.flow.encoder.calls == [2, 2]
     assert token2wav.flow.decoder.estimator.cfg_batches == [4, 4, 4, 4]
     assert all(order == [1.0, 1.0, 0.0, 0.0] for order in token2wav.flow.decoder.estimator.speaker_order)
@@ -254,6 +265,34 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+
+
+def test_adapter_caches_projected_speaker_for_all_stream_chunks():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    expected = F.normalize(prompt.speaker_embedding, dim=1)
+
+    assert torch.equal(prompt.projected_speaker_embedding, expected)
+    assert token2wav.flow.spk_embed_affine_layer.calls == 1
+
+    states = adapter.setup_batch(prompt, 1)
+    _, states = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=False,
+    )
+    adapter.decode_batch(
+        torch.tensor([[12, 13]]),
+        prompt,
+        states,
+        last_chunk=True,
+    )
+
+    assert token2wav.flow.spk_embed_affine_layer.calls == 1
+    assert adapter.prepare_prompt("shared", "/fake/prompt.wav") is prompt
+    assert token2wav.flow.spk_embed_affine_layer.calls == 1
 
 
 def test_adapter_reuses_timeline_and_cfg_workspaces():

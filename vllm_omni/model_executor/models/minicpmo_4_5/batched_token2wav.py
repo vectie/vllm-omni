@@ -113,6 +113,7 @@ def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
 class PromptFeatures:
     speech_tokens: torch.Tensor
     speaker_embedding: torch.Tensor
+    projected_speaker_embedding: torch.Tensor
     mels: torch.Tensor
 
 
@@ -326,9 +327,17 @@ class BatchedToken2Wav(nn.Module):
                     values = self._token2wav._prepare_prompt(prompt_wav)
             finally:
                 torch.set_default_dtype(previous_dtype)
+            # The reference speaker and projection weights are immutable for
+            # the lifetime of this prompt-cache entry. Project once instead
+            # of launching normalize + affine operators for every audio chunk.
+            with self._autocast(values[2].device):
+                projected_speaker = self.flow.spk_embed_affine_layer(
+                    F.normalize(values[2], dim=1)
+                ).detach()
             cached = PromptFeatures(
                 speech_tokens=values[0],
                 speaker_embedding=values[2],
+                projected_speaker_embedding=projected_speaker,
                 mels=values[3],
             )
             self._prompt_features[cache_key] = cached
@@ -342,7 +351,7 @@ class BatchedToken2Wav(nn.Module):
     def _repeat_prompt(features: PromptFeatures, batch_size: int) -> tuple[torch.Tensor, ...]:
         return (
             features.speech_tokens.expand(batch_size, -1),
-            features.speaker_embedding.expand(batch_size, -1),
+            features.projected_speaker_embedding.expand(batch_size, -1),
             features.mels.expand(batch_size, -1, -1),
         )
 
@@ -770,7 +779,7 @@ class BatchedToken2Wav(nn.Module):
         features: PromptFeatures,
         batch_size: int,
     ) -> list[BatchedToken2WavState]:
-        prompt_tokens, speakers, prompt_mels = self._repeat_prompt(features, batch_size)
+        prompt_tokens, projected_speakers, prompt_mels = self._repeat_prompt(features, batch_size)
         lookahead_width = self._pre_lookahead_len()
         lookahead = prompt_tokens.new_full(
             (batch_size, 3 if lookahead_width is None else lookahead_width),
@@ -783,7 +792,6 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=None,
                 att_cache=None,
             )
-            projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
             _, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
@@ -855,7 +863,7 @@ class BatchedToken2Wav(nn.Module):
                     f'"minimum":{lookahead + 1}}}'
                 )
         flow_cache = self._stack_flow_cache(states)
-        speakers = features.speaker_embedding.expand(batch_size, -1)
+        projected_speakers = features.projected_speaker_embedding.expand(batch_size, -1)
         with self._autocast(tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 tokens,
@@ -863,7 +871,6 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=flow_cache["conformer_cnn_cache"],
                 att_cache=flow_cache["conformer_att_cache"],
             )
-            projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),

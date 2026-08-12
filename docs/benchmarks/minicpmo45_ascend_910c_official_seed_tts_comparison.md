@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 on Ascend 910C: official Seed-TTS comparison
 
-Date: 2026-08-09; optimization update: 2026-08-10
+Date: 2026-08-09; optimization update: 2026-08-12
 
 This report compares the pinned LunaNexa vLLM-Omni candidate, an optimized
 candidate built from it, and the competition's published Seed-TTS performance
@@ -147,7 +147,215 @@ e5c89facb530357310cb6d18577f4f44e0ec1052bf0fb54b6e75d9d41ce554f7  delta-cache-ru
 7464973cfb64bbb2139b3afd5892ed84c010602f83eedcb4f3c111fb6144dbe7  delta-cache-performance-gate.json
 ```
 
-## Rejected NPU graph experiment
+## Opt-in eight-step CFM candidate
+
+Stage timing on the accepted ten-step service showed Code2Wav dominating the
+streaming path: its mean stage time was 1568.69 ms, compared with 269.09 ms
+for stage 0 and 822.45 ms for stage 1. The next candidate therefore reduces
+the Code2Wav Euler flow-matching schedule from ten evaluations to eight. No
+codec-window, context, transport, model-weight, or request setting changes.
+
+The candidate passed a fail-closed three-run median performance gate against
+the accepted ten-step delta-cache runs. Each run used the same 32 Seed-TTS
+English prompts, three warmups, concurrency one, and produced exactly 138.40
+seconds / 3,321,600 frames of audio with 32/32 completions.
+
+| Run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM8 1 | 320.00 ms | 906.57 ms | 0.3961 | 0.4193 | 1675.54 ms |
+| CFM8 2 | 315.07 ms | 903.72 ms | 0.3944 | 0.4172 | 1668.50 ms |
+| CFM8 3 | 314.92 ms | 905.78 ms | 0.3960 | 0.4187 | 1675.80 ms |
+
+| Gate metric | Ten-step median | Eight-step median | Change | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| Per-chunk audio RTF | 0.4797 | 0.4187 | -12.72% | passes 5% target |
+| Whole-audio RTF | 0.4475 | 0.3960 | -11.52% | passes 5% target |
+| Audio TTFP | 956.88 ms | 905.78 ms | -5.34% | passes 5% target |
+| End-to-end latency | 1885.22 ms | 1675.54 ms | -11.12% | passes 5% target |
+| TTFT | 313.19 ms | 315.07 ms | +0.60% | within 2% guard |
+
+Because the change alters the numerical sampler rather than removing redundant
+work, performance parity alone cannot promote it. A paired eight-prompt
+Seed-TTS English screen was run with the official protocols: Whisper Large v3
+for WER and the fine-tuned WavLM Large speaker-verification checkpoint for SIM.
+
+| Quality metric | Ten-step control | Eight-step candidate | Change |
+| --- | ---: | ---: | ---: |
+| WER, lower is better | 0.0000 (8/8) | 0.0000 (8/8) | 0.00 pp |
+| WavLM SIM, higher is better | 0.023218 | 0.027103 | +0.003885 (+0.39 pp) |
+
+Both WER runs exported 8/8 WAVs with no request, PCM, ASR, or scoring failure.
+The WavLM checkpoint mapped with zero missing model keys; the one extra loss
+projection key is unused for inference. A CPU/NPU check on the first candidate
+pair differed by less than 0.001 SIM. The low absolute SIM values therefore
+come from the paired output/reference set rather than an NPU-only numerical
+failure, but this small screen is not a competition accuracy claim.
+
+The downloaded evaluator needed device-neutral `.to(device)` calls and
+Python 3.12 / torchaudio 2.10 import compatibility shims. Those shims do not
+change audio, weights, embeddings, or cosine scoring. The exact upstream
+checkpoints used were:
+
+```text
+51f07e3b94d9e0262a6a675ef5a087be3dd09e8c62e9d886827f44f82fe7f94b  wavlm_large_finetune.pth
+6fb4b3c3e6aa567f0a997b30855859cb81528ee8078802af439f7b2da0bf100f  wavlm_large.pt
+```
+
+This candidate is available as the explicit opt-in deploy profile
+`vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm8.yaml`. The conservative 910C
+profile remains at ten steps until the full 1,088-row Seed-TTS WER/SIM run and
+the required Daily-Omni and Video-MME gates pass. The profile was also started
+without the timestep environment override and passed a post-warmup end-to-end
+smoke: one request completed in 1.70 seconds, generated 3.28 seconds / 78,720
+frames of audio, and preserved streaming continuity.
+
+Raw result checksums:
+
+```text
+3493b6771ce8d1161ada6da4b5115050fb6da0e5cf7bf3df7780624fe5ea4ec2  cfm8-run1.json
+12f6f180f50738855487390c51cd85c997fd8a68124e9d27b563abe4f0eb80f5  cfm8-run2.json
+0799b5e6252dc430239c3c906b39c43bab884754d998f7e8ed01e5febf028e17  cfm8-run3.json
+eb30375602233d9c9540b1c763f18eb6531d8672a06e6047efea6a4faad3654f  cfm8-performance-gate.json
+3f3f385e63319be0e49b02913c3a9f4921791f6e3bf29f8bbeff4959e2ad3dab  cfm8-quality-en8.json
+9f54c870928d02426aa30e4fca1ebef4f6cf74e344bb34aed5f03ab3900e9222  cfm10-quality-en8.json
+444ee7e57ad72f28ecad24ddd19c7f12103a8872b3970844cff528ac48da3f6f  cfm8-en-8/wav_res_ref_text.sim
+94d927fc3e78e83cb00e7bc56ae21fa2090b769fd1cdb759c6339ca5987e0b23  cfm10-en-8/wav_res_ref_text.sim
+00b88e046efccaa42db65f61d4ae74e256cc40434319dff87a778ebcd11fa3b9  cfm8-profile-smoke3-warm3.json
+```
+
+## Opt-in six-step CFM candidate
+
+Code2Wav remained the dominant stage after the eight-step optimization, so the
+next candidate reduced only the Euler flow-matching schedule from eight to six
+evaluations. Transport, codec windows, left context, model weights, request
+order, and sampling parameters stayed fixed. Three runs used the same 32
+Seed-TTS English prompts, three warmups, greedy decoding, and concurrency one.
+Every run completed 32/32 requests, generated exactly 138.40 seconds / 3,321,600
+frames, reported 100% streaming continuity, and measured zero underrun.
+
+| Run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM6 1 | 311.61 ms | 834.69 ms | 0.3628 | 0.3830 | 1547.55 ms |
+| CFM6 2 | 313.21 ms | 829.82 ms | 0.3589 | 0.3788 | 1530.69 ms |
+| CFM6 3 | 314.69 ms | 826.56 ms | 0.3572 | 0.3769 | 1523.17 ms |
+
+The fail-closed three-run median gate required at least 5% improvement on every
+audio/E2E target and allowed at most 2% TTFT regression:
+
+| Gate metric | Eight-step median | Six-step median | Change | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| Per-chunk audio RTF | 0.4187 | 0.3788 | -9.54% | passes 5% target |
+| Whole-audio RTF | 0.3960 | 0.3589 | -9.35% | passes 5% target |
+| Audio TTFP | 905.78 ms | 829.82 ms | -8.39% | passes 5% target |
+| End-to-end latency | 1675.54 ms | 1530.69 ms | -8.64% | passes 5% target |
+| TTFT | 315.07 ms | 313.21 ms | -0.59% | within 2% guard |
+
+A paired eight-prompt official Seed-TTS screen kept Whisper Large v3 WER at
+0.0000 for 8/8 utterances with no request, PCM, ASR, or scoring failure. The
+official fine-tuned WavLM Large speaker score moved from 0.027103 at eight steps
+to 0.016932 at six steps, an absolute drop of 0.010171 (1.02 percentage points),
+inside the competition's 2-point allowance. The six-step profile is therefore
+available at `vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6.yaml`, but remains
+opt-in until the full 1,088-row Seed-TTS run plus Daily-Omni and Video-MME gates
+pass. The conservative 910C profile remains at ten steps. The new YAML itself
+was also started without the timestep environment override and passed an
+eight-request, three-warmup smoke with 8/8 completions, 100% streaming
+continuity, zero underrun, and exactly 32.76 seconds / 786,240 frames of audio.
+
+Raw result checksums:
+
+```text
+d8a4f67e086876c9c9ad2b19714d78b2a6aafac0b83d947ac5ea4ffbcbfc2b90  cfm6-run1.json
+4aefd3a1c414e195fd52b2554bd29d69032607f69b533b8b4b3a7ceffb53ee68  cfm6-run2.json
+a45b5b526871b776cec72883ebe022e932aa3f71a3995e69ea954d4687c56e23  cfm6-run3.json
+181699c2eb017284b53d37e027c900b6784d0aea4828638b3802080c171d30e3  cfm6-performance-gate.json
+d522197f3a7ddf0ee04d1dcf1d903ab6412b93041bc29082960f66713041b99d  cfm6-quality-en8.json
+73349fc0d05d0de98d14067f0f1aea1b3ff4a2955ee63254771f8bf198dad7b1  cfm6-en-8/wav_res_ref_text.sim
+fc3c4c306e1534141a82a456f2655d042c395e0e2e87f4e29eae90f8bf2dd712  cfm6-profile-smoke8.json
+```
+
+## Opt-in fixed-width DiT MLP graph partition
+
+The full Code2Wav graph could not tolerate the estimator's internal-format
+Conv2D or growing attention-cache shapes. The narrower partition leaves
+attention and convolution eager and compiles only the affine-free `norm2`,
+modulation, two-layer MLP, gate, and residual expression. It runs only for
+steady streaming chunks with CFG batch 2 and width 50; setup, final, and
+mismatched shapes stay eager. One weight-parameterized TorchAir graph is
+shared by all 16 DiT blocks. Compile and replay failures fall back to eager.
+
+The installed TorchAir build also has an import-order defect when vLLM has
+already registered `npu_define::broadcast`: its converter skips a local
+`op_broadcast` alias that a later converter imports. The adapter repairs that
+missing alias from the registered operator without changing torch-npu.
+Startup logged a successful fixed-width compile, and the first live request
+logged graph replay with no fallback.
+
+Three candidate and three same-era control runs used 32 fixed Seed-TTS English
+prompts, three warmups, concurrency one, greedy decoding, and identical CFM6
+settings. Every run completed 32/32 requests with 100% streaming continuity
+and exactly 138.40 seconds / 3,321,600 frames of audio.
+
+| Run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM6 control 1 | 316.42 ms | 860.70 ms | 0.3825 | 0.4065 | 1628.55 ms |
+| CFM6 control 2 | 312.66 ms | 823.82 ms | 0.3606 | 0.3798 | 1535.94 ms |
+| CFM6 control 3 | 463.18 ms | 975.96 ms | 0.3923 | 0.4182 | 1691.61 ms |
+| MLP graph 1 | 317.85 ms | 848.38 ms | 0.3653 | 0.3853 | 1553.95 ms |
+| MLP graph 2 | 314.51 ms | 842.88 ms | 0.3607 | 0.3807 | 1537.23 ms |
+| MLP graph 3 | 333.34 ms | 858.88 ms | 0.3672 | 0.3852 | 1554.48 ms |
+
+The host produced latency spikes in control run 3, so the result uses the
+predeclared three-run median rather than selecting the best run:
+
+| Gate metric | CFM6 median | MLP graph median | Change |
+| --- | ---: | ---: | ---: |
+| Per-chunk audio RTF | 0.4065 | 0.3852 | -5.25% |
+| P99 per-chunk audio RTF | 1.1587 | 1.1346 | -2.08% |
+| Whole-audio RTF | 0.3825 | 0.3653 | -4.49% |
+| Audio TTFP | 860.70 ms | 848.38 ms | -1.43% |
+| End-to-end latency | 1628.55 ms | 1553.95 ms | -4.58% |
+| TTFT | 316.42 ms | 317.85 ms | +0.45% |
+
+The primary per-chunk metric clears the 5% target, P99 also improves, and TTFT
+stays inside the 2% guard. The other audio/E2E metrics improve but do not all
+clear 5%, so this is an opt-in incremental promotion rather than a new default.
+
+An eight-prompt graph-path quality screen completed 8/8 requests and exported
+all WAVs. Whisper Large v3 WER remained 0.0000 for 8/8 with no ASR or PCM
+failure. Official fine-tuned WavLM Large SIM was 0.018103 versus CFM6's
+0.016932, an improvement of 0.001171 (+0.12 percentage points). The profile is
+`vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph.yaml`. Environment
+variables can override its switch or width for fail-closed operations. A
+profile-only restart (without the graph environment switch) then completed an
+8/8 smoke with the exact 1,197 input-token, 116 output-token, and 786,240-frame
+signature; the service log confirmed graph compilation and replay. The full
+1,088-row Seed-TTS, Daily-Omni, and Video-MME gates remain required.
+
+Raw result checksums:
+
+```text
+cf6bdbf5b7356c6f4c05d6540793ddf7a0ba3c15290af7054663e28c045cc132  cfm6-same-era-control-run1.json
+a11a68f8095ebc40ef1e490a6f4e10aca02a0f67bd525a95bfb4efd2ef6e55d4  cfm6-same-era-control-run2.json
+e341a54432077b4c7209c40d36fce8048df62f269a5afd19f54918b838ca9856  cfm6-same-era-control-run3.json
+d6e4de70dc62bd082c35f076fe1916fa2d53fd6cc44ccc3e53cc63f3b75a800a  cfm6-dit-mlp-graph-run1.json
+153a7004fc6fea076b61680f5c751ed444eb67444ee62c7cdd6151985b4abb4f  cfm6-dit-mlp-graph-run2.json
+c43a425190f8a3ee8053386942f68f92e73e58a131837e9e24c6f43d839b4577  cfm6-dit-mlp-graph-run3.json
+5dc89bf3d864595ac84a3fca73c70aae7309569729561b54c236b078b7757b87  cfm6-dit-mlp-graph-quality-en8.json
+46072dcc2a66ddea019decdeef11eff89e5addb820bfc627360fc70c3732d289  cfm6-dit-mlp-graph-en-8/wav_res_ref_text.sim
+a4c294497a180caf079a4c73d60213ef5514a84ddf4cc7fb394202544bab3e84  cfm6-dit-mlp-graph-profile-smoke8.json
+```
+
+### Rejected shorter initial codec window
+
+Reducing only the initial codec window from 25 to 12 frames improved the
+eight-prompt audio TTFP to 859.98 ms, but mean per-chunk RTF regressed to
+0.7409 and P99 per-chunk RTF reached 3.0611. Whole-audio RTF was 0.4466 and
+all requests completed, so this was a scheduling-quality failure rather than
+a crash. It is rejected because the competition explicitly scores every
+audio chunk's RTF, not only first-packet latency.
+
+## Rejected full-loop NPU graph experiment
 
 NPU CFM graph replay remains disabled. The initial graph path failed because
 the upstream timestep embedder copied a CPU tensor during capture. After the
@@ -158,8 +366,9 @@ to 1.43, per-chunk RTF to 1.60, and raised logical-chip-1 HBM from about 45.4
 GiB to 51.5 GiB. Growing attention-cache shapes are part of the graph key, so
 the observed behavior is consistent with capture churn and cache eviction.
 
-That experimental runtime change was reverted. A viable graph implementation
-needs fixed/padded cache buckets and output-buffer reuse before retesting.
+That full-loop runtime change was reverted. The narrower fixed-width MLP
+partition described above avoids both failure modes; attention-cache bucketing
+would still be required before expanding graph coverage around attention.
 
 ## Pre-optimization reference
 
@@ -212,10 +421,13 @@ VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH=0
 VLLM_OMNI_NPU_SYNC_BEFORE_DEVICE_EVENT=0
 ```
 
-The installed CANN environment does not expose the custom-op package expected
-by vLLM-Ascend, so custom ops were disabled and `fuse_norm_quant` was disabled
-through the Ascend compilation config. These settings define this experiment;
-numbers from a custom-op-capable image must be reported separately.
+The launch profile requested `VLLM_ASCEND_ENABLE_CUSTOM_OPS=0` and
+`fuse_norm_quant=false`, but the installed development vLLM-Ascend build did
+not honor those legacy controls: its engine log reports enabled `norm_quant`
+and `act_quant` fusions and `pass_config.fuse_norm_quant=true`. The same
+observed backend configuration was held fixed within each valid A/B run.
+Results from a different backend build or pass configuration must be reported
+as a separate profile.
 
 ## Hardware topology
 
@@ -271,16 +483,1276 @@ Optimized raw results and the healthy final server log are under:
 /workspace/user_data/lunanexa-stack/experiments/minicpmo45-audio-opt-20260810
 ```
 
+## Same-backend allocation-reuse experiment (rejected)
+
+The installed vLLM-Ascend development tree changed after the earlier resident
+server started. A new same-backend control was therefore built from the
+verified compatibility tree, with only `batched_token2wav.py` restored to
+commit `b1192725`. SHA-256 checks confirmed that the control and candidate
+matched for every NPU runner and scheduler compatibility file and differed
+only in the proposed Code2Wav allocation change.
+
+The candidate preallocated all ten CFM step-output buffers as leading-dimension
+stacks, removed the final `torch.stack` copies, and elided single-request flow
+and HIFT cache clones. The idea reduced allocation count, but increased the
+live working set and was slower on this 910C profile.
+
+Three 32-request repetitions per variant used the same process warmup sequence
+and produced identical totals in every run: 4,801 input tokens, 480 output
+tokens, 3,321,600 audio frames, and 138.40 seconds of audio.
+
+| Variant | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Same-backend control | 330.97 ± 11.15 ms | 987.16 ± 8.87 ms | 0.4485 ± 0.0020 | 0.4792 ± 0.0021 | 1,890.08 ± 8.59 ms |
+| Allocation-reuse candidate | 328.31 ± 3.37 ms | 1,015.15 ± 1.22 ms | 0.4900 ± 0.0011 | 0.5307 ± 0.0025 | 2,062.55 ± 5.72 ms |
+
+The fail-closed median gate rejected the candidate:
+
+- whole-audio RTF regressed 9.49%;
+- audio TTFP regressed 3.06%;
+- E2E regressed 9.25%, beyond the 2% guard;
+- TTFT improved 0.39%, which does not compensate for the audio regressions.
+
+The allocation/copy patch was reverted. The backend compatibility fixes were
+retained: legacy/current context-parallel managers, optional profiling config
+locations, the added full-graph `positions` argument, and scheduler
+`_free_request` dict/`None` versus tuple returns. The combined Code2Wav, NPU,
+and scheduler gate passes 48/48 after the rejected candidate-only test is
+removed.
+
+Raw control/candidate results and the machine-readable rejection report are
+under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-audio-opt-20260810/allocation-v2
+```
+
+## Post-CFM6 910C profiling and rejected candidates
+
+A fresh CFM6 service was profiled on the same Atlas A3 / 910C host after the
+six-step profile was accepted. The stage-2 kernel trace attributed 451.6 ms
+of device time as follows:
+
+| Operator family | Device time | Share |
+| --- | ---: | ---: |
+| TransData | 98.33 ms | 21.77% |
+| Transpose | 65.80 ms | 14.57% |
+| MatMulV2 | 45.94 ms | 10.17% |
+| LayerNormV3 | 42.03 ms | 9.31% |
+| Mul | 35.97 ms | 7.97% |
+| Add | 31.68 ms | 7.02% |
+| ConcatD | 26.86 ms | 5.95% |
+| Slice | 24.49 ms | 5.42% |
+| FlashAttention | 16.64 ms | 3.69% |
+| Conv2D | 15.53 ms | 3.44% |
+
+The host trace also reported 2,973 `aclnnCat` calls taking 749 ms, 3,666
+`aclnnAdd` calls taking 497 ms, 3,744 `aclnnAddmm` calls taking 381 ms, and
+1,758 `aclnnAdds` calls taking 319 ms. The next major target is therefore the
+DiT block's layout/construction and launch overhead, not FlashAttention or the
+Conv2D arithmetic alone.
+
+The exact benchmark protocol matters. In particular, MiniCPM-o's TTS template
+kwargs must be nested in the HTTP extra body; the benchmark CLI's top-level
+`--chat-template-kwargs` does not populate the custom Omni backend payload.
+The validated request fragment is:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-chat-omni \
+  --endpoint /v1/chat/completions \
+  --model openbmb/MiniCPM-o-4_5 \
+  --tokenizer /models/OpenBMB/MiniCPM-o-4_5 \
+  --trust-remote-code \
+  --dataset-name seed-tts \
+  --dataset-path /benchmarks/seedtts_testset \
+  --seed-tts-root /benchmarks/seedtts_testset \
+  --seed-tts-locale en \
+  --num-prompts 32 --num-warmups 3 \
+  --max-concurrency 1 --request-rate inf --seed 0 --temperature 0 \
+  --extra-body '{"modalities":["text","audio"],"chat_template_kwargs":{"use_tts_template":true,"enable_thinking":false}}'
+```
+
+Every valid 32-request run produced the same structural signature: 4,801
+input tokens, 480 output tokens, 3,321,600 audio frames, and 138.40 seconds of
+audio. A fresh three-run CFM6 control reproduced that signature:
+
+| Run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Fresh CFM6 1 | 313.68 ms | 824.42 ms | 0.3693 | 0.3948 | 1573.71 ms |
+| Fresh CFM6 2 | 315.70 ms | 836.57 ms | 0.3731 | 0.3983 | 1588.51 ms |
+| Fresh CFM6 3 | 450.54 ms | 965.92 ms | 0.4130 | 0.4295 | 1715.40 ms |
+
+The third run contains a host-latency excursion, so promotion decisions use
+the three-run median and a same-era control rather than selecting the best
+run. The following candidates were rejected and fully reverted:
+
+| Candidate | Per-chunk RTF | Whole RTF | Audio TTFP | E2E | Reason |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Five CFM steps | +1.91% | +3.54% | +13.25% | +4.17% | Slower than fresh CFM6; no quality budget spent |
+| Split K/V cache | +1.90% | +1.66% | +4.79% | +1.58% | More layout/view overhead than concatenation saved |
+| Fused CFG/Euler expression | +1.16% | +1.38% | -0.15% | +1.38% | Small TTFP win, audio/E2E regression |
+| In-place CFG/Euler update | +0.57% | +0.76% | -0.32% | +0.76% | Small TTFP win, audio/E2E regression |
+
+The first post-profile kernel experiment was also rejected before service
+integration. It fused the affine-free LayerNorm plus AdaLN shift/scale into
+one Ascend Triton kernel and fused the final AdaLN gate plus residual into a
+second kernel for the exact steady Code2Wav shape: BF16 `[2, 50, 512]` with
+`[2, 1, 512]` conditioning. After 100 warmups, a 1,000-iteration synchronized
+screen on the free logical 910C device measured:
+
+| Exact-shape expression | Native eager | Triton prototype | Change |
+| --- | ---: | ---: | ---: |
+| LayerNorm + shift/scale | 47.74 us | 82.80 us | +73.43% |
+| Gate + residual | 20.81 us | 85.80 us | +312.31% |
+
+Lower is better. The LayerNorm path also differed from the native BF16 result
+by 0.0625 maximum absolute and 0.00230 mean absolute because the fused kernel's
+reduction order did not reproduce the stock operator. The prototype was
+removed. This rules out small pointwise Triton replacements on this workload;
+the next kernel attempt must cover a substantially larger, layout-aware DiT
+boundary and eliminate enough `TransData`, transpose, and host launches to
+amortize custom-kernel dispatch.
+
+Full-loop NPU graph replay remains rejected. Native `NPUGraph` cannot capture
+the estimator's internal-format Conv2D. Disabling internal formats allowed a
+TorchAir graph to capture, but its first compilation took 108.5 seconds and
+new streaming-cache shapes triggered 10--17 second recompilations. A viable
+implementation needs fixed cache-shape buckets and an eager boundary around
+the convolution path before it can be benchmarked again.
+
+A 25/50-frame chunk experiment kept the first packet at 25 codec frames and
+doubled only steady-state windows. Its eight-request screen preserved 786,240
+frames / 32.76 seconds and continuity, improved whole-audio RTF by 10.08%,
+audio TTFP by 2.04%, and E2E by 10.12%, but regressed mean per-chunk RTF by
+12.41%, P99 per-chunk RTF by 0.25%, and TTFT by 2.26%. It was rejected because
+the competition scores chunk delivery, not only aggregate completion time.
+
+Raw result checksums:
+
+```text
+3f26e832766af342c2901b8a74faddc7bb4ab889fbd164cd4c86e84a2f20fb9d  cfm6-fresh-control-run1.json
+955c87cbebceebfd019d3ed7a0db13ddd3121486e16b98f5cfd715b814c5f38e  cfm6-fresh-control-run2.json
+52ede14e3c277d6bc4e09ef8616984c2dcde088dafd88f8b3249fe1535e05d28  cfm6-fresh-control-run3.json
+7145110de7b5f12cc1d174c9ac2e0b47c5726200351da2373f15692942f38d38  cfm5-run1.json
+8ac7f5b5477c5ba0043509abf541d951fe9e935d62f8fbf26f536ac19898be0c  cfm5-run2.json
+93ffd114d255a0b2cd56d4f590be3a98e5da788e1d3bf74f56b22ab84f8a9004  cfm5-run3.json
+3dfc1e81ca830dad3e86afe34293dd50d9e20e4129ca4e7905d4805bbda25350  cfm6-chunk50-smoke8.json
+```
+
+## Accepted Talker repetition-frequency cache
+
+A focused Stage-1 trace captured 340 Talker codec steps. `Bincount` ran on AI
+CPU 336 times for 48.14 ms (6.16% of traced device time, 143.3 us average).
+The host trace also recorded 2,732 scalar reads. The longest reads immediately
+followed `torch.multinomial`, while another synchronization occurred inside
+`bincount`. This made the repetition histogram a narrower target than changing
+the Talker transformer or its already-replaying decode graphs.
+
+The accepted implementation stores the exact 16-code frequency vector per
+request and advances it with device-native equality/add/subtract operations.
+It does not change the seed, logits warpers, sampling order, EOS check, codec
+history, or Code2Wav inputs. Focused CPU tests compare both the full penalty
+and incremental window eviction against the former `torch.bincount` result.
+On NPU 1, an isolated 1,000-iteration microbenchmark reduced the hot section
+from 434.77 us mean / 412.48 us P50 to 254.46 us mean / 247.11 us P50, a 41.5%
+mean reduction.
+
+The synchronization was optimized separately and rejected. Skipping
+`sampled.item()` while EOS was masked preserved structure but regressed the
+three-run median whole RTF by 2.77%, chunk RTF by 2.66%, TTFP by 2.37%, and
+E2E by 2.87%. The change was fully reverted before measuring the frequency
+cache; shared Talker/Code2Wav pacing on logical NPU 1 is part of the measured
+system behavior.
+
+The cache candidate used the same CFM6 + fixed-width DiT MLP graph service,
+32 fixed English prompts, three warmups, concurrency one, greedy outer-token
+decoding, and nested MiniCPM-o TTS template body as the fresh control. Every
+run completed 32/32 with 4,801 input tokens, 480 output tokens, 3,321,600
+frames, 138.40 seconds of audio, and 100% streaming continuity.
+
+| Run | TTFT | Audio TTFP | Whole-audio RTF | Per-chunk RTF | P99 chunk RTF | E2E |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cache 1 | 319.42 ms | 829.88 ms | 0.3503 | 0.3699 | 1.1115 | 1488.39 ms |
+| Cache 2 | 713.75 ms | 1225.09 ms | 0.4413 | 0.4691 | 1.9112 | 1887.05 ms |
+| Cache 3 | 319.48 ms | 833.82 ms | 0.3520 | 0.3718 | 1.1049 | 1494.89 ms |
+
+Run 2 is retained as a host/NPU latency excursion rather than discarded. The
+predeclared three-run median remains favorable against the immediately prior
+three-run control:
+
+| Gate metric | Control median | Cache median | Change |
+| --- | ---: | ---: | ---: |
+| Per-chunk audio RTF | 0.3762 | 0.3718 | -1.16% |
+| P99 per-chunk audio RTF | 1.1230 | 1.1115 | -1.03% |
+| Whole-audio RTF | 0.3565 | 0.3520 | -1.24% |
+| Audio TTFP | 835.97 ms | 833.82 ms | -0.26% |
+| End-to-end latency | 1515.55 ms | 1494.89 ms | -1.36% |
+| TTFT | 317.31 ms | 319.48 ms | +0.69% |
+
+TTFT remains inside the 2% guard while all audio and E2E targets improve. An
+eight-prompt Seed-TTS screen then completed 8/8 with the exact 1,197 input,
+116 output, 786,240-frame, and 32.76-second signature. Whisper Large v3 WER
+was 0.0000 for 8/8, with zero request, PCM, ASR, or export failures.
+
+Raw result checksums:
+
+```text
+4fef770978c2f0512a8379ffbefab3371512fe2211fa33d2a695bdad97910b8d  talker-frequency-cache-run1.json
+299632ce53f79e5afe3191ce818f8b58ea23da1240abc054972d988d617b4c85  talker-frequency-cache-run2.json
+e4e32e787791daa3f458cca93c00079bab1b1f7ffffef96a9c3d6bf9a0dff52a  talker-frequency-cache-run3.json
+85fb688b5e9dfac6a407a20ebcefe14fb4d97f7c214684e6e19c34677bbb1024  talker-frequency-cache-quality-en8.json
+```
+
+## Full Seed-TTS qualification of the accepted cache
+
+The accepted cache profile completed the complete 1,088-row English Seed-TTS
+manifest. All 1,088 requests and all 1,088 audio exports succeeded, with zero
+request, PCM, ASR, or export failures. The run produced 163,442 input tokens,
+16,562 output tokens, 118,310,400 PCM frames, and 4,929.6 seconds of audio.
+
+| Metric | Full 1,088-row result |
+| --- | ---: |
+| Mean TTFT | 579.73 ms |
+| Mean audio TTFP | 1,091.71 ms |
+| Whole-audio RTF | 0.4085 |
+| Per-chunk RTF | 0.4305 |
+| P99 per-chunk RTF | 2.0963 |
+| Mean E2E | 1,812.85 ms |
+| Whisper Large v3 mean WER | 0.03327 |
+| Whisper Large v3 median WER | 0.00000 |
+| Official WavLM speaker SIM | 0.02903 |
+
+The full run therefore promotes the Talker repetition-frequency cache past its
+Seed-TTS quality gate. These absolute WER and SIM values describe this model,
+prompt template, and evaluator combination; the competition comparison must
+use the same evaluator and dataset revision for both framework baseline and
+optimized service.
+
+```text
+2def4ce17d95d16e45fb375bcd02cf24b04121353700c9888bdbdeb076c7f5f8  talker-frequency-cache-quality-full-en-1088.json
+8d22eea2f2bc3c96bd284f4c0918d917d084d8197d1206469abf36bb5fae5a27  wav_res_ref_text.sim
+```
+
+## Post-cache Talker profile and rejected sampling candidates
+
+A second Stage-1-only profile captured exactly 340 Talker codec steps after the
+cache landed. `Bincount` was absent. The largest remaining sampling-related
+host-to-device queue costs were `Multinomial` (89.25 ms across 340 calls),
+`Softmax` (7.10 ms), `Sort` (6.62 ms), `Topk` (5.98 ms), `Cumsum` (5.20 ms),
+and masked fill (6.65 ms). Together, the Top-P/Top-K block accounted for about
+31.55 ms of traced queue time and was the next bounded target.
+
+An experimental adapter around `torch_npu.npu_top_k_top_p` reduced an isolated
+FP32 microbenchmark mean from 446.93 us to 378.17 us (-15.38%). It was not
+accepted. Exact mask parity passed all 98 FP32 and FP16 cases but failed 2 of
+98 BF16 cases, which is the live Talker dtype. More importantly, a clean
+reverse-control 3x32 service comparison showed a median per-chunk RTF
+regression of 8.94%, whole-audio RTF regression of 9.17%, audio TTFP
+regression of 6.96%, P99 chunk RTF regression of 6.97%, and E2E regression of
+9.25%. TTFT also regressed 2.46%, beyond the 2% guard. All paired output and
+chunk hashes differed.
+
+The candidate's eight-row Seed-TTS screen completed with WER 0.0000. Its SIM
+was 0.02053 versus 0.03446 for the matching first eight rows of the accepted
+full run, a 1.39 percentage-point drop. Although that screen stayed inside the
+competition's two-point accuracy allowance, it cannot compensate for BF16
+parity loss and the measured serving regressions. The implementation and its
+runtime flag were fully removed; this is a documented negative result, not a
+dormant feature.
+
+The next candidate reused vLLM-Ascend's exponential-race `random_sample`
+implementation to replace `torch.multinomial`. It was tested on idle logical
+NPU 1 with the live 6,562-token probability-vector shape and the required
+scalar read, using 100 warmups plus 1,000 measured iterations. All 1,100 draws
+from each path were valid, but the candidate was substantially slower:
+
+| Sampler path | Mean | P50 | P99 |
+| --- | ---: | ---: | ---: |
+| `torch.multinomial` | 219.98 us | 210.29 us | 245.35 us |
+| Ascend exponential race | 383.33 us | 351.67 us | 449.98 us |
+| Change | +74.25% | +67.23% | +83.40% |
+
+The model already performs the scalar read needed for EOS and request-state
+updates, so the generic sampler's synchronization-avoidance rationale does not
+translate into a win here. Its global-stream handoff, exponential fill, divide,
+and argmax cost more than the live `multinomial` call at batch one. The opt-in
+implementation and environment flag were removed before service A/B testing.
+
+## Competition-exact Daily-Omni protocol audit
+
+Early Daily-Omni screens were far below the organizer's 79.5% framework
+baseline even though the 1 fps image/audio interleave itself matched MiniCPM.
+The remaining mismatch was in the conversation contract. The client was still
+using Daily-Omni's Qwen instruction, retained an empty system role, allowed 256
+output tokens, and did not reproduce MiniCPM-o's chat-template arguments.
+
+The OpenBMB OmniEvalKit `daily_omni` configuration instead uses its own strict
+MCQ prompt, 128 output tokens, 64 frames at 1 fps, interleaved audio, and no
+system role when the configured system prompt is empty. A later audit of the
+competition's current vLLM-Omni deployment guide found one important adapter
+difference: the competition request pins `enable_thinking=false` but does not
+enable `use_tts_template`. It also pins Stage 0 to greedy decoding with
+`repetition_penalty=1.2` and `max_tokens=128`; the repetition penalty must live
+in the deploy YAML because the Omni stage owns it. The benchmark client now
+matches that contract and keeps `modalities=["text"]`, so Talker and Code2Wav
+do no irrelevant work.
+
+Three concurrency-one screens on the same first 32 questions isolated the
+conversation and deploy-contract changes:
+
+| Protocol | Correct | Accuracy | HTTP / parse failures | Duration | Mean TTFT |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MiniCPM prompt, but template flags omitted | 23/32 | 71.875% | 0 / 0 | 39.65 s | 1,162.13 ms |
+| Direct-HF-adapter template flags (`use_tts_template=true`) | 25/32 | 78.125% | 0 / 0 | 46.01 s | 1,398.70 ms |
+| Competition contract, Stage 0 repetition penalty 1.2 | 27/32 | 84.375% | 0 / 0 | 63.58 s | 1,949.18 ms |
+
+This is an evaluator-correctness fix, not a claimed model-speed improvement.
+It prevents a fast but invalid benchmark from being promoted. The competition
+screen result is `organizer-protocol-daily-32-c1.json` (SHA-256
+`d9d8b1f8055962e39f715f5ff25f719dd21b4cc63cfe9d90f96da4b692fa332e`).
+
+The official Hugging Face `qa.json` contains 1,197 rows over 684 videos
+(SHA-256 `3210a45d42424c7d57c1b40a0b9aa2708fc02fab2364bf01fd7d16e1242e146b`).
+The previous local conversion had 1,196 rows because it deduplicated one
+intentional repeated `(video_id, question)` pair; all 684 video/audio assets
+were already complete. Full qualification now uses the untouched official
+1,197-row annotation rather than explaining away the mismatch.
+
+## Thinker-only repeated-prefix candidate
+
+Daily-Omni and Video-MME place media before the question and revisit the same
+video for multiple questions. An opt-in 910C profile now enables vLLM prefix
+caching and the uniform KV manager on Stage 0 only. Talker and Code2Wav retain
+the inherited disabled setting. This can reuse both KV blocks and
+vLLM-Omni's multimodal hidden-state prefix cache, but it also consumes pinned
+host memory and must not be promoted before a fresh-process A/B measures
+accuracy, cache hits, host/NPU memory, mean latency, and P99 latency. The
+source order is intentionally retained; no benchmark-only grouping is used.
+
+The benchmark now records OpenAI `prompt_tokens_details.cached_tokens` per
+request, so a latency change is not attributed to caching without a real hit.
+On a cache-empty, seeded-shuffle 32-row c1 run, the candidate recorded only
+3/32 hits (9,728 cached prompt tokens). Against the matching accepted service,
+duration regressed 3.25%, mean TTFT regressed 2.90%, and P99 TTFT regressed
+29.83%, with exact 20/32 accuracy parity. A cache-empty c10-first run recorded
+the same three hits. Against a cache-empty accepted reverse control it improved
+throughput by 2.77% and mean E2E by 3.14%, but mean TTFT regressed 0.41% and
+P99 TTFT regressed 8.42%.
+
+The mechanism is useful for a different workload shape. On an explicit
+unshuffled repeated-media c1 screen, 19/32 requests hit (45,184 cached tokens),
+duration improved 42.47%, and mean TTFT improved 42.89%, with exact 27/32
+accuracy parity. A deliberately pre-warmed c10 upper bound hit 32/32 and ran
+12.93x faster. Those are session/repeated-media results, not competition
+results. The candidate remains opt-in and is not promoted into the organizer
+profile because the realistic cache-empty distribution fails the P99 guard.
+
+## Full competition Daily-Omni 8K control
+
+The original c4 + 8K competition control completed the untouched 1,197-row annotation
+at concurrency 10:
+
+| Metric | Result |
+| --- | ---: |
+| Accuracy | 937/1,197 = 78.279% |
+| Organizer gate | >= 77.5% (pass) |
+| HTTP successes / failures | 1,197 / 0 |
+| Parse failures | 3 |
+| Duration | 3,176.65 s |
+| Throughput | 0.3768 req/s |
+| Mean / P99 TTFT | 21.840 / 33.101 s |
+| Mean / P99 E2E | 26.478 / 40.644 s |
+
+The detailed result is
+`organizer-protocol-daily-full-1197-c10.json` (SHA-256
+`49fc5cba86f8a57e72cc43982fae11612eb04460d98a6f9ac4e6ad8a3f584678`).
+It exactly matches the organizer reference count of 937 correct answers.
+
+## Thinker c10 admission experiment
+
+The full run exposed the actual performance bottleneck: the client submits ten
+requests while Stage 0 admits and captures only four sequences. An isolated
+profile raises Stage 0 `max_num_seqs` to 10 and adds decode graph capture sizes
+8 and 10, while retaining the 8,192-token scheduler budget. On cache-empty
+c10-first screens it completed in 78.90 and 78.39 seconds versus 98.04 seconds
+for the accepted reverse control. The first comparison improved throughput by
+24.25%, mean TTFT by 26.64%, P99 TTFT by 18.67%, mean E2E by 15.54%, and P99
+E2E by 20.08%, with exact 20/32 accuracy parity.
+
+The full 1,197-row run showed why the screen is not enough. c10 improved
+duration by 4.41%, throughput by 4.61%, mean TTFT by 20.33%, and mean E2E by
+4.29%. It passed the accuracy gate at 936/1,197 = 78.195%, a 0.084-point
+change from the accepted run, with zero HTTP failures and the same three parse
+failures. However, P99 TTFT regressed 2.39% and P99 E2E regressed 38.03%.
+The detailed result is
+`organizer-protocol-daily-full-1197-c10-thinker-c10.json` (SHA-256
+`93c407d378e8a9111740d29ab4f2afd827e6be53c8a4a0e0e9d6bd487b1fa48f`).
+c10 therefore remains an experiment rather than replacing the accepted
+profile. The next admission point is c8, with the same 8,192-token budget and
+decode graph coverage through batch eight.
+
+The full c8 run improved duration by 4.74%, throughput by 4.97%, mean TTFT by
+20.95%, P99 TTFT by 19.88%, and mean E2E by 4.61%. Accuracy passed at
+938/1,197 = 78.363%, with zero HTTP failures and two parse failures. It also
+reduced c10's P99 E2E from 56.101 seconds to 52.752 seconds, but that is still
+a 29.79% regression from the accepted c4 run's 40.644 seconds. The detailed
+result is `organizer-protocol-daily-full-1197-c10-thinker-c8.json` (SHA-256
+`bc2ecc0b71cc8a3873c7b2cf53dabafbe53238543d683ef6823652947d57182d`).
+c8 therefore remains an optional mean-TTFT/throughput profile. c6 is the next
+bounded experiment for recovering the full-run E2E tail.
+
+## Thinker c6 admission screen
+
+The bounded c6 profile keeps the same 8,192-token Stage 0 scheduler budget and
+adds only batch six to the accepted decode-graph shapes. On the same seeded,
+cache-empty, shuffled 32-row concurrency-ten screen, it preserved exact 20/32
+accuracy and completed all requests. Against the matching accepted c4 reverse
+control it improved duration by 17.60%, throughput by 21.35%, mean TTFT by
+19.53%, P99 TTFT by 7.66%, mean E2E by 14.65%, and P99 E2E by 14.20%.
+
+| Metric | Accepted c4 | c6 | Change |
+| --- | ---: | ---: | ---: |
+| Duration | 98.035 s | 80.783 s | -17.60% |
+| Throughput | 0.3264 req/s | 0.3961 req/s | +21.35% |
+| Mean / P99 TTFT | 23.058 / 32.277 s | 18.555 / 29.806 s | -19.53% / -7.66% |
+| Mean / P99 E2E | 27.973 / 39.132 s | 23.875 / 33.576 s | -14.65% / -14.20% |
+| Accuracy | 20/32 | 20/32 | exact parity |
+
+The detailed screen result is
+`thinker-c6-candidate-shuffled-c10-first.json` (SHA-256
+`4d7bef032e21c86caae8a525dfa7297578c17a050bceaa1d55b13ca371793cdf`).
+The screen qualified c6 for the full 1,197-row run but did not by itself
+promote the profile. The predeclared full-run guard was zero HTTP failures,
+accuracy at or above 77.5%, and P99 E2E no more than 2% above the accepted c4
+result (41.457 seconds).
+
+The full run completed all 1,197 requests and improved accuracy from 937 to 942
+correct (78.697%), with two parse failures. It improved duration by 5.38%,
+throughput by 5.69%, mean TTFT by 13.98%, P99 TTFT by 13.35%, and mean E2E by
+5.31%. P99 E2E nevertheless regressed 24.24%, from 40.644 to 50.495 seconds,
+so c6 is not promoted. The detailed result is
+`organizer-protocol-daily-full-1197-c10-thinker-c6.json` (SHA-256
+`e540600ec58d5d01bd102525a9c50eace758cff7135916bddc3f388a48adfe62`).
+
+Unlike the earlier full artifacts, this result contains aligned per-request
+IDs and E2E values. They locate the regression after first token: output length
+correlates 0.896 with post-TTFT time, while input length correlates only 0.060.
+Only 29 responses exceeded eight tokens, but those valid `A. <option text>`
+completions dominate P99. The two 18--19-token responses spent 42--50 seconds
+after first token. The next bounded experiment therefore targets decode
+admission using an exact replay of those 29 prompts; a larger prefill budget is
+not a plausible fix for this tail.
+
+## Thinker c5 final admission point
+
+c5 is the only integer admission point between the accepted c4 profile and c6.
+An exact replay corpus was built from the 29 c6 requests whose output exceeded
+eight tokens (SHA-256
+`425bdc7ad6cdb7d956b7b15ea43b1154dfc923d11554b6a9c2925ac4070b25ea`).
+On this deliberately tail-heavy set, c5 preserved 23/29 accuracy and all 29
+successful requests while reducing P99 E2E from 45.781 to 42.110 seconds
+(-8.02%). It also reduced maximum post-TTFT time from 18.379 to 16.176 seconds.
+The cost was 5.54% lower throughput, 16.19% worse mean TTFT, and 4.18% worse
+mean E2E. The c6 and c5 replay artifacts have SHA-256 values
+`3afac3bd162068c0e11070d0a1b8c63b4169cb6766696392778821ced17797ae`
+and `fe7fa12d6c74b000145705e767592809e2c3017c262a04f24b9aa26b8dab5f75`.
+
+The full c5 run completed all 1,197 requests and passed accuracy at 935/1,197 =
+78.111%, with three parse failures. Against c4 it improved duration by 4.73%,
+throughput by 4.96%, mean TTFT by 9.21%, P99 TTFT by 11.79%, and mean E2E by
+4.69%. P99 E2E still regressed 12.02%, from 40.644 to 45.530 seconds, and
+failed the same 41.457-second guard. The detailed result is
+`organizer-protocol-daily-full-1197-c10-thinker-c5.json` (SHA-256
+`4db216d305bb3484a1f725d10d17a6fab8c64c1940f9fa4f81385a30c049a671`).
+
+The admission sweep is therefore closed: c5, c6, c8, and c10 all improve mean
+performance but fail the predeclared full-run E2E-tail guard. c4 remains the
+competition default. Further admission points would either duplicate an
+already measured integer point or require an unsupported fractional policy.
+
+## Qualified c4 + 16K Thinker prefill budget
+
+With decode admission fixed at c4, the next candidate doubled only Stage 0's
+`max_num_batched_tokens` from 8,192 to 16,384. On the matching seeded,
+cache-empty 32-row concurrency-ten screen, it preserved 20/32 accuracy and all
+32 successful requests. It improved duration by 21.18%, throughput by 26.88%,
+mean/P99 TTFT by 14.35%/11.20%, and mean/P99 E2E by 21.88%/26.65%. The screen
+artifact is `competition-c4-prefill16k-shuffled-c10-first.json` (SHA-256
+`427276b727c155c612589e06e59b0a8f2c9e17b3db6861a4a699303a97ed4d8f`).
+
+The full 1,197-row qualification passed every predeclared promotion condition:
+
+| Metric | c4 + 8K control | c4 + 16K | Change |
+| --- | ---: | ---: | ---: |
+| Accuracy | 937/1,197 = 78.279% | 937/1,197 = 78.279% | exact aggregate parity |
+| HTTP failures | 0 | 0 | pass |
+| Parse failures | 3 | 4 | accuracy unaffected |
+| Duration | 3,176.652 s | 3,002.472 s | -5.48% |
+| Throughput | 0.3768 req/s | 0.3987 req/s | +5.80% |
+| Mean / P99 TTFT | 21.840 / 33.101 s | 21.318 / 31.653 s | -2.39% / -4.38% |
+| Mean / P99 E2E | 26.478 / 40.644 s | 25.020 / 40.289 s | -5.51% / -0.87% |
+
+The 40.289-second P99 E2E is 1.168 seconds below the predeclared 41.457-second
+guard. Per-request text and correctness are not bit-identical across the two
+batching policies, as expected for load-sensitive inference, but the aggregate
+accuracy is identical and remains 0.779 percentage points above the organizer
+gate. The qualified artifact is
+`organizer-protocol-daily-full-1197-c10-competition-prefill16k.json` (SHA-256
+`156a53c9ee29d4927f75d75d386c88e88fa5265489a2ff73709b3dbc0bb1397e`).
+
+The named `minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml`
+profile now carries c4 + 16K. The prior control remains reproducible as
+`minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition_prefill8k.yaml`, and
+all measured admission and prefix-cache experiments continue to inherit that
+8K replay base.
+
+## Video-MME official-adapter screen
+
+The first fail-closed real-service screen used the official 2,700-row parquet,
+local organizer videos, MiniCPM frame packing, 96 frames, no audio or subtitle,
+greedy decoding, 128 output tokens, and concurrency four. The adapter first
+prewarmed 32 unique videos with four bounded workers. A cold cache completed in
+71 seconds and persisted 96-frame JPEG sets outside the timed request section.
+
+All 32 requests completed, 22 answers were correct (68.75%), and there were no
+HTTP failures. This small screen is above the 67.0% organizer gate but is not a
+substitute for the full 2,700-row accuracy run. Mean/P99 TTFT were
+12.534/19.134 seconds and mean/P99 E2E were 14.278/21.343 seconds. The saved
+artifact contains aligned request IDs, per-request TTFT/E2E values, and all 32
+evaluation records. Its SHA-256 is
+`4770f4becab903be7d34cf2c5e6f776763afdacae3693615b9b2a6849e62338d`.
+
+## Full Video-MME gate
+
+The qualified c4 + 16K competition profile then ran the complete official
+2,700-row set over all 900 videos with the same adapter contract: MiniCPM frame
+packing, 96 frames, no audio or subtitle, greedy 128-token text output, and
+concurrency four. Four preprocessing workers populated the persistent frame
+cache before timing; all 2,700 request objects were constructed before the
+initial endpoint test and three-request warmup.
+
+| Metric | Result |
+| --- | ---: |
+| Accuracy | 1,897/2,700 = 70.259% |
+| Organizer gate | >= 67.0% (pass by 3.259 points) |
+| HTTP successes / failures | 2,700 / 0 |
+| Parse failures | 1 |
+| Duration | 9,379.122 s |
+| Throughput | 0.2879 req/s |
+| Mean / median / P99 TTFT | 12.589 / 13.192 / 17.041 s |
+| Mean / median / P99 E2E | 13.890 / 14.360 / 19.561 s |
+
+The result contains 2,700 unique request IDs and aligned input lengths, output
+lengths, TTFTs, E2Es, generated texts, errors, and evaluation records. Its
+error array is empty and the service remained healthy after the 2.6-hour timed
+run. The detailed artifact is
+`videomme-official-full-2700-c4-prefill16k.json` (SHA-256
+`ade02dd9f01f91e6c8d3b4e650642e6b23c5e7ef35ded28c79831ea7f5a28b4c`).
+The 32-row screen's 68.75% was conservative; the full result improved it by
+1.509 percentage points.
+
 ## Competition status and next experiment
 
-This result still does not establish a competition pass. Seed-TTS WER and speaker
-similarity were not evaluated, and the full Daily-Omni and Video-MME quality
-gates were not run. The current local Video-MME extraction contains only ten
-videos, while the official run requires all 2,700 questions.
+The accepted cache has passed the full 1,088-row Seed-TTS WER and official
+speaker-SIM gate. The strict final c4 + 16K profile was rerun over all 1,088
+English rows: serving completed without request or export failure in 1,640.460
+seconds, versus 1,973.520 seconds for the prior 8K qualification (-16.87%).
+Its performance metrics were 335.71 ms mean TTFT, 826.68 ms mean audio TTFP,
+0.3406 whole-audio RTF, 0.3584 per-chunk RTF, 1.100 P99 per-chunk RTF, and
+1,506.87 ms mean E2E. Relative to the prior full qualification, these improve
+by 42.1%, 24.3%, 16.6%, 16.7%, 47.5%, and 16.9%, respectively.
 
-The immediate next step is quality validation, not another default-on speed
-change: export the fixed Seed-TTS manifest audio, run official WER and speaker
-similarity, then run the complete Daily-Omni and Video-MME suites. Further
-speed work should focus on static Code2Wav cache buckets/output-buffer reuse or
-a custom-op-capable image, and remain off by default until it beats this profile
-without exceeding the two-point quality budget.
+Whisper Large v3 then evaluated the persisted 1,088-WAV export offline, with
+zero ASR failures: mean WER was 0.03693 and median WER was 0.00000. The mean
+change from the prior 0.03327 result is +0.366 percentage points, inside the
+two-point accuracy-loss budget. Exact official WavLM-Large SV scoring covered
+all 1,088 pairs and produced 0.029247 SIM, slightly above the prior 0.029029.
+The serving-side evaluator initially failed because a partial Whisper load
+published its processor global before model loading succeeded; initialization
+is now transactional, and the saved WAV export allowed fail-closed rescoring
+without repeating inference.
+
+```text
+c5dafd1f54ae7ac4517694aeb134d03390227ea61de998f9b14f521584d45997  talker-frequency-cache-quality-full-en-1088-prefill16k.json
+58736dee065df32727ee201e07a52616b101bc32924aefb6f4c9e6969753efba  seed-tts-official-wer-full-en-1088-prefill16k.json
+c034d610078c8f0ce7473eb720e0a31aca87ed0a60f9067948e121ab2373224  wav_res_ref_text.sim
+```
+
+Daily-Omni passed the full 1,197-row organizer gate at
+78.279%, and Video-MME passed the full 2,700-row gate at 70.259%. All three
+specified benchmark gates have therefore passed with complete evaluated counts
+and zero HTTP failures. Thinker c10 and c8 were not promoted because their
+full-run P99 E2E regressed 38.03% and 29.79%, respectively. c6 also remains
+experimental: it
+improved mean and P99 TTFT but regressed full-run P99 E2E by 24.24%. c5 reduced
+that regression to 12.02% but still failed the same guard. The subsequent c4 +
+16K prefill candidate passed the full gate and is now the accepted competition
+profile, with +5.80% throughput, -5.51% mean E2E, -4.38% P99 TTFT, -0.87% P99
+E2E, and identical aggregate accuracy versus the c4 + 8K control.
+
+Further speed work must start from the post-cache trace rather than retry the
+rejected fused Top-P, exponential-race sampler, or whole-stack CFM
+preallocation candidates. The next candidate should target a narrower
+fixed-shape DiT partition or Ascend-specific layout/cache kernel, and must beat
+the accepted service in a fresh-process three-run A/B before repeating the
+full quality qualification.
+
+## Rejected DiT AdaLN modulation cache
+
+The next narrow candidate cached every DiT block's AdaLN modulation for the
+six immutable CFM timestep embeddings. It removed 96 repeated SiLU/linear
+projections from each steady-state audio chunk on the fixed-width NPU MLP graph
+path and preserved the generic eager fallback. Focused MiniCPM-o tests passed
+47/47, and the candidate service confirmed graph compilation and replay.
+
+The exact 32-prompt Seed-TTS protocol ran three times on the still-resident
+pre-change service and three times after a candidate restart. All six runs
+completed 32/32 with zero failure and 100% streaming continuity. One control
+host/NPU excursion was retained; the predeclared comparison uses medians.
+
+| Gate metric | Control median | AdaLN cache median | Change |
+| --- | ---: | ---: | ---: |
+| TTFT | 330.22 ms | 321.04 ms | -2.78% |
+| Audio TTFP | 815.94 ms | 838.87 ms | +2.81% |
+| Per-chunk RTF | 0.3566 | 0.3755 | +5.31% |
+| P99 per-chunk RTF | 1.1062 | 1.1150 | +0.80% |
+| E2E | 1,431.11 ms | 1,517.71 ms | +6.05% |
+
+The candidate was rejected and reverted. Saving small invariant outputs added
+memory reads and layout pressure on the already graph-replaying block path;
+the TTFT improvement cannot compensate for material audio and E2E regressions.
+This result closes AdaLN precomputation as a speed target on the current 910C
+stack.
+
+```text
+0106389be776aaec372265949ddbe49a82d410223365c793927b254e55c4e162  adaln-cache-control-run1.json
+59707c4a0d22fba03c9527ec62de9152d67405cf6c29d1897c1ca07b246a1e77  adaln-cache-control-run2.json
+88e1885ec32ff0966139fef1b0a59e0526d338d63a763f84b89db86c875fb0ac  adaln-cache-control-run3.json
+76787dbe68f1b76fbc8cb62a9c5d8afd723404dfeda0b21e11e4d9298a9e6be0  adaln-cache-candidate-run1.json
+bb47ef1dd4a8dea61b626bca35dc7c4c4545df8a292ff5e547ba7d19fb140b10  adaln-cache-candidate-run2.json
+d953eed8508c6d61f93f1b28d580d3d93262c906a089bf7dd6137bcc910f7d08  adaln-cache-candidate-run3.json
+```
+
+## Rejected Ascend evaluation LayerNorm kernel
+
+The next layout-oriented screen replaced the two eager, affine-free DiT
+normalizations per block with torch-npu's inference-only
+`npu_layer_norm_eval`. Before paying for another full service A/B, the exact
+steady-state DiT shape (`[2, 50, 512]`, bfloat16) was measured for 1,000
+iterations on the same 910C. The fused operator was bit-identical to
+`nn.LayerNorm`, but it was materially slower:
+
+| Kernel | Mean | P50 | P99 |
+| --- | ---: | ---: | ---: |
+| Native `nn.LayerNorm` | 42.02 us | 40.87 us | 61.20 us |
+| `npu_layer_norm_eval` | 82.27 us | 82.26 us | 100.32 us |
+
+That is a 95.8% mean regression, and the installed torch-npu version also
+reports `npu_layer_norm_eval` as deprecated. The candidate was therefore
+rejected at the kernel gate and fully reverted. A same-era accepted-service
+control had already completed three 32-prompt runs with zero failures and the
+expected 4,801 input tokens, 480 output tokens, 3,329,280 frames, and 138.72
+seconds of audio in every run; those artifacts remain useful as the next
+candidate's control:
+
+```text
+e545c631531453c7a522b156b3c8a2d302fd8a0f71a2440df0124087cb5f1137  layout-norm-control-run1.json
+3ba4123f02b7b0120f25955d8fcb2b99fce169578435846dced9d7c7a798b5b0  layout-norm-control-run2.json
+e99e9229525efae035291aaf0ace2eddc056297f32e6b6bf8bb8c595e3323315  layout-norm-control-run3.json
+```
+
+The same exact-shape kernel gate also rejected two explicit layout changes.
+Materializing the `[2, 320, 50] -> [2, 50, 320]` transpose took 40.97 us with
+`npu_transpose` versus 23.60 us for the native view. Including the following
+320-to-512 input projection, native view-plus-linear took 56.99 us while an
+explicit contiguous input took 73.18 us (+28.4%) and changed bfloat16
+rounding. A real FRACTAL_NZ projection weight was also slower: 66.89 us versus
+51.02 us for ND (+31.1%). Neither candidate entered service A/B.
+
+## Rejected estimator concat output workspace
+
+A narrower allocation candidate reused one 64 KiB output tensor for the
+fixed-shape `[2, 320, 50]` estimator input. Unlike four manual copies,
+`torch.cat(..., out=workspace)` preserved the native concat kernel and was
+bit-identical. The isolated exact-shape screen improved mean concat time from
+29.35 us to 24.22 us (-17.5%) and P99 from 43.28 us to 37.96 us (-12.3%).
+Focused tests passed 48/48 and the service log confirmed that the accepted DiT
+MLP graph still compiled and replayed.
+
+The exact same-era 32-prompt protocol then ran three times for both variants.
+Every run completed 32/32 with zero failures and the identical 4,801 input
+tokens, 480 output tokens, 3,329,280 audio frames, and 138.72 seconds of audio.
+
+| Gate metric | Control median | Concat-out median | Change |
+| --- | ---: | ---: | ---: |
+| TTFT | 323.66 ms | 323.39 ms | -0.08% |
+| Audio TTFP | 844.60 ms | 850.64 ms | +0.71% |
+| Per-chunk RTF | 0.3796 | 0.3808 | +0.31% |
+| P99 per-chunk RTF | 1.1488 | 1.1731 | +2.11% |
+| E2E | 1,532.69 ms | 1,530.83 ms | -0.12% |
+
+The candidate failed the audio gate and was reverted. The isolated allocation
+win did not survive the full six-step CFM schedule; retaining one output
+buffer across steps likely adds dependency/lifetime pressure that outweighs
+the allocator saving.
+
+```text
+c5d00b67e81927ab69e75b995ab235075eb071d736f74f080a06bbd08546200d  estimator-cat-out-candidate-run1.json
+498ea19c6b179e1aabf50719dd740778a3e2d38d1fb6c27778ad06b8fad5be03  estimator-cat-out-candidate-run2.json
+dac2be12dfe37e0148eac7f78a125c4a18ce081434f822af213373bade75ce0d  estimator-cat-out-candidate-run3.json
+```
+
+Two wider fixed-shape TorchAir partitions were then screened. Compiling the
+native transpose-plus-linear expression failed in the installed converter: it
+dropped or misinterpreted the transpose and attempted a matrix multiply with
+K=50 against K=320. An algebraically equivalent einsum compiled in 9.77
+seconds, but replay took 176.03 us versus 48.32 us eager (3.64x slower) and
+introduced `3.43e-5` maximum fp32 drift. Finally, a graph containing the full
+LayerNorm-scale-shift AdaLN input expression was bit-identical but replayed in
+167.95 us versus 74.91 us eager (2.24x slower). Both were rejected at the
+kernel gate.
+
+Together these screens show that the remaining Stage 2 layout and launch
+overhead cannot be removed profitably with the installed high-level torch-npu
+or TorchAir primitives. The next speed candidate must be a purpose-built CANN
+kernel/fusion spanning a materially larger DiT attention or convolution
+boundary, with its own operator-level parity tests; another Python-level
+buffer, layout cast, or small graph partition is not justified by the 910C
+measurements.
+
+## Rejected DiT MLP static-kernel candidate
+
+The next experiment kept the accepted fixed-shape DiT MLP TorchAir partition
+but enabled CANN's ACLNN static-shape kernel compiler only for that partition.
+The switch was fail-closed and opt-in through
+`npu_dit_mlp_static_kernel`; it did not change the global Thinker or Talker
+compiler configuration. Focused server-side tests passed 3/3. At startup,
+TorchAir confirmed `Starting static kernel compilation`, generated and
+installed a static-kernel run package for the fixed `[2, 50, 512]` partition,
+and then logged the normal compiled-partition confirmation.
+
+An eight-prompt Seed-TTS smoke completed 8/8 with valid audio and 100%
+streaming continuity. The first warmup paid an 87-second one-time static
+materialization cost; subsequent warmups and all measured requests were
+steady-state. Three matched 32-prompt runs were then collected for the
+resident accepted control and for the candidate. Every run completed 32/32
+with zero failures and exactly 4,801 input tokens, 480 output tokens,
+3,329,280 audio frames, and 138.72 seconds of generated audio.
+
+| Gate metric | Control median | Static-kernel median | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 47.845 s | 49.539 s | +3.54% |
+| Request throughput | 0.6688 req/s | 0.6460 req/s | -3.42% |
+| Mean TTFT | 328.13 ms | 324.75 ms | -1.03% |
+| P99 TTFT | 464.75 ms | 455.90 ms | -1.91% |
+| Mean audio TTFP | 835.08 ms | 856.83 ms | +2.60% |
+| P99 audio TTFP | 973.53 ms | 989.61 ms | +1.65% |
+| Mean per-chunk RTF | 0.3710 | 0.3831 | +3.25% |
+| P99 per-chunk RTF | 1.1232 | 1.1499 | +2.38% |
+| Mean E2E | 1,494.55 ms | 1,547.56 ms | +3.55% |
+| P99 E2E | 2,055.39 ms | 2,111.73 ms | +2.74% |
+
+Lower is better for latency and RTF; higher is better for throughput. The
+candidate improved TTFT, but regressed every audio-path target and exceeded
+the 2% guard on mean TTFP, mean and P99 per-chunk RTF, and mean and P99 E2E.
+It was rejected and the accepted service restored. This result also closes
+static-kernel compilation as a profitable optimization for this already small
+MLP partition: removing launch overhead from ten block calls does not repay
+the static package's runtime cost on the six-step CFM schedule.
+
+```text
+3f23330d91d8c7c64db68c72767bc2ad68ababd38c65bb654b44d8cd36a325db  static-kernel-control-run1.json
+ad1a230e7c0bf70a5a7e03d23365b9bf3168924ce162701ece2f3f80d7f29833  static-kernel-control-run2.json
+539eb793d2fbcdd6eee9d7c96dc09e09c371f200f90ec4f2753690904db9c6c4  static-kernel-control-run3.json
+4c32786bb2e064a472a04db273aaf07e1eec1ca3cf5997d1814e8bb59e5face4  static-kernel-candidate-run1.json
+6f3def5cc93106d970ed6ea98df04d23a00745a9cf8fba09ce812311ce661d6f  static-kernel-candidate-run2.json
+a4eb95ca0fe8adeb519ef9ae292d745fd46d343117e7e4ea48980f80ce4ce8ae  static-kernel-candidate-run3.json
+6346c2d5da567b4a621d5b04126e9c5f6388fa2aad5526c7e8dfa8f7547a80e4  static-kernel-smoke8.json
+```
+
+## Rejected virtual-concat input projection
+
+The next candidate implemented a native Triton-Ascend kernel that treated the
+four `[B, C, T]` estimator inputs as one virtual K dimension and performed the
+following 320-to-512 projection without materializing `torch.cat`. The kernel
+was wired behind an opt-in, fail-closed MiniCPM-o switch and preserved the
+accepted eager path as its fallback.
+
+The exact steady-state shape (`B=2`, `T=50`, `K=320`, `N=512`, bfloat16) was
+screened on the same idle 910C service host. Both a 16-program Cube tiling and
+a coarser two-program tiling were tested after warmup. The coarser result is
+shown with two stock alternatives:
+
+| Projection path | Mean | P50 | P99 | Max abs delta |
+| --- | ---: | ---: | ---: | ---: |
+| Native concat + view + linear | 94.14 us | 94.74 us | 110.80 us | 0 |
+| Triton virtual concat, coarse | 927.89 us | 926.96 us | 951.61 us | 0.5 |
+| Four split native linears + sum | 214.03 us | 212.25 us | 241.73 us | 0.5 |
+
+The first, finer Triton tiling was also slow at 583.85 us mean and 580.43 us
+P50. Torch-npu's exposed `npu_linear` operator could not replace the native
+path because it accepts only a 2-D input on this installed stack. The custom
+kernel was 9.86x slower than the native expression, and both ways of changing
+the accumulation order introduced bfloat16 drift. The candidate was rejected
+at the operator gate, removed before deployment, and did not consume a service
+A/B run. This closes virtual concatenation at this small projection boundary;
+a profitable custom operator must fuse a materially larger attention or
+convolution region and amortize its launch and layout cost.
+
+## Rejected attention cache-width bucketing
+
+The next operator gate tested whether padding the variable attention-cache
+width to a small fixed bucket could unlock a more reusable 910C graph or
+kernel. The screen used the exact scaled-dot-product attention expression and
+representative widths observed in the MiniCPM-o audio path. Each case was
+warmed and measured for 600 iterations on an otherwise idle device; the
+padded lanes were masked so they could not affect the result.
+
+| Live cache width | Native width | Fixed bucket | Bucketed width | Change before copy |
+| ---: | ---: | ---: | ---: | ---: |
+| 302 | 93.826 us | 384 | 105.845 us | +12.81% |
+| 302 | 93.826 us | 512 | 101.442 us | +8.12% |
+| 352 | 92.568 us | 384 | 104.411 us | +12.79% |
+| 352 | 92.568 us | 512 | 100.999 us | +9.11% |
+| 402 | 90.114 us | 512 | 98.002 us | +8.75% |
+
+Lower is better. Every fixed bucket was slower by 8.1% to 12.8% before
+counting the cache-padding copy, and the attention call occurs roughly 600
+times per synthesized chunk. The candidate was therefore rejected before a
+service run. Cache-width bucketing remains useful only if a future fused CANN
+kernel eliminates both the padding materialization and enough adjacent
+attention work to repay the extra lanes.
+
+## Accepted Stage-0 duplex foreground scheduling
+
+The next end-to-end candidate targets interactive tail latency under mixed
+load rather than single-request model execution. The duplex runtime now sends
+established interactive requests with a configured negative priority, while
+ordinary batch requests retain priority zero. A bounded aging rule temporarily
+promotes one background request after 30 seconds, then restores its original
+priority after admission. The production MiniCPM-o duplex profile enables
+priority scheduling only on Stage 0; Talker and Code2Wav remain FCFS because
+their chunk-transfer queues require deque operations that vLLM's priority heap
+does not expose.
+
+Focused tests on the 910C environment passed 20/20. The first all-stage
+candidate correctly exposed that queue-interface mismatch when Stage 2 failed
+on `PriorityRequestQueue.remove`; narrowing the policy to Stage 0 removed the
+failure without widening shared vLLM queue semantics.
+
+The concurrency screen launched six deterministic text-only requests with
+`max_tokens=384` 250 ms before committing the duplex audio. Both runs used
+`max_num_seqs=2`. The duplex input and result were identical at the behavioral
+boundary: two Stage-0 output tokens, the `listen` decision, no client errors,
+and no generated audio. All six background requests completed with HTTP 200,
+and the candidate service remained healthy after the run.
+
+| Duplex contention metric | FCFS control | Stage-0 priority | Change |
+| --- | ---: | ---: | ---: |
+| Stage-0 TTFT | 18,526.24 ms | 7,182.85 ms | -61.23% |
+| Duplex model decision | `listen` | `listen` | unchanged |
+| Successful background requests | 6/6 | 6/6 | unchanged |
+| Service health after screen | healthy | healthy | unchanged |
+
+Lower TTFT is better. The optimization removes 11.34 seconds of interactive
+queue delay but cannot preempt the two requests already executing, so its
+remaining approximately seven-second delay is expected. The candidate's
+subsequent idle, steady-state duplex request completed with a 109.47 ms
+Stage-0 TTFT and the same `listen` decision.
+
+This is an admission-latency optimization: it does not change model kernels,
+sampling parameters, or the accepted Seed-TTS/Daily-Omni/Video-MME serving
+profile, so it neither claims nor changes their throughput and accuracy
+numbers. A stricter matched cold-start FCFS replay was attempted, but the
+control process remained blocked in the GlusterFS `lock_page` path after
+checkpoint loading and was stopped without recording benchmark data. The
+reported comparison therefore remains a real mixed-load screen, not a new
+official competition score.
+
+## Accepted Stage-0 duplex foreground preemption
+
+Priority admission still left the interactive request behind both background
+requests already occupying `max_num_seqs=2`. The duplex profile now opts into
+a token-boundary preemption hook: when all Stage-0 slots are occupied and a
+request at the configured foreground priority is waiting, the scheduler
+selects one lower-priority running victim and delegates to vLLM's existing
+preemption lifecycle. vLLM frees the victim's KV blocks and resumes it by
+recomputation; the policy does not introduce a second KV state machine.
+
+The first restart reproduced the host's GlusterFS `lock_page` stall. The exact
+19 GiB model directory was therefore copied to the host's local overlay; the
+model index and Code2Wav flow configuration checksums matched the source. All
+three stages then initialized in 166.62 seconds, and the following service
+screen used that local checkpoint without changing model files or request
+semantics.
+
+Three repetitions each launched six deterministic 384-token text requests,
+then committed the same 4.16-second mono PCM16 16 kHz duplex input. Every
+duplex request made the same two-token `listen` decision with no error or
+generated audio. All 18 background requests completed with HTTP 200, the
+scheduler log recorded exactly one lower-priority victim per repetition, and
+the service remained healthy.
+
+| Run | Stage-0 duplex TTFT | Slowest background request |
+| --- | ---: | ---: |
+| Preemption 1 | 1,202.33 ms | 22.09 s |
+| Preemption 2 | 135.88 ms | 20.96 s |
+| Preemption 3 | 143.28 ms | 20.96 s |
+| Three-run median | 143.28 ms | 20.96 s |
+
+Lower is better. The 143.28 ms median is 98.01% lower than the prior
+priority-only 7,182.85 ms screen and 99.23% lower than the original FCFS
+18,526.24 ms screen. Even the first resident-session materialization run was
+83.26% lower than priority-only admission. The background guard remains
+bounded: the slowest request stayed near the three-wave, two-slot completion
+envelope rather than starving, and bounded aging is still enabled.
+
+The full focused scheduler and duplex-deployment suite passes 114/114 in the
+910C environment. Because this changes only Stage-0 mixed-load admission and
+uses the existing recompute path, it does not change ordinary competition
+requests, model kernels, sampling, or the previously accepted Daily-Omni,
+Seed-TTS, and Video-MME accuracy results.
+
+## Accepted native-duplex control-token embedding cache
+
+MiniCPM-o's persistent Stage-0 append path repeatedly injects the same small
+set of unit and boundary tokens. The existing opt-in cache keeps those token
+embeddings resident on the model device and returns the immutable tensor on
+subsequent appends. It is now exposed as the typed duplex setting
+`cache_control_embeddings` and enabled in the static-weight MiniCPM-o duplex
+profile. The default remains false, and deployments with dynamic LoRA or other
+embedding-weight mutation must not enable it.
+
+An exact-shape 910C operator screen used the checkpoint vocabulary and hidden
+dimensions (`151748 x 4096`, bfloat16) for 1,000 iterations after warmup:
+
+| Operation | Native mean | Cached mean | Change | Max abs delta |
+| --- | ---: | ---: | ---: | ---: |
+| One control-token embedding | 35.36 us | 18.43 us | -47.88% | 0 |
+| Three control embeddings plus concat | 95.95 us | 37.08 us | -61.35% | 0 |
+
+The full duplex service then completed one warmup and three resident requests.
+The warmup request paid graph/session materialization and is excluded. All
+three measured requests returned `ok=true`, the same `listen` decision, and no
+errors. Their Stage-0 TTFT values were 104.85, 97.09, and 98.71 ms: 100.21 ms
+mean and 98.71 ms median. Against the prior resident no-cache screen at
+109.47 ms, that is 8.45% lower mean and 9.83% lower median TTFT. The service
+remained healthy after the runs.
+
+This cache applies only to the native-duplex Stage-0 input builder. It cannot
+change the ordinary competition profile, sampling, Daily-Omni accuracy,
+Seed-TTS audio quality, or Video-MME results. Its promotion gate is therefore
+exact tensor parity plus native-duplex behavioral and latency stability rather
+than a rerun of unrelated ordinary-request suites.
+
+## Rejected raw-tensor SHM, retained event notification
+
+The accepted 910C profiles had enabled the `tensor-v1` shared-memory format
+before a target-host connector proof existed. An exact connector A/B now
+compares it with the ordinary msgpack-plus-SHM path. Each iteration created,
+wrote, read, cloned, and unlinked a real POSIX segment. The steady payload
+matched a 25-frame codec chunk plus three left-context codes; the first-chunk
+case additionally carried six seconds (96,000 float32 samples) of reference
+audio.
+
+| Payload | Connector | Mean round trip | P50 | P99 | Segment bytes |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Steady codec chunk | Serialized SHM | 279.54 us | 272.77 us | 359.00 us | 540 |
+| Steady codec chunk | `tensor-v1` | 370.17 us | 356.81 us | 472.71 us | 705 |
+| First chunk + reference | Serialized SHM | 1,076.55 us | 1,071.38 us | 1,170.70 us | 384,593 |
+| First chunk + reference | `tensor-v1` | 1,105.09 us | 1,098.73 us | 1,219.78 us | 384,769 |
+
+Lower is better. Raw tensors regressed the steady round trip 32.42% and the
+large first-chunk round trip 2.65%, while increasing the segment size in both
+cases. All MiniCPM-o 910C profiles now keep `raw_tensor_shm: false`. The
+generic implementation and its tests remain available for payloads where a
+future measurement shows a win.
+
+Event notification was screened separately for 1,000 real segment transfers.
+An immediate same-thread put/get control measured 163.97 us mean and 286.68 us
+P99; Unix-datagram notification plus put/get measured 184.60 us mean and
+272.42 us P99. The 20.63 us mean notification cost buys a 14.26 us lower P99
+and, more importantly, replaces the receiver's production fallback of up to
+one millisecond between failed reads. Notifications therefore remain enabled
+for tail wakeup and idle-CPU behavior; only the raw serialization format is
+rejected.
+
+## Rejected post-cache kernel candidates
+
+Several additional 910C operator screens were completed before changing the
+stage topology. Each used the exact steady Code2Wav shapes and was rejected
+before promotion when its win did not survive the relevant higher-level gate.
+
+- Replacing the accepted TorchAir MLP partition with eager
+  `torch_npu.npu_ffn` took 154.85 us, and graphing that operator took 162.47 us,
+  versus 149.27 us for the accepted graph.
+- Packing the three attention projections reduced isolated eager preparation
+  from 119.40 us to 92.52 us. In the full three-run service A/B, however, mean
+  TTFP regressed 0.38%, P99 TTFP regressed 0.82%, and P99 chunk RTF regressed
+  1.55%. The candidate was reverted.
+- Direct `npu_fusion_attention` replay was slower than native SDPA at every
+  screened live width. Queue-amortized examples were 31.10 versus 37.48 us at
+  width 202 and 35.32 versus 40.99 us at width 502. The two exposed inference
+  attention-score variants were slower again at roughly 110--130 us.
+- A Triton-Ascend kernel fusing packed-QKV splitting, Q/K affine norms, layout,
+  and cache append preserved Q/V exactly and had a 1.53e-5 maximum K delta. It
+  improved the original preparation path by 5--12%, but remained 7--13% slower
+  than the already-rejected packed eager path.
+- FRACTAL_Z reduced an isolated convolution from 64.52 to 27.26 us, but the
+  complete two-convolution block regressed from 225.07 to 253.80 us because
+  its consumers paid the format conversion. FRACTAL_NZ linear weights were
+  also neutral to slower.
+
+The installed torch-npu emits `npu_fusion_attention_v3`, while its bundled
+TorchAir lacks that converter. An inference-only converter prototype mapped
+the dropout-free BNSD call to GE `FlashAttentionScore`; an exact static full
+attention partition then replayed in 123.91 us versus 254.60 us eager with
+bit-identical outputs. It could not be used directly in serving: Seed-TTS
+reference prompts produce variable initial cache lengths, so none of the four
+warmed static lengths replayed. A dynamic graph specialized and recompiled for
+every new length (4--29 seconds per shape), replayed in about 699 us versus
+265 us eager, and produced NaNs. A fixed-capacity scatter-plus-mask graph was
+also rejected: it took 1.72--1.86 ms versus 0.26--0.32 ms eager and introduced
+nontrivial output/cache drift. This closes high-level attention graphing on the
+installed stack; the 51% static-shape result remains useful evidence for a
+future purpose-built CANN operator with a native variable-length interface.
+
+## Accepted Thinker/Talker co-location and device-baseline fix
+
+The accepted two-NPU layout placed Talker and Code2Wav together on NPU 1 even
+though Thinker usually finishes the short TTS text response before most codec
+and audio work. The new competition layout places Thinker and Talker on NPU 0
+and gives Code2Wav exclusive use of NPU 1. Thinker memory utilization is 0.72
+and Talker is 0.08. Startup measured 71,808 Thinker KV tokens and 71,040 Talker
+KV tokens, covering the qualified c4/16K and c4/4K envelopes.
+
+The first launch exposed an independent parallel-initialization race. When the
+parent had no NPU visibility restriction, the runtime stored the baseline as
+`None`; the resolver interpreted that as "read the current environment" after
+the parallel diffusion initializer had temporarily selected NPU 1. Talker's
+requested NPU 0 was consequently remapped onto NPU 1. The runtime now records
+an unrestricted baseline explicitly as an empty string, and the resolver
+preserves the physical IDs from the deployment. The corrected log reports
+Stages 0/1 on NPU 0 and Stage 2 on NPU 1. The focused device-resolution and
+stage-initialization suite passes 45/45.
+
+Both variants were launched as fresh processes from the same source tree and
+ran the exact 32-prompt Seed-TTS protocol three times. Every run completed
+32/32 with zero failures, 100% streaming continuity, 4,801 input tokens, 480
+output tokens, 3,329,280 frames, and 138.72 seconds of audio. The promotion
+comparison uses the three-run median.
+
+| Gate metric | Fresh control | Co-located Talker | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 51.983 s | 47.327 s | -8.96% |
+| Request throughput | 0.6156 req/s | 0.6762 req/s | +9.84% |
+| Median TTFT | 333.54 ms | 321.25 ms | -3.68% |
+| P99 TTFT | 460.37 ms | 459.56 ms | -0.18% |
+| Mean audio TTFP | 858.67 ms | 849.54 ms | -1.06% |
+| P99 audio TTFP | 983.39 ms | 970.25 ms | -1.34% |
+| Mean per-chunk RTF | 0.3993 | 0.3692 | -7.55% |
+| P99 per-chunk RTF | 1.1149 | 1.1195 | +0.42% |
+| Mean E2E | 1,624.04 ms | 1,478.50 ms | -8.96% |
+| P99 E2E | 2,193.40 ms | 1,902.56 ms | -13.26% |
+
+Lower is better except for throughput. The sole regression is the 0.42% P99
+chunk-RTF movement, inside the 2% performance guard. Stage placement and KV
+capacity do not change weights, kernels, sampling, or request content, and the
+identical structural signature confirms that the existing full Seed-TTS,
+Daily-Omni, and Video-MME accuracy qualifications carry forward.
+
+```text
+104dd9236daea0659694cc1243d13c8c5b48c60da1d7ace24a8cccabbc2cecb7  fresh-control-run1.json
+e82b009f8b840459d846d7a8c44a8e01ca9a75db1c8102ccbe60b222eef4f1ff  fresh-control-run2.json
+df5406b0a4e8453dfd11ca7543d51fba7f891ae80da944727f559856bf29336d  fresh-control-run3.json
+a87bdcce96ad1745f6617024712e1d6a5484a3467640f42080b311189cf34776  talker0-candidate-run1.json
+b2ff698a7e0a6760eea4a0bd4820056e55bd0c751de881f827f33f80489ac3e1  talker0-candidate-run2.json
+5329f607c9aa8b234f02fd13330fd71d62fae7bca9d480561f1f9c67c3f42ae9  talker0-candidate-run3.json
+```
+
+## Rejected single-request Code2Wav cache-state packing
+
+The next Code2Wav candidate targeted the batch-of-one path used by the
+concurrency-one competition workload. The control rebuilt batched flow and
+HiFT cache tensors with seven `torch.cat` operations for every streamed chunk,
+even when only one request was active. Two progressively narrower variants
+were tested against a fresh control on the accepted Thinker/Talker co-located
+CFM6 profile.
+
+The first variant skipped both the input cats and the compact output-cache
+clones. It was rejected immediately: retaining detached views kept their
+larger backing tensors alive and increased allocator/lifetime pressure. The
+three-run median serving duration and mean E2E both regressed by about 3.5%,
+and mean audio TTFP regressed by 2.03%.
+
+The second variant removed only the seven redundant input cats and preserved
+the existing compact output clones. It passed an exact two-chunk state and
+audio parity test and completed all three service runs, but its performance
+result was mixed:
+
+| Three-run median metric | Fresh control | Input-only candidate | Change | Direction |
+| --- | ---: | ---: | ---: | --- |
+| Serving duration | 46.416 s | 46.511 s | +0.20% | slower |
+| Request throughput | 0.6894 req/s | 0.6880 req/s | -0.20% | slower |
+| Mean E2E | 1,449.92 ms | 1,453.04 ms | +0.22% | slower |
+| Median E2E | 1,472.86 ms | 1,469.72 ms | -0.21% | faster |
+| P99 E2E | 1,969.68 ms | 1,917.62 ms | -2.64% | faster |
+| Mean TTFT | 324.35 ms | 318.17 ms | -1.91% | faster |
+| Median TTFT | 325.78 ms | 319.48 ms | -1.93% | faster |
+| P99 TTFT | 458.48 ms | 463.08 ms | +1.00% | slower |
+| Mean audio TTFP | 836.42 ms | 832.45 ms | -0.47% | faster |
+| P99 audio TTFP | 998.92 ms | 980.67 ms | -1.83% | faster |
+| Mean whole-audio RTF | 0.3418 | 0.3421 | +0.09% | slower |
+| Median whole-audio RTF | 0.3325 | 0.3365 | +1.19% | slower |
+| P99 whole-audio RTF | 0.4162 | 0.4118 | -1.05% | faster |
+
+Lower is better except for throughput. Every run completed 32/32 requests
+with zero failures and 100% streaming continuity, and produced the identical
+4,801 input tokens, 480 output tokens, 3,329,280 audio frames, and 138.72
+seconds of audio. The saved client artifacts did not contain usable
+per-chunk-RTF samples (`null` for control and zero for the candidate), so that
+metric was not used to promote the change.
+
+The narrowed candidate's modest TTFT and tail-TTFP wins did not survive as a
+throughput, mean-E2E, or whole-audio-RTF improvement. Both variants were
+therefore removed from the runtime and deployment profile. This negative
+result also sets the next Code2Wav boundary: avoid Python-side micro-caches
+whose savings are below run-to-run service noise, and concentrate on measured
+NPU graph/operator work or larger stage scheduling changes.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-single-state-20260812/results
+```
+
+Result checksums:
+
+```text
+888295934fedcb084985679912c22f8fb825b71658db4d9a1a9a9c43ff1708d3  control-run1.json
+e2546312ae653137380b32a30f4d066268b53460380bb68d8f372fe92d6edef2  control-run2.json
+7b4be878c00dad9a92aed0b54c764bd0c948d979d179feb71bd1423bd84c1cd8  control-run3.json
+697e7e0bec5a52cf758430d74a3eb6f2bf3deeca56a04ea4544111c39186cbbf  candidate-run1.json
+1e153f3a927754d9bdca17c035cd340ea3a50ea857dc96c34680fc8d8bb24470  candidate-run2.json
+997493ac54045f1f143264cceb340f3f0fa1518c7d55818b56eee574c910f6a0  candidate-run3.json
+35731529c63e48c4ed8063529038d8926b078515579d94f525d7555c591dfc47  input-only-run1.json
+a2ca2a3f0b92d57f9287ebc787ee10af3219fe27b4d39714ad5a437dbd6de9b8  input-only-run2.json
+ba5ef71705eff7c2e31d9c1fceb5279c8c7dfdd02ede290b9fc3c64e8efb7cb9  input-only-run3.json
+```
+
+## Rejected early Code2Wav prompt prewarm
+
+This candidate tried to overlap Seed-TTS reference-audio prompt preparation
+on NPU 1 with Talker's accumulation of its first 25 codec tokens on NPU 0.
+The stage processor emitted one control-only payload as soon as the first
+codec token arrived. Code2Wav prepared and cached the reference features but
+did not create streaming state or run CFM/HiFT; the first real audio chunk
+kept sequence number zero and followed the unchanged generation path.
+
+The opt-in implementation passed 74 focused tests, including prompt-cache
+reuse, first-chunk ordering, cleanup, and invalid-switch coverage. It was then
+run three times against the same fresh control used for the narrowed
+cache-packing experiment. Every candidate run completed 32/32 requests with
+zero failures and produced the same 4,801 input tokens, 480 output tokens,
+3,329,280 audio frames, and 138.72 seconds of audio.
+
+| Three-run median metric | Fresh control | Prompt-prewarm candidate | Change | Direction |
+| --- | ---: | ---: | ---: | --- |
+| Serving duration | 46.416 s | 47.770 s | +2.92% | slower |
+| Request throughput | 0.6894 req/s | 0.6699 req/s | -2.83% | slower |
+| Mean E2E | 1,449.92 ms | 1,492.28 ms | +2.92% | slower |
+| Median E2E | 1,472.86 ms | 1,486.04 ms | +0.90% | slower |
+| P99 E2E | 1,969.68 ms | 2,002.92 ms | +1.69% | slower |
+| Mean TTFT | 324.35 ms | 326.49 ms | +0.66% | slower |
+| Median TTFT | 325.78 ms | 329.87 ms | +1.26% | slower |
+| P99 TTFT | 458.48 ms | 468.08 ms | +2.09% | slower |
+| Mean audio TTFP | 836.42 ms | 852.87 ms | +1.97% | slower |
+| Median audio TTFP | 840.65 ms | 838.00 ms | -0.32% | faster |
+| P99 audio TTFP | 998.92 ms | 991.09 ms | -0.78% | faster |
+| Mean whole-audio RTF | 0.3418 | 0.3512 | +2.75% | slower |
+| Median whole-audio RTF | 0.3325 | 0.3413 | +2.64% | slower |
+| P99 whole-audio RTF | 0.4162 | 0.4272 | +2.65% | slower |
+
+Lower is better except for throughput. The small median/tail TTFP movements
+did not compensate for regressions in duration, throughput, mean TTFP, E2E,
+TTFT tail, or whole-audio RTF. The additional cross-stage scheduling and IPC
+work costs more than the prompt preparation it overlaps at concurrency one.
+The candidate was therefore removed from both source and deployment state.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-prompt-prewarm-20260812/results
+```
+
+Result checksums:
+
+```text
+aaa02b02a5a0c1a87ffee2cb182f5c38893dd1cd9619fedde655ab9cb8629227  prompt-prewarm-run1.json
+d529dc0388f18e230aa5626f18d6484202ed2d90dc73ffa387e5c5f2cdb7ac0d  prompt-prewarm-run2.json
+43f7a57234642eddee62e7abd34b5624046586ab41b90c293cebe372d64f9f70  prompt-prewarm-run3.json
+```
+
+## Accepted prompt speaker-projection cache
+
+The next candidate removed repeated NPU work without changing stage traffic.
+MiniCPM-o previously normalized the immutable reference-speaker embedding and
+ran `spk_embed_affine_layer` during prompt setup and again for every streamed
+25-frame codec chunk. The prompt cache now stores that projected embedding
+beside the existing speech tokens and mel features, expands it by batch, and
+evicts it through the existing prompt lifecycle.
+
+The implementation preserves the original autocast context and mathematical
+order for each row. It changes no model weight, CFM step, random input,
+sampling operation, codec token, or HiFT operation. The focused Code2Wav suite
+passes 46/46, including an explicit assertion that two streamed chunks do not
+repeat the projection.
+
+Three fresh-process candidate runs used the same 32 fixed English prompts,
+three warmups, concurrency one, CFM6 profile, and nested TTS request body as
+the immediately preceding fresh control. Every run completed 32/32 with zero
+failure and 100% streaming continuity, and produced the identical 4,801 input
+tokens, 480 output tokens, 3,329,280 audio frames, and 138.72 seconds of audio.
+
+| Three-run median metric | Fresh control | Speaker-cache candidate | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 46.416 s | 45.954 s | -1.00% |
+| Request throughput | 0.6894 req/s | 0.6963 req/s | +1.01% |
+| Mean E2E | 1,449.92 ms | 1,435.69 ms | -0.98% |
+| Median E2E | 1,472.86 ms | 1,444.23 ms | -1.94% |
+| P99 E2E | 1,969.68 ms | 1,910.92 ms | -2.98% |
+| Mean TTFT | 324.35 ms | 318.52 ms | -1.80% |
+| Median TTFT | 325.78 ms | 324.49 ms | -0.39% |
+| P99 TTFT | 458.48 ms | 452.63 ms | -1.28% |
+| Mean audio TTFP | 836.42 ms | 828.27 ms | -0.98% |
+| Median audio TTFP | 840.65 ms | 834.45 ms | -0.74% |
+| P99 audio TTFP | 998.92 ms | 970.07 ms | -2.89% |
+| Mean whole-audio RTF | 0.3418 | 0.3383 | -1.02% |
+| Median whole-audio RTF | 0.3325 | 0.3314 | -0.35% |
+| P99 whole-audio RTF | 0.4162 | 0.4126 | -0.86% |
+
+Lower is better except for throughput. Every measured gate moves in the
+desired direction. The fresh control artifacts did not expose usable
+per-chunk-RTF samples, so those values were not used in the matched promotion
+decision; the candidate runs themselves were stable at 0.3576--0.3671 mean
+and 1.0968--1.1085 P99 per-chunk RTF.
+
+Because the output path and structural signature are unchanged, the accepted
+full Seed-TTS, Daily-Omni, and Video-MME qualifications carry forward. This
+candidate is promoted as an always-on prompt-cache optimization rather than a
+deployment switch.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-speaker-projection-cache-20260812/results
+```
+
+Result checksums:
+
+```text
+c62724cc2961ef621a3f823967ae934e7069bb0c2c9f4bbcf790f09b1cacb426  speaker-cache-run1.json
+7b5adf0fa934dcd4564d6fafd1cf1f9e4b60176eee7940722690bc826efd8814  speaker-cache-run2.json
+477b47c9365c8ba2744118f903ac54f3dd7e5431e23d823e4f032669c23ffdd2  speaker-cache-run3.json
+```

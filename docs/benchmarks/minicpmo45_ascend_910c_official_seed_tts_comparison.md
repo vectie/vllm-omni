@@ -1141,3 +1141,44 @@ e545c631531453c7a522b156b3c8a2d302fd8a0f71a2440df0124087cb5f1137  layout-norm-co
 3ba4123f02b7b0120f25955d8fcb2b99fce169578435846dced9d7c7a798b5b0  layout-norm-control-run2.json
 e99e9229525efae035291aaf0ace2eddc056297f32e6b6bf8bb8c595e3323315  layout-norm-control-run3.json
 ```
+
+The same exact-shape kernel gate also rejected two explicit layout changes.
+Materializing the `[2, 320, 50] -> [2, 50, 320]` transpose took 40.97 us with
+`npu_transpose` versus 23.60 us for the native view. Including the following
+320-to-512 input projection, native view-plus-linear took 56.99 us while an
+explicit contiguous input took 73.18 us (+28.4%) and changed bfloat16
+rounding. A real FRACTAL_NZ projection weight was also slower: 66.89 us versus
+51.02 us for ND (+31.1%). Neither candidate entered service A/B.
+
+## Rejected estimator concat output workspace
+
+A narrower allocation candidate reused one 64 KiB output tensor for the
+fixed-shape `[2, 320, 50]` estimator input. Unlike four manual copies,
+`torch.cat(..., out=workspace)` preserved the native concat kernel and was
+bit-identical. The isolated exact-shape screen improved mean concat time from
+29.35 us to 24.22 us (-17.5%) and P99 from 43.28 us to 37.96 us (-12.3%).
+Focused tests passed 48/48 and the service log confirmed that the accepted DiT
+MLP graph still compiled and replayed.
+
+The exact same-era 32-prompt protocol then ran three times for both variants.
+Every run completed 32/32 with zero failures and the identical 4,801 input
+tokens, 480 output tokens, 3,329,280 audio frames, and 138.72 seconds of audio.
+
+| Gate metric | Control median | Concat-out median | Change |
+| --- | ---: | ---: | ---: |
+| TTFT | 323.66 ms | 323.39 ms | -0.08% |
+| Audio TTFP | 844.60 ms | 850.64 ms | +0.71% |
+| Per-chunk RTF | 0.3796 | 0.3808 | +0.31% |
+| P99 per-chunk RTF | 1.1488 | 1.1731 | +2.11% |
+| E2E | 1,532.69 ms | 1,530.83 ms | -0.12% |
+
+The candidate failed the audio gate and was reverted. The isolated allocation
+win did not survive the full six-step CFM schedule; retaining one output
+buffer across steps likely adds dependency/lifetime pressure that outweighs
+the allocator saving.
+
+```text
+c5d00b67e81927ab69e75b995ab235075eb071d736f74f080a06bbd08546200d  estimator-cat-out-candidate-run1.json
+498ea19c6b179e1aabf50719dd740778a3e2d38d1fb6c27778ad06b8fad5be03  estimator-cat-out-candidate-run2.json
+dac2be12dfe37e0148eac7f78a125c4a18ce081434f822af213373bade75ce0d  estimator-cat-out-candidate-run3.json
+```

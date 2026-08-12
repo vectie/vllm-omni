@@ -1182,3 +1182,21 @@ c5d00b67e81927ab69e75b995ab235075eb071d736f74f080a06bbd08546200d  estimator-cat-
 498ea19c6b179e1aabf50719dd740778a3e2d38d1fb6c27778ad06b8fad5be03  estimator-cat-out-candidate-run2.json
 dac2be12dfe37e0148eac7f78a125c4a18ce081434f822af213373bade75ce0d  estimator-cat-out-candidate-run3.json
 ```
+
+Two wider fixed-shape TorchAir partitions were then screened. Compiling the
+native transpose-plus-linear expression failed in the installed converter: it
+dropped or misinterpreted the transpose and attempted a matrix multiply with
+K=50 against K=320. An algebraically equivalent einsum compiled in 9.77
+seconds, but replay took 176.03 us versus 48.32 us eager (3.64x slower) and
+introduced `3.43e-5` maximum fp32 drift. Finally, a graph containing the full
+LayerNorm-scale-shift AdaLN input expression was bit-identical but replayed in
+167.95 us versus 74.91 us eager (2.24x slower). Both were rejected at the
+kernel gate.
+
+Together these screens show that the remaining Stage 2 layout and launch
+overhead cannot be removed profitably with the installed high-level torch-npu
+or TorchAir primitives. The next speed candidate must be a purpose-built CANN
+kernel/fusion spanning a materially larger DiT attention or convolution
+boundary, with its own operator-level parity tests; another Python-level
+buffer, layout cast, or small graph partition is not justified by the 910C
+measurements.

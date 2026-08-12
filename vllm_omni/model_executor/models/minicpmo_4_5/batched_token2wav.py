@@ -180,6 +180,7 @@ class BatchedToken2Wav(nn.Module):
         self._timeline_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
         self._cfm_delta_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
         self._timestep_embedding_cache: dict[tuple[Any, ...], torch.Tensor] = {}
+        self._adaln_modulation_cache: dict[tuple[Any, ...], torch.Tensor] = {}
         self._cfg_workspace: dict[tuple[str, tuple[int, ...], torch.dtype, str, int | None], torch.Tensor] = {}
         self._npu_cfm_graphs: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self._npu_cfm_graph_disabled = False
@@ -406,6 +407,7 @@ class BatchedToken2Wav(nn.Module):
         cond: torch.Tensor,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
+        adaln_modulations: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
@@ -436,6 +438,7 @@ class BatchedToken2Wav(nn.Module):
                         cnn_out,
                         att_out,
                         graph_fn,
+                        adaln_modulations,
                     )
                     if not self._npu_dit_mlp_graph_used:
                         logger.info(
@@ -469,6 +472,7 @@ class BatchedToken2Wav(nn.Module):
         cnn_out: torch.Tensor,
         att_out: torch.Tensor,
         graph_fn: Any,
+        adaln_modulations: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run attention/conv eagerly and replay the fixed-width MLP graph."""
         hidden = estimator.in_proj(estimator_input.transpose(1, 2))
@@ -477,6 +481,11 @@ class BatchedToken2Wav(nn.Module):
                 raise RuntimeError("MiniCPM-o NPU DiT MLP graph requires eval-mode affine-free norm2")
             if float(block.norm2.eps) != 1e-6:
                 raise RuntimeError(f"MiniCPM-o NPU DiT MLP graph requires norm2 eps=1e-6, got {block.norm2.eps}")
+            modulation = (
+                block.adaLN_modulation(time_embedding)
+                if adaln_modulations is None
+                else adaln_modulations[block_idx]
+            )
             (
                 shift_msa,
                 scale_msa,
@@ -487,7 +496,7 @@ class BatchedToken2Wav(nn.Module):
                 shift_conv,
                 scale_conv,
                 gate_conv,
-            ) = block.adaLN_modulation(time_embedding).chunk(9, dim=-1)
+            ) = modulation.chunk(9, dim=-1)
 
             attention, new_att = block.attn.forward_chunk(
                 block.norm1(hidden) * (1 + scale_msa) + shift_msa,
@@ -576,6 +585,58 @@ class BatchedToken2Wav(nn.Module):
         self._timestep_embedding_cache[key] = cached
         return cached
 
+    def _estimator_adaln_modulations(
+        self,
+        estimator: nn.Module,
+        time_embeddings: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Cache immutable per-timestep AdaLN parameters for the NPU MLP graph.
+
+        Every DiT block's modulation depends only on its frozen weights and the
+        fixed CFM timestep embedding.  Recomputing 16 SiLU/linear projections
+        at each of six steps for every streamed chunk is therefore redundant.
+        Keep the eager estimator untouched and use this cache only for the
+        fixed-width NPU graph path, where the block loop is already explicit.
+        """
+        if (
+            not self._npu_dit_mlp_graph_enabled
+            or self._npu_dit_mlp_graph_disabled
+            or time_embeddings.device.type != "npu"
+        ):
+            return None
+        blocks = getattr(estimator, "blocks", None)
+        if not blocks:
+            return None
+        return self._cached_estimator_adaln_modulations(estimator, time_embeddings)
+
+    def _cached_estimator_adaln_modulations(
+        self,
+        estimator: nn.Module,
+        time_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build/reuse AdaLN values after the caller establishes eligibility."""
+        blocks = estimator.blocks
+        key = (
+            id(estimator),
+            int(time_embeddings.data_ptr()),
+            tuple(time_embeddings.shape),
+            time_embeddings.dtype,
+            time_embeddings.device.type,
+            time_embeddings.device.index,
+        )
+        cached = self._adaln_modulation_cache.get(key)
+        if cached is not None:
+            return cached
+        with torch.inference_mode():
+            cached = torch.stack(
+                [
+                    torch.stack([block.adaLN_modulation(step_embedding) for block in blocks])
+                    for step_embedding in time_embeddings
+                ]
+            ).detach()
+        self._adaln_modulation_cache[key] = cached
+        return cached
+
     def _decode_cfm_eager(
         self,
         mu: torch.Tensor,
@@ -602,6 +663,7 @@ class BatchedToken2Wav(nn.Module):
         speakers_cfg = self._cfg_pair("speakers", speakers, zero_unconditional=True)
         cond_cfg = self._cfg_pair("cond", cond, zero_unconditional=True)
         time_embeddings = self._estimator_time_embeddings(estimator, timeline, batch_size * 2)
+        adaln_modulations = self._estimator_adaln_modulations(estimator, time_embeddings)
         deltas = self._cfm_deltas_for(timeline)
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
@@ -617,6 +679,7 @@ class BatchedToken2Wav(nn.Module):
                 cond=cond_cfg,
                 cnn_cache=old_cnn,
                 att_cache=old_att,
+                adaln_modulations=None if adaln_modulations is None else adaln_modulations[step],
             )
             conditional, unconditional = estimate.split(batch_size, dim=0)
             velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional

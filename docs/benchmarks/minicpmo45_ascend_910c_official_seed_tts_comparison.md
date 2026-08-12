@@ -1200,3 +1200,53 @@ kernel/fusion spanning a materially larger DiT attention or convolution
 boundary, with its own operator-level parity tests; another Python-level
 buffer, layout cast, or small graph partition is not justified by the 910C
 measurements.
+
+## Rejected DiT MLP static-kernel candidate
+
+The next experiment kept the accepted fixed-shape DiT MLP TorchAir partition
+but enabled CANN's ACLNN static-shape kernel compiler only for that partition.
+The switch was fail-closed and opt-in through
+`npu_dit_mlp_static_kernel`; it did not change the global Thinker or Talker
+compiler configuration. Focused server-side tests passed 3/3. At startup,
+TorchAir confirmed `Starting static kernel compilation`, generated and
+installed a static-kernel run package for the fixed `[2, 50, 512]` partition,
+and then logged the normal compiled-partition confirmation.
+
+An eight-prompt Seed-TTS smoke completed 8/8 with valid audio and 100%
+streaming continuity. The first warmup paid an 87-second one-time static
+materialization cost; subsequent warmups and all measured requests were
+steady-state. Three matched 32-prompt runs were then collected for the
+resident accepted control and for the candidate. Every run completed 32/32
+with zero failures and exactly 4,801 input tokens, 480 output tokens,
+3,329,280 audio frames, and 138.72 seconds of generated audio.
+
+| Gate metric | Control median | Static-kernel median | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 47.845 s | 49.539 s | +3.54% |
+| Request throughput | 0.6688 req/s | 0.6460 req/s | -3.42% |
+| Mean TTFT | 328.13 ms | 324.75 ms | -1.03% |
+| P99 TTFT | 464.75 ms | 455.90 ms | -1.91% |
+| Mean audio TTFP | 835.08 ms | 856.83 ms | +2.60% |
+| P99 audio TTFP | 973.53 ms | 989.61 ms | +1.65% |
+| Mean per-chunk RTF | 0.3710 | 0.3831 | +3.25% |
+| P99 per-chunk RTF | 1.1232 | 1.1499 | +2.38% |
+| Mean E2E | 1,494.55 ms | 1,547.56 ms | +3.55% |
+| P99 E2E | 2,055.39 ms | 2,111.73 ms | +2.74% |
+
+Lower is better for latency and RTF; higher is better for throughput. The
+candidate improved TTFT, but regressed every audio-path target and exceeded
+the 2% guard on mean TTFP, mean and P99 per-chunk RTF, and mean and P99 E2E.
+It was rejected and the accepted service restored. This result also closes
+static-kernel compilation as a profitable optimization for this already small
+MLP partition: removing launch overhead from ten block calls does not repay
+the static package's runtime cost on the six-step CFM schedule.
+
+```text
+3f23330d91d8c7c64db68c72767bc2ad68ababd38c65bb654b44d8cd36a325db  static-kernel-control-run1.json
+ad1a230e7c0bf70a5a7e03d23365b9bf3168924ce162701ece2f3f80d7f29833  static-kernel-control-run2.json
+539eb793d2fbcdd6eee9d7c96dc09e09c371f200f90ec4f2753690904db9c6c4  static-kernel-control-run3.json
+4c32786bb2e064a472a04db273aaf07e1eec1ca3cf5997d1814e8bb59e5face4  static-kernel-candidate-run1.json
+6f3def5cc93106d970ed6ea98df04d23a00745a9cf8fba09ce812311ce661d6f  static-kernel-candidate-run2.json
+a4eb95ca0fe8adeb519ef9ae292d745fd46d343117e7e4ea48980f80ce4ce8ae  static-kernel-candidate-run3.json
+6346c2d5da567b4a621d5b04126e9c5f6388fa2aad5526c7e8dfa8f7547a80e4  static-kernel-smoke8.json
+```

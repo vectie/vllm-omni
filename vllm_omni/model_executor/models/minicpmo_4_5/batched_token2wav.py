@@ -19,7 +19,6 @@ import torch.nn.functional as F
 _SILENCE_TOKEN = 4218
 _NPU_DIT_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH"
 _NPU_DIT_MLP_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH"
-_NPU_ESTIMATOR_CAT_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_ESTIMATOR_CAT_OUT"
 logger = logging.getLogger(__name__)
 
 
@@ -66,22 +65,6 @@ def _npu_dit_mlp_graph_width(config_value: Any = None) -> int:
     if width <= 0:
         raise ValueError(f"{_NPU_DIT_MLP_GRAPH_WIDTH_ENV} must be positive, got {width}")
     return width
-
-
-def _npu_estimator_cat_out_enabled(config_value: Any = None) -> bool:
-    """Resolve the opt-in fixed-shape estimator concat workspace."""
-    env_value = os.environ.get(_NPU_ESTIMATOR_CAT_OUT_ENV)
-    raw = env_value if env_value not in (None, "") else config_value
-    if raw is None:
-        return False
-    if isinstance(raw, bool):
-        return raw
-    normalized = str(raw).strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"Invalid {_NPU_ESTIMATOR_CAT_OUT_ENV}={raw!r}")
 
 
 def _ensure_torchair_broadcast_alias() -> None:
@@ -153,7 +136,6 @@ class BatchedToken2Wav(nn.Module):
         *,
         npu_dit_mlp_graph: Any = None,
         npu_dit_mlp_graph_width: Any = None,
-        npu_estimator_cat_out: Any = None,
     ):
         super().__init__()
         self._token2wav = token2wav
@@ -199,14 +181,10 @@ class BatchedToken2Wav(nn.Module):
         self._cfm_delta_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
         self._timestep_embedding_cache: dict[tuple[Any, ...], torch.Tensor] = {}
         self._cfg_workspace: dict[tuple[str, tuple[int, ...], torch.dtype, str, int | None], torch.Tensor] = {}
-        self._estimator_input_workspace: dict[
-            tuple[tuple[int, ...], torch.dtype, str, int | None], torch.Tensor
-        ] = {}
         self._npu_cfm_graphs: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self._npu_cfm_graph_disabled = False
         self._npu_dit_mlp_graph_enabled = _npu_dit_mlp_graph_enabled(npu_dit_mlp_graph)
         self._npu_dit_mlp_graph_width = _npu_dit_mlp_graph_width(npu_dit_mlp_graph_width)
-        self._npu_estimator_cat_out_enabled = _npu_estimator_cat_out_enabled(npu_estimator_cat_out)
         self._npu_dit_mlp_graph: Any | None = None
         self._npu_dit_mlp_graph_disabled = False
         self._npu_dit_mlp_graph_used = False
@@ -417,24 +395,6 @@ class BatchedToken2Wav(nn.Module):
         att = x.new_empty((depth, batch_size, heads, old_att_len + chunk_size, att_width))
         return cnn, att
 
-    def _estimator_input(
-        self,
-        x: torch.Tensor,
-        mu: torch.Tensor,
-        speaker_features: torch.Tensor,
-        cond: torch.Tensor,
-    ) -> torch.Tensor:
-        parts = (x, mu, speaker_features, cond)
-        if not self._npu_estimator_cat_out_enabled or x.device.type != "npu":
-            return torch.cat(parts, dim=1)
-        shape = (int(x.shape[0]), sum(int(part.shape[1]) for part in parts), int(x.shape[2]))
-        key = (shape, x.dtype, x.device.type, x.device.index)
-        workspace = self._estimator_input_workspace.get(key)
-        if workspace is None:
-            workspace = x.new_empty(shape)
-            self._estimator_input_workspace[key] = workspace
-        return torch.cat(parts, dim=1, out=workspace)
-
     def _estimator_step(
         self,
         estimator: nn.Module,
@@ -449,7 +409,7 @@ class BatchedToken2Wav(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
-        estimator_input = self._estimator_input(x, mu, speaker_features, cond)
+        estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)

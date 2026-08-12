@@ -11,7 +11,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_mlp_residual,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
-    _npu_estimator_cat_out_enabled,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -374,27 +373,6 @@ def test_invalid_npu_dit_mlp_graph_width_is_rejected(monkeypatch, value: str):
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH", value)
     with pytest.raises(ValueError, match="NPU_DIT_MLP_GRAPH_WIDTH"):
         _npu_dit_mlp_graph_width()
-
-
-def test_npu_estimator_cat_out_environment_overrides_profile(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_ESTIMATOR_CAT_OUT", "off")
-    assert _npu_estimator_cat_out_enabled(True) is False
-
-
-def test_invalid_npu_estimator_cat_out_switch_is_rejected(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_ESTIMATOR_CAT_OUT", "sometimes")
-    with pytest.raises(ValueError, match="NPU_ESTIMATOR_CAT_OUT"):
-        _npu_estimator_cat_out_enabled()
-
-
-def test_estimator_input_preserves_generic_concat_math():
-    adapter = BatchedToken2Wav(_FakeToken2Wav(), npu_estimator_cat_out=True)
-    parts = tuple(torch.randn(2, 1, 5) for _ in range(4))
-
-    actual = adapter._estimator_input(*parts)
-
-    torch.testing.assert_close(actual, torch.cat(parts, dim=1), rtol=0, atol=0)
-    assert adapter._estimator_input_workspace == {}
 
 
 @pytest.mark.parametrize(("value", "expected"), [("0", 1), ("8", 8), ("bad", 4)])

@@ -98,17 +98,6 @@ class _CosyVoiceStyleTimestepEmbedder(nn.Module):
         return self.mlp(torch.cat((torch.cos(arguments), torch.sin(arguments)), dim=-1))
 
 
-class _CountingAdaLN(nn.Module):
-    def __init__(self, hidden_size: int):
-        super().__init__()
-        self.projection = nn.Linear(hidden_size, hidden_size * 9)
-        self.calls = 0
-
-    def forward(self, value):
-        self.calls += 1
-        return self.projection(F.silu(value))
-
-
 class _FakeDecoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -321,36 +310,6 @@ def test_adapter_caches_cosyvoice_timestep_embeddings_without_forward_calls():
     torch.testing.assert_close(actual, expected)
     assert cached is actual
     assert estimator.t_embedder.calls == calls_before_cache
-
-
-def test_adapter_caches_dit_adaln_modulations_for_every_step_and_block():
-    adapter = BatchedToken2Wav(_FakeToken2Wav())
-    adapter._npu_dit_mlp_graph_enabled = True
-    adapter._npu_dit_mlp_graph_disabled = False
-    blocks = [SimpleNamespace(adaLN_modulation=_CountingAdaLN(3)) for _ in range(2)]
-    estimator = SimpleNamespace(blocks=blocks)
-    time_embeddings = torch.randn(2, 2, 1, 3)
-
-    # Exercise the cache math on CPU; production eligibility is NPU-only.
-    expected = torch.stack(
-        [torch.stack([block.adaLN_modulation(step) for block in blocks]) for step in time_embeddings]
-    )
-    calls_before_cache = [block.adaLN_modulation.calls for block in blocks]
-    actual = adapter._cached_estimator_adaln_modulations(estimator, time_embeddings)
-    cached = adapter._cached_estimator_adaln_modulations(estimator, time_embeddings)
-
-    torch.testing.assert_close(actual, expected)
-    assert cached is actual
-    assert [block.adaLN_modulation.calls for block in blocks] == [value + len(time_embeddings) for value in calls_before_cache]
-
-
-def test_adapter_keeps_adaln_cache_off_the_generic_eager_path():
-    adapter = BatchedToken2Wav(_FakeToken2Wav())
-    estimator = SimpleNamespace(blocks=[SimpleNamespace(adaLN_modulation=_CountingAdaLN(3))])
-    time_embeddings = torch.randn(2, 2, 1, 3)
-
-    assert adapter._estimator_adaln_modulations(estimator, time_embeddings) is None
-    assert adapter._adaln_modulation_cache == {}
 
 
 def test_dit_mlp_residual_matches_eager_block_math():

@@ -1144,6 +1144,26 @@ class TestResolveScheduler:
 
 
 class TestDeployConfigLoading:
+    def test_load_minicpmo_910c_competition_topology(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml"
+            )
+        )
+
+        deploy = load_deploy_config(deploy_path)
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert [stage.yaml_runtime["devices"] for stage in stages] == ["0", "0", "1"]
+        assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages[:2]] == [
+            0.72,
+            0.08,
+        ]
+        assert stages[0].yaml_engine_args["max_num_batched_tokens"] == 16384
+
     def test_load_minicpmo_duplex_deploy_config(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "minicpmo_4_5_duplex.yaml"
 

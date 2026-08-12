@@ -1156,6 +1156,7 @@ class TestDeployConfigLoading:
         assert deploy.session_mode == "duplex"
         assert deploy.async_chunk is True
         assert deploy.active_stream_window == 1
+        assert deploy.duplex_session.cache_control_embeddings is True
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.yaml_engine_args["async_scheduling"] for stage in stages] == [False, False, False]

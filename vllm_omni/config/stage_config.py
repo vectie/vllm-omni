@@ -445,6 +445,10 @@ class DuplexSessionRuntimeConfig:
     # it ahead of the foreground class for one admission turn. This bounds
     # starvation without adding a second scheduler or request state machine.
     background_aging_s: float | None = None
+    # Cache the small set of repeatedly injected Stage-0 control-token
+    # embeddings on-device. Enable only when embedding weights are immutable;
+    # dynamic LoRA/adapters must leave this false.
+    cache_control_embeddings: bool = False
 
     def __post_init__(self) -> None:
         positive = {

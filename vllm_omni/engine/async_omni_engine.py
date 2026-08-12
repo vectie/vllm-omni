@@ -245,6 +245,10 @@ class AsyncOmniEngine:
             )
         else:
             os.environ.pop("VLLM_OMNI_DUPLEX_BACKGROUND_AGING_S", None)
+        if self.duplex_session_config.cache_control_embeddings:
+            os.environ["VLLM_OMNI_MINICPMO45_CACHE_CONTROL_EMBEDDINGS"] = "1"
+        else:
+            os.environ.pop("VLLM_OMNI_MINICPMO45_CACHE_CONTROL_EMBEDDINGS", None)
 
         # Tri-state: None means "not specified" — the deploy yaml's per-stage
         # trust_remote_code stays in effect. An explicit True/False here is a

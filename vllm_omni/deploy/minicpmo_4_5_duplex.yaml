@@ -22,6 +22,9 @@ duplex_session:
   # than 30 seconds are aged ahead for one turn to prevent starvation.
   foreground_priority: -100
   background_aging_s: 30.0
+  # This profile does not load dynamic LoRA/adapters, so repeated Stage-0
+  # delimiter embeddings are safe to keep accelerator-resident.
+  cache_control_embeddings: true
 
 stages:
   - stage_id: 0

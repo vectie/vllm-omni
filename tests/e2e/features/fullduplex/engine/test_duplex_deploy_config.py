@@ -34,6 +34,7 @@ def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> No
     assert deploy.duplex_session.completed_append_cache_size == 256
     assert deploy.duplex_session.foreground_priority is None
     assert deploy.duplex_session.background_aging_s is None
+    assert deploy.duplex_session.cache_control_embeddings is False
     with pytest.raises(FrozenInstanceError):
         deploy.duplex_session.idle_ttl_s = 1.0  # type: ignore[misc]
 
@@ -78,6 +79,7 @@ def test_duplex_session_runtime_accepts_foreground_scheduling(tmp_path) -> None:
         "duplex_session:\n"
         "  foreground_priority: -100\n"
         "  background_aging_s: 2.5\n"
+        "  cache_control_embeddings: true\n"
         "stages: []\n",
         encoding="utf-8",
     )
@@ -86,6 +88,7 @@ def test_duplex_session_runtime_accepts_foreground_scheduling(tmp_path) -> None:
 
     assert deploy.duplex_session.foreground_priority == -100
     assert deploy.duplex_session.background_aging_s == 2.5
+    assert deploy.duplex_session.cache_control_embeddings is True
 
 
 @pytest.mark.parametrize("priority", [0, 1])

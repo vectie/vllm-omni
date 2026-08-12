@@ -447,7 +447,11 @@ class StageRuntime:
         }
         primary_exc: Exception | None = None
         init_state_lock = threading.Lock()
-        self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
+        # Preserve an unrestricted parent environment as an explicit empty
+        # baseline. ``None`` tells the resolver to reread the process env,
+        # which may be temporarily narrowed by a parallel diffusion-stage
+        # initializer and can remap another stage onto the wrong device.
+        self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var, "")
 
         init_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
         for plan in stage_plans:

@@ -33,6 +33,11 @@ def resolve_stage_physical_devices(
     device_list = _parse_device_list(devices)
     env_var = current_omni_platform.device_control_env_var
     visible_devices = visible_baseline if visible_baseline is not None else os.environ.get(env_var)
+    # An explicit empty baseline means the parent process had no visibility
+    # restriction when initialization began. Do not fall back to a temporary
+    # stage scope that another parallel initializer may have installed.
+    if visible_devices == "":
+        return ",".join(device_list)
     if visible_devices is not None:
         visible_device_list = _parse_device_list(visible_devices)
         device_list = _map_device_list(stage_id, device_list, visible_device_list)

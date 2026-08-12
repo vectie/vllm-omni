@@ -218,6 +218,14 @@ def test_resolve_stage_physical_devices_uses_visible_baseline(monkeypatch: pytes
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_resolve_stage_physical_devices_preserves_unrestricted_baseline(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "1")
+
+    assert resolve_stage_physical_devices(1, "0", visible_baseline="") == "0"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_map_device_list_raises_on_non_numeric():
     """Non-numeric device IDs raise ValueError."""
     with pytest.raises(ValueError, match="must be non-negative integers"):

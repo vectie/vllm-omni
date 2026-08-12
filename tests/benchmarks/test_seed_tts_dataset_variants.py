@@ -224,3 +224,39 @@ def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch):
     assert calls["input_features"].device == "cuda:1"
     assert calls["generate_kwargs"]["attention_mask"].device == "cuda:1"
     assert calls["generate_kwargs"]["forced_decoder_ids"] == [(1, 2)]
+
+
+def test_seed_tts_whisper_load_failure_does_not_poison_globals(monkeypatch):
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    processor = object()
+
+    class FakeProcessorType:
+        @classmethod
+        def from_pretrained(cls, model_id):
+            assert model_id == seed_tts_eval.OFFICIAL_WHISPER_HF_ID
+            return processor
+
+    class FakeModelType:
+        @classmethod
+        def from_pretrained(cls, model_id, *, torch_dtype):
+            assert model_id == seed_tts_eval.OFFICIAL_WHISPER_HF_ID
+            assert torch_dtype is not None
+            raise OSError("incomplete checkpoint")
+
+    fake_transformers = types.SimpleNamespace(
+        WhisperForConditionalGeneration=FakeModelType,
+        WhisperProcessor=FakeProcessorType,
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setattr(seed_tts_eval, "_get_eval_device", lambda: "cpu")
+    monkeypatch.setattr(seed_tts_eval, "_en_processor", None)
+    monkeypatch.setattr(seed_tts_eval, "_en_model", None)
+    monkeypatch.setattr(seed_tts_eval, "_device", None)
+
+    with pytest.raises(OSError, match="incomplete checkpoint"):
+        seed_tts_eval._ensure_en_asr()
+
+    assert seed_tts_eval._en_processor is None
+    assert seed_tts_eval._en_model is None
+    assert seed_tts_eval._device is None

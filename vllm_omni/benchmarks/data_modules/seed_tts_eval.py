@@ -415,27 +415,35 @@ def _utmos_predict_f32_16k(wav_f32: np.ndarray) -> float | None:
 def _ensure_en_asr() -> None:
     global _en_processor, _en_model, _device
     with _lock:
-        if _en_processor is not None:
+        if _en_processor is not None and _en_model is not None and _device is not None:
             return
         import torch
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-        _device = _get_eval_device()
+        # Build the evaluator transactionally. Assigning the processor before
+        # the much larger model finishes loading poisons global state when a
+        # download, OOM, or checkpoint error interrupts model construction:
+        # every later request sees a non-null processor, skips initialization,
+        # and then asserts because the model is still null.
+        device = _get_eval_device()
         mid = os.environ.get("SEED_TTS_HF_WHISPER_MODEL", OFFICIAL_WHISPER_HF_ID).strip() or OFFICIAL_WHISPER_HF_ID
         logger.warning(
             "Loading Seed-TTS eval Whisper HF model %r on %s (one-time, seed-tts-eval protocol)...",
             mid,
-            _device,
+            device,
         )
-        _en_processor = WhisperProcessor.from_pretrained(mid)
+        processor = WhisperProcessor.from_pretrained(mid)
         # Force float32 weights/bias to match `_transcribe_en_f32_16k`'s fp32 protocol
         # and `WhisperProcessor`'s default fp32 ``input_features``. transformers >=5.x
         # honors ``model.config.torch_dtype`` in ``from_pretrained``, and
         # ``openai/whisper-large-v3`` ships ``torch_dtype: float16`` in its config —
         # without this override conv1 raises
         # ``RuntimeError: Input type (float) and bias type (c10::Half) should be the same``.
-        _en_model = WhisperForConditionalGeneration.from_pretrained(mid, torch_dtype=torch.float32).to(_device)
-        _en_model.eval()
+        model = WhisperForConditionalGeneration.from_pretrained(mid, torch_dtype=torch.float32).to(device)
+        model.eval()
+        _en_processor = processor
+        _en_model = model
+        _device = device
 
 
 def _ensure_zh_asr() -> None:

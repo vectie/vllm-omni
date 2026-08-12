@@ -1250,3 +1250,32 @@ ad1a230e7c0bf70a5a7e03d23365b9bf3168924ce162701ece2f3f80d7f29833  static-kernel-
 a4eb95ca0fe8adeb519ef9ae292d745fd46d343117e7e4ea48980f80ce4ce8ae  static-kernel-candidate-run3.json
 6346c2d5da567b4a621d5b04126e9c5f6388fa2aad5526c7e8dfa8f7547a80e4  static-kernel-smoke8.json
 ```
+
+## Rejected virtual-concat input projection
+
+The next candidate implemented a native Triton-Ascend kernel that treated the
+four `[B, C, T]` estimator inputs as one virtual K dimension and performed the
+following 320-to-512 projection without materializing `torch.cat`. The kernel
+was wired behind an opt-in, fail-closed MiniCPM-o switch and preserved the
+accepted eager path as its fallback.
+
+The exact steady-state shape (`B=2`, `T=50`, `K=320`, `N=512`, bfloat16) was
+screened on the same idle 910C service host. Both a 16-program Cube tiling and
+a coarser two-program tiling were tested after warmup. The coarser result is
+shown with two stock alternatives:
+
+| Projection path | Mean | P50 | P99 | Max abs delta |
+| --- | ---: | ---: | ---: | ---: |
+| Native concat + view + linear | 94.14 us | 94.74 us | 110.80 us | 0 |
+| Triton virtual concat, coarse | 927.89 us | 926.96 us | 951.61 us | 0.5 |
+| Four split native linears + sum | 214.03 us | 212.25 us | 241.73 us | 0.5 |
+
+The first, finer Triton tiling was also slow at 583.85 us mean and 580.43 us
+P50. Torch-npu's exposed `npu_linear` operator could not replace the native
+path because it accepts only a 2-D input on this installed stack. The custom
+kernel was 9.86x slower than the native expression, and both ways of changing
+the accumulation order introduced bfloat16 drift. The candidate was rejected
+at the operator gate, removed before deployment, and did not consume a service
+A/B run. This closes virtual concatenation at this small projection boundary;
+a profitable custom operator must fuse a materially larger attention or
+convolution region and amortize its launch and layout cost.

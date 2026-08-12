@@ -19,9 +19,9 @@ duplex_session:
   max_sessions: 2
   completed_append_cache_size: 256
   # Established duplex work wins admission, while background requests older
-  # than two seconds are aged ahead for one turn to prevent starvation.
+  # than 30 seconds are aged ahead for one turn to prevent starvation.
   foreground_priority: -100
-  background_aging_s: 2.0
+  background_aging_s: 30.0
 
 stages:
   - stage_id: 0

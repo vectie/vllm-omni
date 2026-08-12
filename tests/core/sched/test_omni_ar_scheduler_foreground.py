@@ -56,3 +56,17 @@ def test_background_aging_leaves_recent_request_behind_foreground(monkeypatch) -
 
     assert scheduler.waiting.peek_request() is foreground
     assert background.priority == 0
+
+
+def test_remove_queued_request_supports_priority_queue_and_running_list() -> None:
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    waiting = create_request_queue(SchedulingPolicy.PRIORITY)
+    request = _ComparableRequest(request_id="aborted", priority=-100, arrival_time=99.0)
+    waiting.add_request(request)
+    running = [request]
+
+    scheduler._remove_queued_request(waiting, request)
+    scheduler._remove_queued_request(running, request)
+
+    assert not waiting
+    assert running == []

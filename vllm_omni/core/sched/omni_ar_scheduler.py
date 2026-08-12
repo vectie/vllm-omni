@@ -171,6 +171,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _should_defer_waiting_admission(self) -> bool:
         return False
 
+    @staticmethod
+    def _remove_queued_request(queue: Any, request: Request) -> None:
+        """Remove from either a vLLM RequestQueue or a plain running list."""
+        remove_request = getattr(queue, "remove_request", None)
+        if remove_request is not None:
+            remove_request(request)
+        else:
+            queue.remove(request)
+
     def _promote_aged_background_requests(self) -> None:
         """Bound background starvation when duplex foreground priority is on.
 
@@ -317,7 +326,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         for queue in (self.waiting, self.running):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
-                    queue.remove(req)
+                    self._remove_queued_request(queue, req)
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
         self._promote_aged_background_requests()

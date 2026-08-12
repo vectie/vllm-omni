@@ -1113,3 +1113,31 @@ stack.
 bb47ef1dd4a8dea61b626bca35dc7c4c4545df8a292ff5e547ba7d19fb140b10  adaln-cache-candidate-run2.json
 d953eed8508c6d61f93f1b28d580d3d93262c906a089bf7dd6137bcc910f7d08  adaln-cache-candidate-run3.json
 ```
+
+## Rejected Ascend evaluation LayerNorm kernel
+
+The next layout-oriented screen replaced the two eager, affine-free DiT
+normalizations per block with torch-npu's inference-only
+`npu_layer_norm_eval`. Before paying for another full service A/B, the exact
+steady-state DiT shape (`[2, 50, 512]`, bfloat16) was measured for 1,000
+iterations on the same 910C. The fused operator was bit-identical to
+`nn.LayerNorm`, but it was materially slower:
+
+| Kernel | Mean | P50 | P99 |
+| --- | ---: | ---: | ---: |
+| Native `nn.LayerNorm` | 42.02 us | 40.87 us | 61.20 us |
+| `npu_layer_norm_eval` | 82.27 us | 82.26 us | 100.32 us |
+
+That is a 95.8% mean regression, and the installed torch-npu version also
+reports `npu_layer_norm_eval` as deprecated. The candidate was therefore
+rejected at the kernel gate and fully reverted. A same-era accepted-service
+control had already completed three 32-prompt runs with zero failures and the
+expected 4,801 input tokens, 480 output tokens, 3,329,280 frames, and 138.72
+seconds of audio in every run; those artifacts remain useful as the next
+candidate's control:
+
+```text
+e545c631531453c7a522b156b3c8a2d302fd8a0f71a2440df0124087cb5f1137  layout-norm-control-run1.json
+3ba4123f02b7b0120f25955d8fcb2b99fce169578435846dced9d7c7a798b5b0  layout-norm-control-run2.json
+e99e9229525efae035291aaf0ace2eddc056297f32e6b6bf8bb8c595e3323315  layout-norm-control-run3.json
+```

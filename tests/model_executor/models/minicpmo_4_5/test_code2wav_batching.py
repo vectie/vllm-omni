@@ -8,11 +8,9 @@ import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
-    _configure_torchair_mlp_graph,
     _dit_mlp_residual,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
-    _npu_dit_mlp_static_kernel_enabled,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -362,39 +360,6 @@ def test_npu_dit_mlp_graph_environment_overrides_profile(monkeypatch):
 
     assert _npu_dit_mlp_graph_enabled(True) is False
     assert _npu_dit_mlp_graph_width(50) == 25
-
-
-def test_npu_dit_mlp_static_kernel_switch(monkeypatch):
-    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_STATIC_KERNEL", raising=False)
-    assert _npu_dit_mlp_static_kernel_enabled() is False
-    assert _npu_dit_mlp_static_kernel_enabled(True) is True
-    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_STATIC_KERNEL", "off")
-    assert _npu_dit_mlp_static_kernel_enabled(True) is False
-
-
-def test_npu_dit_mlp_static_kernel_configures_torchair():
-    aclgraph = SimpleNamespace(_aclnn_static_shape_kernel=False)
-    config = SimpleNamespace(
-        mode=None,
-        debug=SimpleNamespace(
-            run_eagerly=False,
-            aclgraph=SimpleNamespace(disable_reinplace_inplaceable_ops_pass=False),
-        ),
-        experimental_config=SimpleNamespace(aclgraph=aclgraph),
-    )
-
-    _configure_torchair_mlp_graph(config, static_kernel=True)
-
-    assert config.mode == "reduce-overhead"
-    assert config.debug.run_eagerly is True
-    assert config.debug.aclgraph.disable_reinplace_inplaceable_ops_pass is True
-    assert aclgraph._aclnn_static_shape_kernel is True
-
-
-def test_npu_dit_mlp_static_kernel_fails_closed_when_unsupported():
-    config = SimpleNamespace(experimental_config=SimpleNamespace(aclgraph=SimpleNamespace()))
-    with pytest.raises(RuntimeError, match="does not support static ACLNN kernels"):
-        _configure_torchair_mlp_graph(config, static_kernel=True)
 
 
 def test_invalid_npu_dit_mlp_graph_switch_is_rejected(monkeypatch):

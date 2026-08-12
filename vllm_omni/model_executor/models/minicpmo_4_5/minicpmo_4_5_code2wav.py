@@ -792,5 +792,4 @@ class MiniCPMO45Code2Wav(nn.Module):
             token2wav,
             npu_dit_mlp_graph=extra.get("npu_dit_mlp_graph"),
             npu_dit_mlp_graph_width=extra.get("npu_dit_mlp_graph_width"),
-            npu_dit_mlp_static_kernel=extra.get("npu_dit_mlp_static_kernel"),
         )

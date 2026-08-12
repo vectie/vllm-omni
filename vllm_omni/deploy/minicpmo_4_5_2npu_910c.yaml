@@ -27,7 +27,9 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
-      raw_tensor_shm: true
+      # Exact 910C connector A/B: tensor-v1 was slower for both steady codec
+      # chunks and the reference-audio first chunk. Keep serialized SHM.
+      raw_tensor_shm: false
       shm_event_notifications: true
       # Use a unique value when multiple services share one host.
       shm_notification_namespace: minicpmo45-910c

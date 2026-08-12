@@ -158,10 +158,13 @@ serving profile and its accuracy numbers are unchanged.
 ### 4. Same-host transfer
 
 The optional `tensor-v1` shared-memory format separates a small serialized
-metadata header from aligned raw CPU tensor buffers. It now recognizes the
-`msgspec.Struct` payloads used by the inter-stage wire contract and avoids a
-second tensor serialization copy. Unix datagram notifications replace repeated
-failed `shm_open` polling when enabled.
+metadata header from aligned raw CPU tensor buffers. It recognizes the
+`msgspec.Struct` payloads used by the inter-stage wire contract, but the exact
+910C connector screen found it 32.42% slower for steady codec chunks and 2.65%
+slower for the reference-audio first chunk. MiniCPM-o 910C profiles therefore
+use serialized SHM. Unix datagram notifications remain enabled: their small
+mean dispatch cost reduced the measured P99 and replaces up to a one-millisecond
+failed-read fallback in the production receive loop.
 
 This is not NPU zero-copy: producing an inter-stage tensor still requires a
 device-to-host transfer, and the consumer copies it into owned CPU storage
@@ -402,7 +405,8 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Stage-separated continuous batching and request-owned audio state | Shipped |
 | Stage 0 scheduler/KV continuity for native duplex | Shipped, experimental lifecycle boundary |
 | Per-chunk RTF, TTFT, TTFP, continuity, and benchmark quality gates | Shipped |
-| Raw-tensor SHM and event notification | Implemented, opt-in, target proof required |
+| Raw-tensor SHM | Rejected for MiniCPM-o 910C: steady/first-chunk connector round trips regressed 32.42%/2.65%; profiles restored serialized SHM |
+| SHM event notification | Retained for 910C: 20.63 us mean dispatch cost, 14.26 us lower P99, and avoids the receive loop's up-to-1 ms polling fallback |
 | Cached immutable Stage 0 control-token embeddings | Shipped in the static-weight native-duplex profile; exact operator parity, representative operator sequence -61.35%, resident Stage-0 TTFT mean -8.45% |
 | Sticky fused-to-MATH Ascend SDPA adapter | Implemented, target proof required |
 | Exact-shape CFM graph replay | Implemented, off by default; full-loop capture rejected on measured 910C |

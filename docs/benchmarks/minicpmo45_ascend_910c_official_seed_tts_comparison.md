@@ -1381,3 +1381,35 @@ change the ordinary competition profile, sampling, Daily-Omni accuracy,
 Seed-TTS audio quality, or Video-MME results. Its promotion gate is therefore
 exact tensor parity plus native-duplex behavioral and latency stability rather
 than a rerun of unrelated ordinary-request suites.
+
+## Rejected raw-tensor SHM, retained event notification
+
+The accepted 910C profiles had enabled the `tensor-v1` shared-memory format
+before a target-host connector proof existed. An exact connector A/B now
+compares it with the ordinary msgpack-plus-SHM path. Each iteration created,
+wrote, read, cloned, and unlinked a real POSIX segment. The steady payload
+matched a 25-frame codec chunk plus three left-context codes; the first-chunk
+case additionally carried six seconds (96,000 float32 samples) of reference
+audio.
+
+| Payload | Connector | Mean round trip | P50 | P99 | Segment bytes |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Steady codec chunk | Serialized SHM | 279.54 us | 272.77 us | 359.00 us | 540 |
+| Steady codec chunk | `tensor-v1` | 370.17 us | 356.81 us | 472.71 us | 705 |
+| First chunk + reference | Serialized SHM | 1,076.55 us | 1,071.38 us | 1,170.70 us | 384,593 |
+| First chunk + reference | `tensor-v1` | 1,105.09 us | 1,098.73 us | 1,219.78 us | 384,769 |
+
+Lower is better. Raw tensors regressed the steady round trip 32.42% and the
+large first-chunk round trip 2.65%, while increasing the segment size in both
+cases. All MiniCPM-o 910C profiles now keep `raw_tensor_shm: false`. The
+generic implementation and its tests remain available for payloads where a
+future measurement shows a win.
+
+Event notification was screened separately for 1,000 real segment transfers.
+An immediate same-thread put/get control measured 163.97 us mean and 286.68 us
+P99; Unix-datagram notification plus put/get measured 184.60 us mean and
+272.42 us P99. The 20.63 us mean notification cost buys a 14.26 us lower P99
+and, more importantly, replaces the receiver's production fallback of up to
+one millisecond between failed reads. Notifications therefore remain enabled
+for tail wakeup and idle-CPU behavior; only the raw serialization format is
+rejected.

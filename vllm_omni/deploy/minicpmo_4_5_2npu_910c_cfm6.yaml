@@ -19,7 +19,7 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
-      raw_tensor_shm: true
+      raw_tensor_shm: false
       shm_event_notifications: true
       shm_notification_namespace: minicpmo45-910c
       token2wav_n_timesteps: 6

@@ -2219,7 +2219,7 @@ class TestPlatformOverrides:
         assert connector["extra"]["token2wav_n_timesteps"] == 8
         assert connector["extra"]["codec_chunk_frames"] == 25
         assert connector["extra"]["codec_left_context_frames"] == 3
-        assert connector["extra"]["raw_tensor_shm"] is True
+        assert connector["extra"]["raw_tensor_shm"] is False
         assert connector["extra"]["shm_event_notifications"] is True
 
         assert deploy.platforms is not None
@@ -2237,7 +2237,7 @@ class TestPlatformOverrides:
         assert connector["extra"]["token2wav_n_timesteps"] == 6
         assert connector["extra"]["codec_chunk_frames"] == 25
         assert connector["extra"]["codec_left_context_frames"] == 3
-        assert connector["extra"]["raw_tensor_shm"] is True
+        assert connector["extra"]["raw_tensor_shm"] is False
         assert connector["extra"]["shm_event_notifications"] is True
 
         assert deploy.platforms is not None
@@ -2256,6 +2256,7 @@ class TestPlatformOverrides:
         assert connector["extra"]["npu_dit_mlp_graph_width"] == 50
         assert connector["extra"]["codec_chunk_frames"] == 25
         assert connector["extra"]["codec_left_context_frames"] == 3
+        assert connector["extra"]["raw_tensor_shm"] is False
 
     def test_minicpmo_4_5_910c_competition_profile_pins_thinker_sampling(self):
         deploy_path = Path(

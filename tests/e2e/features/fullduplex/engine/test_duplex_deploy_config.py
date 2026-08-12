@@ -32,6 +32,8 @@ def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> No
     assert deploy.duplex_session.max_pending_turns_per_session == 4
     assert deploy.duplex_session.max_sessions == 1
     assert deploy.duplex_session.completed_append_cache_size == 256
+    assert deploy.duplex_session.foreground_priority is None
+    assert deploy.duplex_session.background_aging_s is None
     with pytest.raises(FrozenInstanceError):
         deploy.duplex_session.idle_ttl_s = 1.0  # type: ignore[misc]
 
@@ -58,6 +60,8 @@ def test_duplex_session_runtime_accepts_disabled_idle_expiry(tmp_path) -> None:
         ("max_pending_turns_per_session", -1),
         ("max_sessions", 0),
         ("completed_append_cache_size", 0),
+        ("background_aging_s", 0),
+        ("background_aging_s", -1),
     ],
 )
 def test_duplex_session_runtime_rejects_non_positive_values(tmp_path, name: str, value: int) -> None:
@@ -65,4 +69,32 @@ def test_duplex_session_runtime_rejects_non_positive_values(tmp_path, name: str,
     deploy_path.write_text(f"duplex_session:\n  {name}: {value}\nstages: []\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match=rf"duplex_session\.{name} must be positive"):
+        load_deploy_config(deploy_path)
+
+
+def test_duplex_session_runtime_accepts_foreground_scheduling(tmp_path) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n"
+        "  foreground_priority: -100\n"
+        "  background_aging_s: 2.5\n"
+        "stages: []\n",
+        encoding="utf-8",
+    )
+
+    deploy = load_deploy_config(deploy_path)
+
+    assert deploy.duplex_session.foreground_priority == -100
+    assert deploy.duplex_session.background_aging_s == 2.5
+
+
+@pytest.mark.parametrize("priority", [0, 1])
+def test_duplex_session_runtime_requires_negative_foreground_priority(tmp_path, priority: int) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        f"duplex_session:\n  foreground_priority: {priority}\nstages: []\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="foreground_priority must be negative"):
         load_deploy_config(deploy_path)

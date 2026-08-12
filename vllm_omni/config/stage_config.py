@@ -438,6 +438,13 @@ class DuplexSessionRuntimeConfig:
     max_pending_turns_per_session: int = 4
     max_sessions: int = 1
     completed_append_cache_size: int = 256
+    # Lower values have higher priority in vLLM's priority scheduler. ``None``
+    # preserves ordinary FCFS behavior for deployments that have not opted in.
+    foreground_priority: int | None = None
+    # Once background work has waited this long, the Omni scheduler promotes
+    # it ahead of the foreground class for one admission turn. This bounds
+    # starvation without adding a second scheduler or request state machine.
+    background_aging_s: float | None = None
 
     def __post_init__(self) -> None:
         positive = {
@@ -452,6 +459,10 @@ class DuplexSessionRuntimeConfig:
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        if self.foreground_priority is not None and self.foreground_priority >= 0:
+            raise ValueError("duplex_session.foreground_priority must be negative or null")
+        if self.background_aging_s is not None and self.background_aging_s <= 0:
+            raise ValueError("duplex_session.background_aging_s must be positive or null")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")

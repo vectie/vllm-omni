@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from collections.abc import Iterable
 from time import time
@@ -170,6 +171,71 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _should_defer_waiting_admission(self) -> bool:
         return False
 
+    def _promote_aged_background_requests(self) -> None:
+        """Bound background starvation when duplex foreground priority is on.
+
+        vLLM's priority queue orders smaller values first. Established duplex
+        requests use a negative configured priority; ordinary work remains at
+        zero unless the caller supplied another value. Once non-foreground
+        work exceeds the configured wait bound, promote the oldest aged cohort
+        ahead of the current foreground floor and rebuild the heap.
+        """
+        raw = os.environ.get("VLLM_OMNI_DUPLEX_BACKGROUND_AGING_S")
+        if raw in (None, "") or not self.waiting:
+            return
+        promoted = getattr(self, "_omni_aged_background", None)
+        if promoted is not None and any(waiting is promoted[0] for waiting in self.waiting):
+            return
+        try:
+            aging_s = float(raw)
+        except ValueError:
+            logger.warning("Invalid VLLM_OMNI_DUPLEX_BACKGROUND_AGING_S=%r; disabling aging", raw)
+            return
+        if aging_s <= 0:
+            return
+
+        now = time()
+        waiting = list(self.waiting)
+        aged = [
+            request
+            for request in waiting
+            if request.priority >= 0 and now - float(request.arrival_time) >= aging_s
+        ]
+        if not aged:
+            return
+        # Only one background request receives the temporary boost. It keeps
+        # that boost until admitted, then returns to its caller-supplied
+        # priority. This guarantees progress without turning an old offline
+        # queue into a new foreground class.
+        aged_request = min(aged, key=lambda request: (request.arrival_time, request.request_id))
+        current_floor = min(
+            (request.priority for request in (*waiting, *self.running)),
+            default=0,
+        )
+        aged_priority = current_floor - 1
+        self._omni_aged_background = (aged_request, aged_request.priority)
+        aged_request.priority = aged_priority
+        rebuilt = create_request_queue(self.policy)
+        for request in waiting:
+            rebuilt.add_request(request)
+        self.waiting = rebuilt
+        logger.debug(
+            "Promoted aged background request %s to priority %d after %.3fs",
+            aged_request.request_id,
+            aged_priority,
+            aging_s,
+        )
+
+    def _restore_admitted_background_priority(self) -> None:
+        promoted = getattr(self, "_omni_aged_background", None)
+        if promoted is None:
+            return
+        request, original_priority = promoted
+        if any(waiting is request for waiting in self.waiting):
+            return
+        request.priority = original_priority
+        self._omni_aged_background = None
+
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
         Check triggers and process side effects (marking transfer).
@@ -254,6 +320,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     queue.remove(req)
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
+        self._promote_aged_background_requests()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
@@ -267,6 +334,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            self._restore_admitted_background_priority()
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
                 if deferred_waiting:

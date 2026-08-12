@@ -18,15 +18,23 @@ duplex_session:
   # Matches the configured Stage0/Stage1 sequence capacity below.
   max_sessions: 2
   completed_append_cache_size: 256
+  # Established duplex work wins admission, while background requests older
+  # than two seconds are aged ahead for one turn to prevent starvation.
+  foreground_priority: -100
+  background_aging_s: 2.0
 
 stages:
   - stage_id: 0
     max_num_seqs: 2
     async_scheduling: false
+    engine_extras:
+      scheduling_policy: priority
 
   - stage_id: 1
     max_num_seqs: 2
     async_scheduling: false
+    engine_extras:
+      scheduling_policy: priority
     # The split Talker exposes a binary continue/stop vocabulary; native
     # segment and turn boundaries travel as explicit output metadata.
     default_sampling_params:
@@ -37,3 +45,5 @@ stages:
   - stage_id: 2
     max_num_seqs: 2
     async_scheduling: false
+    engine_extras:
+      scheduling_policy: priority

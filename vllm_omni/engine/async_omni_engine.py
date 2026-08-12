@@ -11,6 +11,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import json
+import os
 import queue
 import threading
 import time
@@ -235,6 +236,15 @@ class AsyncOmniEngine:
         self.duplex_session_config = DuplexSessionRuntimeConfig()
         if deploy_config_path is not None:
             self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
+        if self.duplex_session_config.background_aging_s is not None:
+            # Stage workers inherit the launch environment. The scheduler is
+            # deliberately model-neutral, so pass the typed pipeline setting
+            # through one private Omni environment variable.
+            os.environ["VLLM_OMNI_DUPLEX_BACKGROUND_AGING_S"] = str(
+                self.duplex_session_config.background_aging_s
+            )
+        else:
+            os.environ.pop("VLLM_OMNI_DUPLEX_BACKGROUND_AGING_S", None)
 
         # Tri-state: None means "not specified" — the deploy yaml's per-stage
         # trust_remote_code stays in effect. An explicit True/False here is a

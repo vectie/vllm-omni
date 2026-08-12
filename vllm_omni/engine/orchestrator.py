@@ -114,6 +114,7 @@ def build_engine_core_request_from_tokens(
     model_config: ModelConfig | None = None,
     resumable: bool = False,
     mm_features: list | None = None,
+    priority: int = 0,
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
     if arrival_time is None:
@@ -155,6 +156,7 @@ def build_engine_core_request_from_tokens(
         resumable=resumable,
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
+        priority=priority,
     )
 
 
@@ -223,6 +225,7 @@ class _OrchestratorDuplexStagePort:
             [str, Any, OrchestratorRequestState],
             Awaitable[None],
         ],
+        foreground_priority: int | None = None,
     ) -> None:
         self._stage_pools = stage_pools
         self._request_states = request_states
@@ -230,6 +233,7 @@ class _OrchestratorDuplexStagePort:
         self._cleanup_request_ids = cleanup_request_ids
         self._async_chunk = async_chunk
         self._prewarm_async_chunk_stages = prewarm_async_chunk_stages
+        self._foreground_priority = foreground_priority
 
     @property
     def stage_count(self) -> int:
@@ -299,6 +303,7 @@ class _OrchestratorDuplexStagePort:
             params=context.stage_sampling_params,
             model_config=self._stage_pools[context.stage_id].stage_vllm_config.model_config,
             resumable=True,
+            priority=(self._foreground_priority if self._foreground_priority is not None else 0),
         )
         request.external_req_id = request.request_id
         pool = self._stage_pools[context.stage_id]
@@ -404,6 +409,7 @@ class Orchestrator:
                     cleanup_request_ids=self._cleanup_request_ids,
                     async_chunk=self.async_chunk,
                     prewarm_async_chunk_stages=self._prewarm_async_chunk_stages,
+                    foreground_priority=runtime_session_config.foreground_priority,
                 ),
                 result_sink=self.rpc_async_queue,
                 lifecycle_sink=self.output_async_queue,

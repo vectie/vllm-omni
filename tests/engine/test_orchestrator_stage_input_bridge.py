@@ -122,7 +122,7 @@ class FakePrewarmPool:
         return 0
 
 
-def _duplex_stage_port_submission():
+def _duplex_stage_port_submission(*, foreground_priority: int | None = None):
     stage_pools = []
     for stage_id in range(3):
         pool = SimpleNamespace(
@@ -141,6 +141,7 @@ def _duplex_stage_port_submission():
         cleanup_request_ids=AsyncMock(),
         async_chunk=True,
         prewarm_async_chunk_stages=prewarm,
+        foreground_priority=foreground_priority,
     )
     context = DuplexStageRequestContext(
         request_id="req-duplex",
@@ -283,6 +284,16 @@ async def test_duplex_prewarm_runs_after_first_stage0_submission() -> None:
     assert result.stage_id == 0
     stage_pools[0].submit_initial.assert_awaited_once()
     prewarm.assert_awaited_once_with("req-duplex", ANY, request_states["req-duplex"])
+
+
+def test_duplex_foreground_priority_reaches_engine_request() -> None:
+    port, stage_pools, _, _, submission = _duplex_stage_port_submission(foreground_priority=-100)
+
+    result = asyncio.run(port.submit(submission))
+
+    assert result.stage_id == 0
+    request = stage_pools[0].submit_initial.await_args.args[2]
+    assert request.priority == -100
 
 
 @pytest.mark.asyncio

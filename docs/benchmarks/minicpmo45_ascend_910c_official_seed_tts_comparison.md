@@ -1035,7 +1035,31 @@ The 32-row screen's 68.75% was conservative; the full result improved it by
 ## Competition status and next experiment
 
 The accepted cache has passed the full 1,088-row Seed-TTS WER and official
-speaker-SIM gate. Daily-Omni passed the full 1,197-row organizer gate at
+speaker-SIM gate. The strict final c4 + 16K profile was rerun over all 1,088
+English rows: serving completed without request or export failure in 1,640.460
+seconds, versus 1,973.520 seconds for the prior 8K qualification (-16.87%).
+Its performance metrics were 335.71 ms mean TTFT, 826.68 ms mean audio TTFP,
+0.3406 whole-audio RTF, 0.3584 per-chunk RTF, 1.100 P99 per-chunk RTF, and
+1,506.87 ms mean E2E. Relative to the prior full qualification, these improve
+by 42.1%, 24.3%, 16.6%, 16.7%, 47.5%, and 16.9%, respectively.
+
+Whisper Large v3 then evaluated the persisted 1,088-WAV export offline, with
+zero ASR failures: mean WER was 0.03693 and median WER was 0.00000. The mean
+change from the prior 0.03327 result is +0.366 percentage points, inside the
+two-point accuracy-loss budget. Exact official WavLM-Large SV scoring covered
+all 1,088 pairs and produced 0.029247 SIM, slightly above the prior 0.029029.
+The serving-side evaluator initially failed because a partial Whisper load
+published its processor global before model loading succeeded; initialization
+is now transactional, and the saved WAV export allowed fail-closed rescoring
+without repeating inference.
+
+```text
+c5dafd1f54ae7ac4517694aeb134d03390227ea61de998f9b14f521584d45997  talker-frequency-cache-quality-full-en-1088-prefill16k.json
+58736dee065df32727ee201e07a52616b101bc32924aefb6f4c9e6969753efba  seed-tts-official-wer-full-en-1088-prefill16k.json
+c034d610078c8f0ce7473eb720e0a31aca87ed0a60f9067948e121ab2373224  wav_res_ref_text.sim
+```
+
+Daily-Omni passed the full 1,197-row organizer gate at
 78.279%, and Video-MME passed the full 2,700-row gate at 70.259%. All three
 specified benchmark gates have therefore passed with complete evaluated counts
 and zero HTTP failures. Thinker c10 and c8 were not promoted because their
@@ -1053,3 +1077,39 @@ preallocation candidates. The next candidate should target a narrower
 fixed-shape DiT partition or Ascend-specific layout/cache kernel, and must beat
 the accepted service in a fresh-process three-run A/B before repeating the
 full quality qualification.
+
+## Rejected DiT AdaLN modulation cache
+
+The next narrow candidate cached every DiT block's AdaLN modulation for the
+six immutable CFM timestep embeddings. It removed 96 repeated SiLU/linear
+projections from each steady-state audio chunk on the fixed-width NPU MLP graph
+path and preserved the generic eager fallback. Focused MiniCPM-o tests passed
+47/47, and the candidate service confirmed graph compilation and replay.
+
+The exact 32-prompt Seed-TTS protocol ran three times on the still-resident
+pre-change service and three times after a candidate restart. All six runs
+completed 32/32 with zero failure and 100% streaming continuity. One control
+host/NPU excursion was retained; the predeclared comparison uses medians.
+
+| Gate metric | Control median | AdaLN cache median | Change |
+| --- | ---: | ---: | ---: |
+| TTFT | 330.22 ms | 321.04 ms | -2.78% |
+| Audio TTFP | 815.94 ms | 838.87 ms | +2.81% |
+| Per-chunk RTF | 0.3566 | 0.3755 | +5.31% |
+| P99 per-chunk RTF | 1.1062 | 1.1150 | +0.80% |
+| E2E | 1,431.11 ms | 1,517.71 ms | +6.05% |
+
+The candidate was rejected and reverted. Saving small invariant outputs added
+memory reads and layout pressure on the already graph-replaying block path;
+the TTFT improvement cannot compensate for material audio and E2E regressions.
+This result closes AdaLN precomputation as a speed target on the current 910C
+stack.
+
+```text
+0106389be776aaec372265949ddbe49a82d410223365c793927b254e55c4e162  adaln-cache-control-run1.json
+59707c4a0d22fba03c9527ec62de9152d67405cf6c29d1897c1ca07b246a1e77  adaln-cache-control-run2.json
+88e1885ec32ff0966139fef1b0a59e0526d338d63a763f84b89db86c875fb0ac  adaln-cache-control-run3.json
+76787dbe68f1b76fbc8cb62a9c5d8afd723404dfeda0b21e11e4d9298a9e6be0  adaln-cache-candidate-run1.json
+bb47ef1dd4a8dea61b626bca35dc7c4c4545df8a292ff5e547ba7d19fb140b10  adaln-cache-candidate-run2.json
+d953eed8508c6d61f93f1b28d580d3d93262c906a089bf7dd6137bcc910f7d08  adaln-cache-candidate-run3.json
+```

@@ -1,0 +1,23 @@
+# Atlas A3 / Ascend 910C fixed-width DiT MLP static-kernel experiment.
+#
+# This changes only the compiler policy of the already-qualified width-50 MLP
+# graph. It remains opt-in until a same-host Seed-TTS A/B passes.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      raw_tensor_shm: true
+      shm_event_notifications: true
+      shm_notification_namespace: minicpmo45-910c
+      token2wav_n_timesteps: 6
+      npu_dit_mlp_graph: true
+      npu_dit_mlp_graph_width: 50
+      npu_dit_mlp_static_kernel: true

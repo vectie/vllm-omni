@@ -19,6 +19,7 @@ import torch.nn.functional as F
 _SILENCE_TOKEN = 4218
 _NPU_DIT_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH"
 _NPU_DIT_MLP_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH"
+_NPU_DIT_MLP_STATIC_KERNEL_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_STATIC_KERNEL"
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +66,48 @@ def _npu_dit_mlp_graph_width(config_value: Any = None) -> int:
     if width <= 0:
         raise ValueError(f"{_NPU_DIT_MLP_GRAPH_WIDTH_ENV} must be positive, got {width}")
     return width
+
+
+def _npu_dit_mlp_static_kernel_enabled(config_value: Any = None) -> bool:
+    """Return whether the fixed-shape TorchAir graph uses static ACLNN kernels."""
+    env_value = os.environ.get(_NPU_DIT_MLP_STATIC_KERNEL_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_MLP_STATIC_KERNEL_ENV}={raw!r}")
+
+
+def _configure_torchair_mlp_graph(compiler_config: Any, *, static_kernel: bool) -> None:
+    """Configure the dedicated DiT graph without changing global vLLM graphs.
+
+    TorchAir has carried both nested and flat CompilerConfig layouts. The
+    fixed-width candidate fails closed when the installed runtime does not
+    expose its static-shape switch, rather than benchmarking an ordinary graph
+    under a misleading static-kernel profile.
+    """
+    if hasattr(compiler_config, "mode"):
+        compiler_config.mode = "reduce-overhead"
+    debug = getattr(compiler_config, "debug", None)
+    if debug is not None:
+        if hasattr(debug, "run_eagerly"):
+            debug.run_eagerly = True
+        aclgraph = getattr(debug, "aclgraph", None)
+        if aclgraph is not None and hasattr(aclgraph, "disable_reinplace_inplaceable_ops_pass"):
+            aclgraph.disable_reinplace_inplaceable_ops_pass = True
+    if not static_kernel:
+        return
+    experimental = getattr(compiler_config, "experimental_config", None)
+    aclgraph = getattr(experimental, "aclgraph", None)
+    if aclgraph is None or not hasattr(aclgraph, "_aclnn_static_shape_kernel"):
+        raise RuntimeError("Installed TorchAir does not support static ACLNN kernels")
+    aclgraph._aclnn_static_shape_kernel = True
 
 
 def _ensure_torchair_broadcast_alias() -> None:
@@ -136,6 +179,7 @@ class BatchedToken2Wav(nn.Module):
         *,
         npu_dit_mlp_graph: Any = None,
         npu_dit_mlp_graph_width: Any = None,
+        npu_dit_mlp_static_kernel: Any = None,
     ):
         super().__init__()
         self._token2wav = token2wav
@@ -185,6 +229,7 @@ class BatchedToken2Wav(nn.Module):
         self._npu_cfm_graph_disabled = False
         self._npu_dit_mlp_graph_enabled = _npu_dit_mlp_graph_enabled(npu_dit_mlp_graph)
         self._npu_dit_mlp_graph_width = _npu_dit_mlp_graph_width(npu_dit_mlp_graph_width)
+        self._npu_dit_mlp_static_kernel = _npu_dit_mlp_static_kernel_enabled(npu_dit_mlp_static_kernel)
         self._npu_dit_mlp_graph: Any | None = None
         self._npu_dit_mlp_graph_disabled = False
         self._npu_dit_mlp_graph_used = False
@@ -247,6 +292,10 @@ class BatchedToken2Wav(nn.Module):
 
             _ensure_torchair_broadcast_alias()
             compiler_config = torchair.CompilerConfig()
+            _configure_torchair_mlp_graph(
+                compiler_config,
+                static_kernel=self._npu_dit_mlp_static_kernel,
+            )
             self._npu_dit_mlp_graph = torch.compile(
                 _dit_mlp_residual,
                 backend=torchair.get_npu_backend(compiler_config=compiler_config),

@@ -1279,3 +1279,73 @@ at the operator gate, removed before deployment, and did not consume a service
 A/B run. This closes virtual concatenation at this small projection boundary;
 a profitable custom operator must fuse a materially larger attention or
 convolution region and amortize its launch and layout cost.
+
+## Rejected attention cache-width bucketing
+
+The next operator gate tested whether padding the variable attention-cache
+width to a small fixed bucket could unlock a more reusable 910C graph or
+kernel. The screen used the exact scaled-dot-product attention expression and
+representative widths observed in the MiniCPM-o audio path. Each case was
+warmed and measured for 600 iterations on an otherwise idle device; the
+padded lanes were masked so they could not affect the result.
+
+| Live cache width | Native width | Fixed bucket | Bucketed width | Change before copy |
+| ---: | ---: | ---: | ---: | ---: |
+| 302 | 93.826 us | 384 | 105.845 us | +12.81% |
+| 302 | 93.826 us | 512 | 101.442 us | +8.12% |
+| 352 | 92.568 us | 384 | 104.411 us | +12.79% |
+| 352 | 92.568 us | 512 | 100.999 us | +9.11% |
+| 402 | 90.114 us | 512 | 98.002 us | +8.75% |
+
+Lower is better. Every fixed bucket was slower by 8.1% to 12.8% before
+counting the cache-padding copy, and the attention call occurs roughly 600
+times per synthesized chunk. The candidate was therefore rejected before a
+service run. Cache-width bucketing remains useful only if a future fused CANN
+kernel eliminates both the padding materialization and enough adjacent
+attention work to repay the extra lanes.
+
+## Accepted Stage-0 duplex foreground scheduling
+
+The next end-to-end candidate targets interactive tail latency under mixed
+load rather than single-request model execution. The duplex runtime now sends
+established interactive requests with a configured negative priority, while
+ordinary batch requests retain priority zero. A bounded aging rule temporarily
+promotes one background request after 30 seconds, then restores its original
+priority after admission. The production MiniCPM-o duplex profile enables
+priority scheduling only on Stage 0; Talker and Code2Wav remain FCFS because
+their chunk-transfer queues require deque operations that vLLM's priority heap
+does not expose.
+
+Focused tests on the 910C environment passed 20/20. The first all-stage
+candidate correctly exposed that queue-interface mismatch when Stage 2 failed
+on `PriorityRequestQueue.remove`; narrowing the policy to Stage 0 removed the
+failure without widening shared vLLM queue semantics.
+
+The concurrency screen launched six deterministic text-only requests with
+`max_tokens=384` 250 ms before committing the duplex audio. Both runs used
+`max_num_seqs=2`. The duplex input and result were identical at the behavioral
+boundary: two Stage-0 output tokens, the `listen` decision, no client errors,
+and no generated audio. All six background requests completed with HTTP 200,
+and the candidate service remained healthy after the run.
+
+| Duplex contention metric | FCFS control | Stage-0 priority | Change |
+| --- | ---: | ---: | ---: |
+| Stage-0 TTFT | 18,526.24 ms | 7,182.85 ms | -61.23% |
+| Duplex model decision | `listen` | `listen` | unchanged |
+| Successful background requests | 6/6 | 6/6 | unchanged |
+| Service health after screen | healthy | healthy | unchanged |
+
+Lower TTFT is better. The optimization removes 11.34 seconds of interactive
+queue delay but cannot preempt the two requests already executing, so its
+remaining approximately seven-second delay is expected. The candidate's
+subsequent idle, steady-state duplex request completed with a 109.47 ms
+Stage-0 TTFT and the same `listen` decision.
+
+This is an admission-latency optimization: it does not change model kernels,
+sampling parameters, or the accepted Seed-TTS/Daily-Omni/Video-MME serving
+profile, so it neither claims nor changes their throughput and accuracy
+numbers. A stricter matched cold-start FCFS replay was attempted, but the
+control process remained blocked in the GlusterFS `lock_page` path after
+checkpoint loading and was stopped without recording benchmark data. The
+reported comparison therefore remains a real mixed-load screen, not a new
+official competition score.

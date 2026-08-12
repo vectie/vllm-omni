@@ -144,6 +144,17 @@ session setup and offline/background work may use spare capacity but must not
 increase established-session P99 or playback underrun. A practical scheduler
 must prevent starvation in both directions and expose queue time by class.
 
+The native-duplex profile now implements that admission split on Stage 0:
+established sessions use priority `-100`, ordinary requests remain at zero,
+and one background request older than 30 seconds is temporarily aged ahead for
+one admission. Stage 1 and Stage 2 intentionally remain FCFS because their
+chunk-transfer path needs queue removal operations not provided by vLLM's
+priority heap. On the measured six-request 910C contention screen, Stage-0
+duplex TTFT fell from 18.526 seconds to 7.183 seconds while the model decision,
+six successful background responses, and post-run service health were
+preserved. This qualifies mixed-load admission behavior only; the competition
+serving profile and its accuracy numbers are unchanged.
+
 ### 4. Same-host transfer
 
 The optional `tensor-v1` shared-memory format separates a small serialized
@@ -175,7 +186,9 @@ explicit: TransData plus Transpose consume 36.34% of device time, while host
 launches are dominated by Cat/Add/Addmm/Adds. FlashAttention is only 3.69% and
 Conv2D arithmetic is 3.44%. Optimize the 16-block streaming DiT as a unit:
 
-1. define fixed/padded buckets for `(chunk_width, attention_cache_width)`;
+1. keep live cache widths for stock SDPA; the measured 384/512 padded buckets
+   were 8.1% to 12.8% slower before copy, so revisit bucketing only inside a
+   materially larger fused CANN kernel;
 2. keep internal-format convolution eager, because native graph capture fails
    on that operator and forcing ND format is slower;
 3. capture attention, normalization, MLP, cache writes, and residual updates
@@ -403,10 +416,10 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Thinker c8 admission/decode graph coverage | Measured; full throughput +4.97%, mean/P99 TTFT -20.95%/-19.88%, retained opt-in because P99 E2E regressed 29.79% |
 | Thinker c6/c5 admission/decode graph coverage | Measured; rejected because full-run P99 E2E regressed 24.24%/12.02% despite mean-latency gains |
 | Thinker c4 + 16K prefill budget | Promoted; full Daily-Omni throughput +5.80%, mean E2E -5.51%, P99 TTFT/E2E -4.38%/-0.87%, identical 78.279% aggregate accuracy |
-| Foreground/background scheduler classes | Designed, not implemented |
+| Foreground/background scheduler classes | Shipped for native-duplex Stage-0 admission; six-request screen reduced Stage-0 TTFT 61.23%, with 30-second bounded background aging |
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |
 | Fixed-width DiT MLP graph partition around eager convolution | Implemented; full Seed-TTS, Daily-Omni, and Video-MME gates passed |
-| Broader cache-shape-bucketed DiT graph partitions | Next graph-coverage target |
+| Broader cache-shape-bucketed DiT graph partitions | Stock SDPA operator gate rejected: fixed 384/512 cache widths were 8.1-12.8% slower before copy; retry only as part of a larger fused CANN boundary |
 | Ascend-specific DiT layout/cache kernels | Profiler-triggered fallback if partitioning cannot remove launch overhead |
 | Deployment-distribution distillation/LoRA | Research fallback, not serving baseline |

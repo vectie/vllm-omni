@@ -11,6 +11,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_mlp_residual,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
+    _npu_virtual_concat_projection_enabled,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -191,6 +192,19 @@ def test_token2wav_step_count_defaults_to_checkpoint_quality() -> None:
 def test_token2wav_step_count_environment_override_wins(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS", "6")
     assert _resolve_token2wav_n_timesteps({"token2wav_n_timesteps": 8}) == 6
+
+
+def test_npu_virtual_concat_projection_switch(monkeypatch) -> None:
+    assert not _npu_virtual_concat_projection_enabled()
+    assert _npu_virtual_concat_projection_enabled(True)
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_VIRTUAL_CONCAT_PROJECTION", "1")
+    assert _npu_virtual_concat_projection_enabled(False)
+
+
+def test_invalid_npu_virtual_concat_projection_switch(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_VIRTUAL_CONCAT_PROJECTION", "maybe")
+    with pytest.raises(ValueError, match="VIRTUAL_CONCAT_PROJECTION"):
+        _npu_virtual_concat_projection_enabled()
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "not-an-int"])

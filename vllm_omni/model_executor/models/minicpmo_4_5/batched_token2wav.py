@@ -19,6 +19,7 @@ import torch.nn.functional as F
 _SILENCE_TOKEN = 4218
 _NPU_DIT_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH"
 _NPU_DIT_MLP_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH"
+_NPU_VIRTUAL_CONCAT_PROJECTION_ENV = "VLLM_OMNI_MINICPMO45_NPU_VIRTUAL_CONCAT_PROJECTION"
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +66,21 @@ def _npu_dit_mlp_graph_width(config_value: Any = None) -> int:
     if width <= 0:
         raise ValueError(f"{_NPU_DIT_MLP_GRAPH_WIDTH_ENV} must be positive, got {width}")
     return width
+
+
+def _npu_virtual_concat_projection_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_VIRTUAL_CONCAT_PROJECTION_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_VIRTUAL_CONCAT_PROJECTION_ENV}={raw!r}")
 
 
 def _ensure_torchair_broadcast_alias() -> None:
@@ -136,6 +152,7 @@ class BatchedToken2Wav(nn.Module):
         *,
         npu_dit_mlp_graph: Any = None,
         npu_dit_mlp_graph_width: Any = None,
+        npu_virtual_concat_projection: Any = None,
     ):
         super().__init__()
         self._token2wav = token2wav
@@ -188,6 +205,11 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_mlp_graph: Any | None = None
         self._npu_dit_mlp_graph_disabled = False
         self._npu_dit_mlp_graph_used = False
+        self._npu_virtual_concat_projection_enabled = _npu_virtual_concat_projection_enabled(
+            npu_virtual_concat_projection
+        )
+        self._npu_virtual_concat_projection_disabled = False
+        self._npu_virtual_concat_projection_used = False
         self._warmup_npu_dit_mlp_graph()
 
     def _warmup_npu_dit_mlp_graph(self) -> None:
@@ -409,17 +431,16 @@ class BatchedToken2Wav(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
-        estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
-        cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
+        cnn_out, att_out = self._estimator_buffers(estimator, x, att_cache)
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
         graph_width = self._npu_dit_mlp_graph_width
         use_mlp_graph = (
             self._npu_dit_mlp_graph_enabled
             and not self._npu_dit_mlp_graph_disabled
-            and estimator_input.device.type == "npu"
-            and int(estimator_input.shape[0]) == 2
-            and int(estimator_input.shape[2]) == graph_width
+            and x.device.type == "npu"
+            and int(x.shape[0]) == 2
+            and int(x.shape[2]) == graph_width
             and cnn_cache is not None
             and att_cache is not None
         )
@@ -427,9 +448,43 @@ class BatchedToken2Wav(nn.Module):
             try:
                 graph_fn = self._get_npu_dit_mlp_graph()
                 if graph_fn is not None:
+                    projected_hidden = None
+                    if (
+                        self._npu_virtual_concat_projection_enabled
+                        and not self._npu_virtual_concat_projection_disabled
+                    ):
+                        try:
+                            from vllm_omni.platforms.npu.models.minicpmo_4_5_virtual_concat import (
+                                virtual_concat_linear,
+                            )
+
+                            projected_hidden = virtual_concat_linear(
+                                x,
+                                mu,
+                                speaker_features,
+                                cond,
+                                estimator.in_proj.weight,
+                                estimator.in_proj.bias,
+                            )
+                            if not self._npu_virtual_concat_projection_used:
+                                logger.info(
+                                    "MiniCPM-o NPU virtual concat projection active for CFG batch=2, width=%d",
+                                    graph_width,
+                                )
+                                self._npu_virtual_concat_projection_used = True
+                        except Exception:
+                            self._npu_virtual_concat_projection_disabled = True
+                            logger.warning(
+                                "MiniCPM-o NPU virtual concat projection failed; using native concat",
+                                exc_info=True,
+                            )
+                    estimator_input = None
+                    if projected_hidden is None:
+                        estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
                     result = self._estimator_blocks_forward_chunk_mlp_graph(
                         estimator,
                         estimator_input,
+                        projected_hidden,
                         time_embedding,
                         old_cnn,
                         old_att,
@@ -448,6 +503,7 @@ class BatchedToken2Wav(nn.Module):
                 self._npu_dit_mlp_graph = None
                 self._npu_dit_mlp_graph_disabled = True
                 logger.warning("MiniCPM-o NPU DiT MLP graph execution failed; using eager blocks", exc_info=True)
+        estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         result = estimator.blocks_forward_chunk(
             estimator_input,
             time_embedding,
@@ -462,7 +518,8 @@ class BatchedToken2Wav(nn.Module):
     @staticmethod
     def _estimator_blocks_forward_chunk_mlp_graph(
         estimator: nn.Module,
-        estimator_input: torch.Tensor,
+        estimator_input: torch.Tensor | None,
+        projected_hidden: torch.Tensor | None,
         time_embedding: torch.Tensor,
         old_cnn: Any,
         old_att: Any,
@@ -471,7 +528,12 @@ class BatchedToken2Wav(nn.Module):
         graph_fn: Any,
     ) -> torch.Tensor:
         """Run attention/conv eagerly and replay the fixed-width MLP graph."""
-        hidden = estimator.in_proj(estimator_input.transpose(1, 2))
+        if projected_hidden is None:
+            if estimator_input is None:
+                raise RuntimeError("estimator input is required without a projected hidden state")
+            hidden = estimator.in_proj(estimator_input.transpose(1, 2))
+        else:
+            hidden = projected_hidden
         for block_idx, block in enumerate(estimator.blocks):
             if block.training or block.norm2.weight is not None or block.norm2.bias is not None:
                 raise RuntimeError("MiniCPM-o NPU DiT MLP graph requires eval-mode affine-free norm2")

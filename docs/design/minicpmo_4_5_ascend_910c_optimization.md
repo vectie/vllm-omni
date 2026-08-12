@@ -422,6 +422,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Thinker c6/c5 admission/decode graph coverage | Measured; rejected because full-run P99 E2E regressed 24.24%/12.02% despite mean-latency gains |
 | Thinker c4 + 16K prefill budget | Promoted; full Daily-Omni throughput +5.80%, mean E2E -5.51%, P99 TTFT/E2E -4.38%/-0.87%, identical 78.279% aggregate accuracy |
 | Foreground/background scheduler classes | Shipped for native-duplex Stage-0 admission; six-request screen reduced Stage-0 TTFT 61.23%, with 30-second bounded background aging |
+| Work-conserving Stage-0 foreground preemption | Shipped for native duplex; three-run contended TTFT median 143.28 ms, 98.01% below priority-only admission, with 18/18 background completions |
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |
 | Fixed-width DiT MLP graph partition around eager convolution | Implemented; full Seed-TTS, Daily-Omni, and Video-MME gates passed |

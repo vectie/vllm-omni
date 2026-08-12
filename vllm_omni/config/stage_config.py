@@ -445,6 +445,12 @@ class DuplexSessionRuntimeConfig:
     # it ahead of the foreground class for one admission turn. This bounds
     # starvation without adding a second scheduler or request state machine.
     background_aging_s: float | None = None
+    # When every Stage-0 request slot is occupied, allow an arriving foreground
+    # request to preempt one lower-priority running request at the next
+    # synchronous scheduler boundary. The victim follows vLLM's ordinary
+    # recompute-on-resume lifecycle; disabled by default because that trades
+    # background throughput for interactive tail latency.
+    foreground_preemption: bool = False
     # Cache the small set of repeatedly injected Stage-0 control-token
     # embeddings on-device. Enable only when embedding weights are immutable;
     # dynamic LoRA/adapters must leave this false.
@@ -467,6 +473,8 @@ class DuplexSessionRuntimeConfig:
             raise ValueError("duplex_session.foreground_priority must be negative or null")
         if self.background_aging_s is not None and self.background_aging_s <= 0:
             raise ValueError("duplex_session.background_aging_s must be positive or null")
+        if self.foreground_preemption and self.foreground_priority is None:
+            raise ValueError("duplex_session.foreground_preemption requires foreground_priority")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")

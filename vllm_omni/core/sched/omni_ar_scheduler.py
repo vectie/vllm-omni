@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections import defaultdict
 from collections.abc import Iterable
-from time import time
+from time import monotonic, time
 from typing import Any
 
 import numpy as np
@@ -13,7 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import create_request_queue
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
@@ -245,6 +245,80 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         request.priority = original_priority
         self._omni_aged_background = None
 
+    def _preempt_background_for_foreground(self) -> Request | None:
+        """Free one occupied slot for latency-critical duplex work.
+
+        Priority queues only affect admission order. If all request slots are
+        already occupied, a newly arrived foreground append otherwise waits
+        for a running background decode to finish. On the synchronous AR
+        scheduler, the start of ``schedule`` is a safe token boundary: the
+        prior runner output has been consumed and no work for this step has
+        been submitted yet. Reuse vLLM's own preemption primitive here so KV,
+        encoder-cache, metrics, and recompute-on-resume bookkeeping stay in
+        one implementation.
+        """
+        raw = os.environ.get("VLLM_OMNI_DUPLEX_FOREGROUND_PREEMPTION_PRIORITY")
+        if raw in (None, "") or not self.waiting or not self.running:
+            return None
+        if self.policy != SchedulingPolicy.PRIORITY:
+            return None
+        try:
+            foreground_priority = int(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid VLLM_OMNI_DUPLEX_FOREGROUND_PREEMPTION_PRIORITY=%r; disabling preemption",
+                raw,
+            )
+            return None
+
+        occupied = len(self.running) + int(getattr(self, "num_waiting_for_streaming_input", 0))
+        if occupied < self.max_num_running_reqs:
+            return None
+
+        aged = getattr(self, "_omni_aged_background", None)
+        aged_request = aged[0] if aged is not None else None
+        if aged_request is not None and any(request is aged_request for request in self.waiting):
+            # The starvation bound deliberately puts this one background
+            # request ahead of foreground admission. Do not evict another
+            # background request merely to fill the reclaimed slot with the
+            # already-aged request.
+            return None
+        foreground = [
+            request
+            for request in self.waiting
+            if request.priority <= foreground_priority and not request.is_finished()
+        ]
+        if not foreground:
+            return None
+        admitted = min(
+            foreground,
+            key=lambda request: (request.priority, request.arrival_time, request.request_id),
+        )
+
+        victims = [
+            request
+            for request in self.running
+            if request.priority > admitted.priority
+            and request.status == RequestStatus.RUNNING
+            and not request.is_finished()
+        ]
+        if not victims:
+            return None
+        victim = max(
+            victims,
+            key=lambda request: (request.priority, request.arrival_time, request.request_id),
+        )
+        self.running.remove(victim)
+        self._preempt_request(victim, monotonic())
+        logger.info(
+            "Preempted background request %s (priority=%d) for duplex foreground %s (priority=%d)",
+            victim.request_id,
+            victim.priority,
+            admitted.request_id,
+            admitted.priority,
+        )
+        return victim
+
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
         Check triggers and process side effects (marking transfer).
@@ -330,6 +404,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
         self._promote_aged_background_requests()
+        self._preempt_background_for_foreground()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests

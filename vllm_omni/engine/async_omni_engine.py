@@ -245,6 +245,15 @@ class AsyncOmniEngine:
             )
         else:
             os.environ.pop("VLLM_OMNI_DUPLEX_BACKGROUND_AGING_S", None)
+        if (
+            self.duplex_session_config.foreground_preemption
+            and self.duplex_session_config.foreground_priority is not None
+        ):
+            os.environ["VLLM_OMNI_DUPLEX_FOREGROUND_PREEMPTION_PRIORITY"] = str(
+                self.duplex_session_config.foreground_priority
+            )
+        else:
+            os.environ.pop("VLLM_OMNI_DUPLEX_FOREGROUND_PREEMPTION_PRIORITY", None)
         if self.duplex_session_config.cache_control_embeddings:
             os.environ["VLLM_OMNI_MINICPMO45_CACHE_CONTROL_EMBEDDINGS"] = "1"
         else:

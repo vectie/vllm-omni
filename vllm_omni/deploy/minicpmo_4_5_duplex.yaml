@@ -22,6 +22,10 @@ duplex_session:
   # than 30 seconds are aged ahead for one turn to prevent starvation.
   foreground_priority: -100
   background_aging_s: 30.0
+  # Priority alone cannot displace requests already occupying both Stage-0
+  # slots. Reclaim one lower-priority slot at the next token boundary so a
+  # committed duplex append does not inherit an offline decode's full tail.
+  foreground_preemption: true
   # This profile does not load dynamic LoRA/adapters, so repeated Stage-0
   # delimiter embeddings are safe to keep accelerator-resident.
   cache_control_embeddings: true

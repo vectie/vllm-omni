@@ -594,6 +594,26 @@ run. The following candidates were rejected and fully reverted:
 | Fused CFG/Euler expression | +1.16% | +1.38% | -0.15% | +1.38% | Small TTFP win, audio/E2E regression |
 | In-place CFG/Euler update | +0.57% | +0.76% | -0.32% | +0.76% | Small TTFP win, audio/E2E regression |
 
+The first post-profile kernel experiment was also rejected before service
+integration. It fused the affine-free LayerNorm plus AdaLN shift/scale into
+one Ascend Triton kernel and fused the final AdaLN gate plus residual into a
+second kernel for the exact steady Code2Wav shape: BF16 `[2, 50, 512]` with
+`[2, 1, 512]` conditioning. After 100 warmups, a 1,000-iteration synchronized
+screen on the free logical 910C device measured:
+
+| Exact-shape expression | Native eager | Triton prototype | Change |
+| --- | ---: | ---: | ---: |
+| LayerNorm + shift/scale | 47.74 us | 82.80 us | +73.43% |
+| Gate + residual | 20.81 us | 85.80 us | +312.31% |
+
+Lower is better. The LayerNorm path also differed from the native BF16 result
+by 0.0625 maximum absolute and 0.00230 mean absolute because the fused kernel's
+reduction order did not reproduce the stock operator. The prototype was
+removed. This rules out small pointwise Triton replacements on this workload;
+the next kernel attempt must cover a substantially larger, layout-aware DiT
+boundary and eliminate enough `TransData`, transpose, and host launches to
+amortize custom-kernel dispatch.
+
 Full-loop NPU graph replay remains rejected. Native `NPUGraph` cannot capture
 the estimator's internal-format Conv2D. Disabling internal formats allowed a
 TorchAir graph to capture, but its first compilation took 108.5 seconds and
@@ -1349,6 +1369,50 @@ control process remained blocked in the GlusterFS `lock_page` path after
 checkpoint loading and was stopped without recording benchmark data. The
 reported comparison therefore remains a real mixed-load screen, not a new
 official competition score.
+
+## Accepted Stage-0 duplex foreground preemption
+
+Priority admission still left the interactive request behind both background
+requests already occupying `max_num_seqs=2`. The duplex profile now opts into
+a token-boundary preemption hook: when all Stage-0 slots are occupied and a
+request at the configured foreground priority is waiting, the scheduler
+selects one lower-priority running victim and delegates to vLLM's existing
+preemption lifecycle. vLLM frees the victim's KV blocks and resumes it by
+recomputation; the policy does not introduce a second KV state machine.
+
+The first restart reproduced the host's GlusterFS `lock_page` stall. The exact
+19 GiB model directory was therefore copied to the host's local overlay; the
+model index and Code2Wav flow configuration checksums matched the source. All
+three stages then initialized in 166.62 seconds, and the following service
+screen used that local checkpoint without changing model files or request
+semantics.
+
+Three repetitions each launched six deterministic 384-token text requests,
+then committed the same 4.16-second mono PCM16 16 kHz duplex input. Every
+duplex request made the same two-token `listen` decision with no error or
+generated audio. All 18 background requests completed with HTTP 200, the
+scheduler log recorded exactly one lower-priority victim per repetition, and
+the service remained healthy.
+
+| Run | Stage-0 duplex TTFT | Slowest background request |
+| --- | ---: | ---: |
+| Preemption 1 | 1,202.33 ms | 22.09 s |
+| Preemption 2 | 135.88 ms | 20.96 s |
+| Preemption 3 | 143.28 ms | 20.96 s |
+| Three-run median | 143.28 ms | 20.96 s |
+
+Lower is better. The 143.28 ms median is 98.01% lower than the prior
+priority-only 7,182.85 ms screen and 99.23% lower than the original FCFS
+18,526.24 ms screen. Even the first resident-session materialization run was
+83.26% lower than priority-only admission. The background guard remains
+bounded: the slowest request stayed near the three-wave, two-slot completion
+envelope rather than starving, and bounded aging is still enabled.
+
+The full focused scheduler and duplex-deployment suite passes 114/114 in the
+910C environment. Because this changes only Stage-0 mixed-load admission and
+uses the existing recompute path, it does not change ordinary competition
+requests, model kernels, sampling, or the previously accepted Daily-Omni,
+Seed-TTS, and Video-MME accuracy results.
 
 ## Accepted native-duplex control-token embedding cache
 

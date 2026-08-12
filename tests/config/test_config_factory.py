@@ -1159,6 +1159,11 @@ class TestDeployConfigLoading:
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.yaml_engine_args["async_scheduling"] for stage in stages] == [False, False, False]
+        assert [stage.yaml_engine_args.get("scheduling_policy", "fcfs") for stage in stages] == [
+            "priority",
+            "fcfs",
+            "fcfs",
+        ]
         assert all("Async" not in (stage.scheduler_cls or "") for stage in stages)
         assert [stage.devices for stage in deploy.stages] == ["0", "0", "0"]
         assert deploy.stages[1].enforce_eager is False

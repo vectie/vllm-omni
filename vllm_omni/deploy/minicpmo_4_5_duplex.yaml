@@ -33,8 +33,6 @@ stages:
   - stage_id: 1
     max_num_seqs: 2
     async_scheduling: false
-    engine_extras:
-      scheduling_policy: priority
     # The split Talker exposes a binary continue/stop vocabulary; native
     # segment and turn boundaries travel as explicit output metadata.
     default_sampling_params:
@@ -45,5 +43,3 @@ stages:
   - stage_id: 2
     max_num_seqs: 2
     async_scheduling: false
-    engine_extras:
-      scheduling_policy: priority

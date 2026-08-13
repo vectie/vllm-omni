@@ -2301,6 +2301,38 @@ class TestPlatformOverrides:
         assert connector["extra"]["token2wav_n_timesteps"] == 6
         assert connector["extra"]["npu_dit_mlp_graph"] is True
 
+    def test_minicpmo_4_5_910c_dit_preamble_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_preamble_graph_competition.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.stages[0].max_num_seqs == 4
+        assert deploy.stages[0].max_num_batched_tokens == 16384
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_dit_mlp_graph"] is True
+        assert extra["npu_dit_mlp_graph_width"] == 50
+        assert extra["npu_dit_preamble_graph"] is True
+
+    def test_minicpmo_4_5_910c_dit_megagraph_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_megagraph_competition.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_dit_mlp_graph"] is True
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_dit_conv_mlp_graph"] is True
+
     def test_minicpmo_4_5_910c_prefix_cache_is_thinker_only(self):
         deploy_path = Path(
             get_deploy_config_path("minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_prefix_cache.yaml")

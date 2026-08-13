@@ -19,6 +19,8 @@ import torch.nn.functional as F
 _SILENCE_TOKEN = 4218
 _NPU_DIT_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH"
 _NPU_DIT_MLP_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH"
+_NPU_DIT_PREAMBLE_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH"
+_NPU_DIT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH"
 logger = logging.getLogger(__name__)
 
 
@@ -53,6 +55,36 @@ def _npu_dit_mlp_graph_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_DIT_MLP_GRAPH_ENV}={raw!r}")
+
+
+def _npu_dit_preamble_graph_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_PREAMBLE_GRAPH_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_PREAMBLE_GRAPH_ENV}={raw!r}")
+
+
+def _npu_dit_conv_mlp_graph_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_CONV_MLP_GRAPH_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_CONV_MLP_GRAPH_ENV}={raw!r}")
 
 
 def _npu_dit_mlp_graph_width(config_value: Any = None) -> int:
@@ -103,6 +135,91 @@ def _dit_mlp_residual(
     return x + gate * hidden
 
 
+def _dit_attention_preamble(
+    x: torch.Tensor,
+    time_embedding: torch.Tensor,
+    adaln_weight: torch.Tensor,
+    adaln_bias: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_norm_bias: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse the fixed MiniCPM-o DiT block front into one NPU graph.
+
+    The production profile guards the model-specific 512-wide, 8x64-head
+    layout before entering this function. Returning the complete modulation
+    tensor lets the eager convolution and the separately compiled MLP consume
+    the same values without repeating the AdaLN projection.
+    """
+    modulation = F.linear(F.silu(time_embedding), adaln_weight, adaln_bias)
+    shift_msa = modulation[:, :, :512]
+    scale_msa = modulation[:, :, 512:1024]
+    hidden = F.layer_norm(x, (512,), eps=1e-6)
+    hidden = hidden * (1 + scale_msa) + shift_msa
+    q = F.linear(hidden, q_weight, q_bias).reshape(2, 50, 8, 64).transpose(1, 2)
+    k = F.linear(hidden, k_weight, k_bias).reshape(2, 50, 8, 64).transpose(1, 2)
+    v = F.linear(hidden, v_weight, v_bias).reshape(2, 50, 8, 64).transpose(1, 2)
+    q = F.layer_norm(q, (64,), q_norm_weight, q_norm_bias, 1e-5)
+    k = F.layer_norm(k, (64,), k_norm_weight, k_norm_bias, 1e-5)
+    return modulation, q, k, v
+
+
+def _dit_conv_mlp_residual(
+    hidden: torch.Tensor,
+    conv_input: torch.Tensor,
+    cnn_cache: torch.Tensor,
+    gate_conv: torch.Tensor,
+    shift_mlp: torch.Tensor,
+    scale_mlp: torch.Tensor,
+    gate_mlp: torch.Tensor,
+    conv1_weight: torch.Tensor,
+    conv1_bias: torch.Tensor,
+    conv_norm_weight: torch.Tensor,
+    conv_norm_bias: torch.Tensor,
+    conv2_weight: torch.Tensor,
+    conv2_bias: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc1_bias: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    fc2_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fixed 910C DiT Conv/cache + gated MLP megagraph partition."""
+    cache1, cache2 = cnn_cache.split((512, 512), dim=1)
+    first_input = torch.cat((cache1, conv_input.transpose(1, 2)), dim=2)
+    new_cache1 = first_input[:, :, -2:]
+    convolution = F.conv1d(first_input, conv1_weight, conv1_bias).transpose(1, 2)
+    convolution = F.layer_norm(
+        convolution,
+        (512,),
+        conv_norm_weight,
+        conv_norm_bias,
+        1e-5,
+    )
+    convolution = F.mish(convolution)
+    second_input = torch.cat((cache2, convolution.transpose(1, 2)), dim=2)
+    new_cache2 = second_input[:, :, -2:]
+    convolution = F.conv1d(second_input, conv2_weight, conv2_bias).transpose(1, 2)
+    hidden = hidden + gate_conv * convolution
+    hidden = _dit_mlp_residual(
+        hidden,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+        fc1_weight,
+        fc1_bias,
+        fc2_weight,
+        fc2_bias,
+    )
+    return hidden, torch.cat((new_cache1, new_cache2), dim=1)
+
+
 def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
     flow = tuple((name, tensor_signature(state.flow_cache[name])) for name in sorted(state.flow_cache))
     hift = tuple((name, tensor_signature(state.hift_cache[name])) for name in sorted(state.hift_cache))
@@ -137,6 +254,8 @@ class BatchedToken2Wav(nn.Module):
         *,
         npu_dit_mlp_graph: Any = None,
         npu_dit_mlp_graph_width: Any = None,
+        npu_dit_preamble_graph: Any = None,
+        npu_dit_conv_mlp_graph: Any = None,
     ):
         super().__init__()
         self._token2wav = token2wav
@@ -189,7 +308,17 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_mlp_graph: Any | None = None
         self._npu_dit_mlp_graph_disabled = False
         self._npu_dit_mlp_graph_used = False
+        self._npu_dit_preamble_graph_enabled = _npu_dit_preamble_graph_enabled(npu_dit_preamble_graph)
+        self._npu_dit_preamble_graph: Any | None = None
+        self._npu_dit_preamble_graph_disabled = False
+        self._npu_dit_preamble_graph_used = False
+        self._npu_dit_conv_mlp_graph_enabled = _npu_dit_conv_mlp_graph_enabled(npu_dit_conv_mlp_graph)
+        self._npu_dit_conv_mlp_graph: Any | None = None
+        self._npu_dit_conv_mlp_graph_disabled = False
+        self._npu_dit_conv_mlp_graph_used = False
         self._warmup_npu_dit_mlp_graph()
+        self._warmup_npu_dit_preamble_graph()
+        self._warmup_npu_dit_conv_mlp_graph()
 
     def _warmup_npu_dit_mlp_graph(self) -> None:
         """Compile the fixed-width post-convolution partition during startup."""
@@ -255,6 +384,176 @@ class BatchedToken2Wav(nn.Module):
                 dynamic=False,
             )
         return self._npu_dit_mlp_graph
+
+    @staticmethod
+    def _dit_preamble_compatible(block: nn.Module, width: int) -> bool:
+        return (
+            width == 50
+            and not block.training
+            and int(block.attn.num_heads) == 8
+            and int(block.attn.head_dim) == 64
+            and int(block.attn.to_q.in_features) == 512
+            and int(block.adaLN_modulation[1].out_features) == 9 * 512
+            and block.norm1.weight is None
+            and block.norm1.bias is None
+            and float(block.norm1.eps) == 1e-6
+            and float(block.attn.q_norm.eps) == 1e-5
+            and float(block.attn.k_norm.eps) == 1e-5
+        )
+
+    def _warmup_npu_dit_preamble_graph(self) -> None:
+        if not self._npu_dit_preamble_graph_enabled:
+            return
+        estimator = getattr(getattr(self.flow, "decoder", None), "estimator", None)
+        blocks = getattr(estimator, "blocks", None)
+        block = blocks[0] if blocks else None
+        weight = getattr(getattr(getattr(block, "attn", None), "to_q", None), "weight", None)
+        if (
+            block is None
+            or not isinstance(weight, torch.Tensor)
+            or weight.device.type != "npu"
+            or not self._dit_preamble_compatible(block, self._npu_dit_mlp_graph_width)
+        ):
+            self._npu_dit_preamble_graph_disabled = True
+            logger.warning(
+                "MiniCPM-o NPU DiT preamble graph disabled: estimator does not match the fixed 2x50x512, 8x64 layout"
+            )
+            return
+        x = weight.new_zeros((2, 50, 512))
+        time_embedding = weight.new_zeros((2, 1, 512))
+        try:
+            graph_fn = self._get_npu_dit_preamble_graph()
+            if graph_fn is None:
+                return
+            with torch.inference_mode():
+                graph_fn(
+                    x,
+                    time_embedding,
+                    block.adaLN_modulation[1].weight,
+                    block.adaLN_modulation[1].bias,
+                    block.attn.to_q.weight,
+                    block.attn.to_q.bias,
+                    block.attn.to_k.weight,
+                    block.attn.to_k.bias,
+                    block.attn.to_v.weight,
+                    block.attn.to_v.bias,
+                    block.attn.q_norm.weight,
+                    block.attn.q_norm.bias,
+                    block.attn.k_norm.weight,
+                    block.attn.k_norm.bias,
+                )
+            torch.npu.synchronize()
+            logger.info("Compiled MiniCPM-o NPU DiT attention preamble graph for 2x50x512, 8x64 heads")
+        except Exception:
+            self._npu_dit_preamble_graph = None
+            self._npu_dit_preamble_graph_disabled = True
+            logger.warning("MiniCPM-o NPU DiT preamble graph compilation failed; using eager attention", exc_info=True)
+
+    def _get_npu_dit_preamble_graph(self):
+        if self._npu_dit_preamble_graph_disabled:
+            return None
+        if self._npu_dit_preamble_graph is None:
+            from torch_npu.dynamo import torchair
+
+            _ensure_torchair_broadcast_alias()
+            compiler_config = torchair.CompilerConfig()
+            self._npu_dit_preamble_graph = torch.compile(
+                _dit_attention_preamble,
+                backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self._npu_dit_preamble_graph
+
+    @staticmethod
+    def _dit_conv_mlp_compatible(block: nn.Module, width: int) -> bool:
+        conv1 = block.conv.block[1]
+        conv2 = block.conv.block[6]
+        return (
+            width == 50
+            and not block.training
+            and int(conv1.in_channels) == 512
+            and int(conv1.out_channels) == 512
+            and tuple(conv1.kernel_size) == (3,)
+            and int(conv2.in_channels) == 512
+            and int(conv2.out_channels) == 512
+            and tuple(conv2.kernel_size) == (3,)
+            and block.norm2.weight is None
+            and block.norm2.bias is None
+            and float(block.norm2.eps) == 1e-6
+            and int(block.mlp.fc1.in_features) == 512
+            and int(block.mlp.fc1.out_features) == 2048
+            and int(block.mlp.fc2.out_features) == 512
+        )
+
+    def _warmup_npu_dit_conv_mlp_graph(self) -> None:
+        if not self._npu_dit_conv_mlp_graph_enabled:
+            return
+        estimator = getattr(getattr(self.flow, "decoder", None), "estimator", None)
+        blocks = getattr(estimator, "blocks", None)
+        block = blocks[0] if blocks else None
+        weight = getattr(getattr(getattr(block, "mlp", None), "fc1", None), "weight", None)
+        if (
+            block is None
+            or not isinstance(weight, torch.Tensor)
+            or weight.device.type != "npu"
+            or not self._dit_conv_mlp_compatible(block, self._npu_dit_mlp_graph_width)
+        ):
+            self._npu_dit_conv_mlp_graph_disabled = True
+            logger.warning("MiniCPM-o NPU DiT Conv+MLP graph disabled: block layout is incompatible")
+            return
+        hidden = weight.new_zeros((2, 50, 512))
+        modulation = weight.new_zeros((2, 1, 512))
+        cnn_cache = weight.new_zeros((2, 1024, 2))
+        conv1 = block.conv.block[1]
+        conv_norm = block.conv.block[3]
+        conv2 = block.conv.block[6]
+        try:
+            graph_fn = self._get_npu_dit_conv_mlp_graph()
+            if graph_fn is None:
+                return
+            with torch.inference_mode():
+                graph_fn(
+                    hidden,
+                    hidden,
+                    cnn_cache,
+                    modulation,
+                    modulation,
+                    modulation,
+                    modulation,
+                    conv1.weight,
+                    conv1.bias,
+                    conv_norm.weight,
+                    conv_norm.bias,
+                    conv2.weight,
+                    conv2.bias,
+                    block.mlp.fc1.weight,
+                    block.mlp.fc1.bias,
+                    block.mlp.fc2.weight,
+                    block.mlp.fc2.bias,
+                )
+            torch.npu.synchronize()
+            logger.info("Compiled MiniCPM-o NPU DiT Conv+MLP megagraph for 2x50x512")
+        except Exception:
+            self._npu_dit_conv_mlp_graph = None
+            self._npu_dit_conv_mlp_graph_disabled = True
+            logger.warning("MiniCPM-o NPU DiT Conv+MLP graph compilation failed; using split path", exc_info=True)
+
+    def _get_npu_dit_conv_mlp_graph(self):
+        if self._npu_dit_conv_mlp_graph_disabled:
+            return None
+        if self._npu_dit_conv_mlp_graph is None:
+            from torch_npu.dynamo import torchair
+
+            _ensure_torchair_broadcast_alias()
+            compiler_config = torchair.CompilerConfig()
+            self._npu_dit_conv_mlp_graph = torch.compile(
+                _dit_conv_mlp_residual,
+                backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self._npu_dit_conv_mlp_graph
 
     def _timeline_for(self, value: torch.Tensor) -> torch.Tensor:
         key = (value.device.type, value.device.index, value.dtype)
@@ -436,6 +735,12 @@ class BatchedToken2Wav(nn.Module):
             try:
                 graph_fn = self._get_npu_dit_mlp_graph()
                 if graph_fn is not None:
+                    preamble_graph_fn = None
+                    if self._npu_dit_preamble_graph_enabled and not self._npu_dit_preamble_graph_disabled:
+                        preamble_graph_fn = self._get_npu_dit_preamble_graph()
+                    conv_mlp_graph_fn = None
+                    if self._npu_dit_conv_mlp_graph_enabled and not self._npu_dit_conv_mlp_graph_disabled:
+                        conv_mlp_graph_fn = self._get_npu_dit_conv_mlp_graph()
                     result = self._estimator_blocks_forward_chunk_mlp_graph(
                         estimator,
                         estimator_input,
@@ -445,6 +750,8 @@ class BatchedToken2Wav(nn.Module):
                         cnn_out,
                         att_out,
                         graph_fn,
+                        preamble_graph_fn,
+                        conv_mlp_graph_fn,
                     )
                     if not self._npu_dit_mlp_graph_used:
                         logger.info(
@@ -452,6 +759,12 @@ class BatchedToken2Wav(nn.Module):
                             graph_width,
                         )
                         self._npu_dit_mlp_graph_used = True
+                    if preamble_graph_fn is not None and not self._npu_dit_preamble_graph_used:
+                        logger.info("MiniCPM-o NPU DiT attention preamble graph replay active")
+                        self._npu_dit_preamble_graph_used = True
+                    if conv_mlp_graph_fn is not None and not self._npu_dit_conv_mlp_graph_used:
+                        logger.info("MiniCPM-o NPU DiT Conv+MLP megagraph replay active")
+                        self._npu_dit_conv_mlp_graph_used = True
                     return result, cnn_out, att_out
             except Exception:
                 self._npu_dit_mlp_graph = None
@@ -478,14 +791,38 @@ class BatchedToken2Wav(nn.Module):
         cnn_out: torch.Tensor,
         att_out: torch.Tensor,
         graph_fn: Any,
+        preamble_graph_fn: Any | None = None,
+        conv_mlp_graph_fn: Any | None = None,
     ) -> torch.Tensor:
-        """Run attention/conv eagerly and replay the fixed-width MLP graph."""
+        """Replay enabled fixed-width partitions with exact eager fallbacks."""
         hidden = estimator.in_proj(estimator_input.transpose(1, 2))
         for block_idx, block in enumerate(estimator.blocks):
             if block.training or block.norm2.weight is not None or block.norm2.bias is not None:
                 raise RuntimeError("MiniCPM-o NPU DiT MLP graph requires eval-mode affine-free norm2")
             if float(block.norm2.eps) != 1e-6:
                 raise RuntimeError(f"MiniCPM-o NPU DiT MLP graph requires norm2 eps=1e-6, got {block.norm2.eps}")
+            if preamble_graph_fn is None:
+                modulation = block.adaLN_modulation(time_embedding)
+                q = k = v = None
+            else:
+                if not BatchedToken2Wav._dit_preamble_compatible(block, int(hidden.shape[1])):
+                    raise RuntimeError("MiniCPM-o NPU DiT preamble graph encountered an incompatible block")
+                modulation, q, k, v = preamble_graph_fn(
+                    hidden,
+                    time_embedding,
+                    block.adaLN_modulation[1].weight,
+                    block.adaLN_modulation[1].bias,
+                    block.attn.to_q.weight,
+                    block.attn.to_q.bias,
+                    block.attn.to_k.weight,
+                    block.attn.to_k.bias,
+                    block.attn.to_v.weight,
+                    block.attn.to_v.bias,
+                    block.attn.q_norm.weight,
+                    block.attn.q_norm.bias,
+                    block.attn.k_norm.weight,
+                    block.attn.k_norm.bias,
+                )
             (
                 shift_msa,
                 scale_msa,
@@ -496,35 +833,87 @@ class BatchedToken2Wav(nn.Module):
                 shift_conv,
                 scale_conv,
                 gate_conv,
-            ) = block.adaLN_modulation(time_embedding).chunk(9, dim=-1)
+            ) = modulation.chunk(9, dim=-1)
 
-            attention, new_att = block.attn.forward_chunk(
-                block.norm1(hidden) * (1 + scale_msa) + shift_msa,
-                old_att[block_idx],
-                None,
-            )
+            if q is None or k is None or v is None:
+                attention, new_att = block.attn.forward_chunk(
+                    block.norm1(hidden) * (1 + scale_msa) + shift_msa,
+                    old_att[block_idx],
+                    None,
+                )
+            else:
+                attention, new_att = BatchedToken2Wav._attention_from_projected_qkv(
+                    block.attn, q, k, v, old_att[block_idx]
+                )
             hidden = hidden + gate_msa * attention
 
-            convolution, new_cnn = block.conv.forward_chunk(
-                block.norm3(hidden) * (1 + scale_conv) + shift_conv,
-                old_cnn[block_idx],
-            )
-            hidden = hidden + gate_conv * convolution
-            hidden = graph_fn(
-                hidden,
-                shift_mlp,
-                scale_mlp,
-                gate_mlp,
-                block.mlp.fc1.weight,
-                block.mlp.fc1.bias,
-                block.mlp.fc2.weight,
-                block.mlp.fc2.bias,
-            )
+            conv_input = block.norm3(hidden) * (1 + scale_conv) + shift_conv
+            if conv_mlp_graph_fn is None:
+                convolution, new_cnn = block.conv.forward_chunk(
+                    conv_input,
+                    old_cnn[block_idx],
+                )
+                hidden = hidden + gate_conv * convolution
+                hidden = graph_fn(
+                    hidden,
+                    shift_mlp,
+                    scale_mlp,
+                    gate_mlp,
+                    block.mlp.fc1.weight,
+                    block.mlp.fc1.bias,
+                    block.mlp.fc2.weight,
+                    block.mlp.fc2.bias,
+                )
+            else:
+                if not BatchedToken2Wav._dit_conv_mlp_compatible(block, int(hidden.shape[1])):
+                    raise RuntimeError("MiniCPM-o NPU DiT Conv+MLP graph encountered an incompatible block")
+                conv1 = block.conv.block[1]
+                conv_norm = block.conv.block[3]
+                conv2 = block.conv.block[6]
+                hidden, new_cnn = conv_mlp_graph_fn(
+                    hidden,
+                    conv_input,
+                    old_cnn[block_idx],
+                    gate_conv,
+                    shift_mlp,
+                    scale_mlp,
+                    gate_mlp,
+                    conv1.weight,
+                    conv1.bias,
+                    conv_norm.weight,
+                    conv_norm.bias,
+                    conv2.weight,
+                    conv2.bias,
+                    block.mlp.fc1.weight,
+                    block.mlp.fc1.bias,
+                    block.mlp.fc2.weight,
+                    block.mlp.fc2.bias,
+                )
             cnn_out[block_idx].copy_(new_cnn)
             att_out[block_idx, :, :, : new_att.shape[2], :].copy_(new_att)
 
         hidden = estimator.final_layer(hidden, time_embedding)
         return hidden.transpose(1, 2)
+
+    @staticmethod
+    def _attention_from_projected_qkv(
+        attention_module: nn.Module,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        att_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if att_cache is not None:
+            k_cache, v_cache = att_cache.chunk(2, dim=3)
+            k = torch.cat((k, k_cache), dim=2)
+            v = torch.cat((v, v_cache), dim=2)
+        new_att_cache = torch.cat((k, v), dim=3)
+        hidden = F.scaled_dot_product_attention(q, k, v)
+        batch_size, _, width, _ = hidden.shape
+        hidden = hidden.transpose(1, 2).reshape(batch_size, width, -1)
+        hidden = attention_module.proj(hidden)
+        hidden = attention_module.proj_drop(hidden)
+        return hidden, new_att_cache
 
     def _estimator_time_embeddings(
         self,

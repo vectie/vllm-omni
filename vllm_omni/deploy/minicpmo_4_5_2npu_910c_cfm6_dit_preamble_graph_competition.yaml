@@ -1,0 +1,27 @@
+# Atlas 800I A3 / Ascend 910C competition profile with the wider DiT graph.
+#
+# This is deliberately a separate candidate profile until the fresh-process
+# service A/B and the competition accuracy gates qualify it. It inherits the
+# accepted CFM6 + DiT MLP graph + Thinker c4/16K profile, then additionally
+# fuses the fixed DiT AdaLN/attention-QKV preamble on Code2Wav's NPU.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml
+
+# Top-level connector blocks replace the inherited block. Keep every accepted
+# 910C setting explicit so the only new variable is the preamble graph.
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      raw_tensor_shm: false
+      shm_event_notifications: true
+      shm_notification_namespace: minicpmo45-910c
+      token2wav_n_timesteps: 6
+      npu_dit_mlp_graph: true
+      npu_dit_mlp_graph_width: 50
+      npu_dit_preamble_graph: true

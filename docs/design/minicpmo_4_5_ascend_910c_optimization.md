@@ -372,6 +372,40 @@ control it improved throughput 5.80%, mean E2E 5.51%, P99 TTFT 4.38%, and P99
 E2E 0.87%. The 8K control remains available as the explicit
 `competition_prefill8k.yaml` replay profile.
 
+The model-specific DiT megagraph candidate expands that fixed-width boundary:
+
+```bash
+VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND=auto \
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_megagraph_competition.yaml \
+  --trust-remote-code --interleave-mm-strings \
+  --host 0.0.0.0 --port 8099
+```
+
+This is a compiler-fused TorchAir megagraph, not a hand-written monolithic
+AscendC kernel. At the invariant CFG shape `[2, 50, 512]`, one graph covers
+AdaLN, Q/K/V projection, and Q/K normalization before eager SDPA; a second
+graph spans both causal Conv1D operations, both cache updates, the gated
+residual, normalization, and the complete MLP residual. Strict architecture
+guards and eager fallbacks remain in place.
+
+The native CANN `super_kernel_optimize` experiment was rejected: it preserved
+bits but took 337.6 us versus 148.6 us for the existing MLP graph. Packed QKV
+was exact but tied/slower, and extending the graph past attention introduced
+0.03125 maximum drift without stable speed. The selected attention preamble
+was exact and 30.6% faster in isolation. The combined Conv+MLP boundary was
+14-17% faster than two graph partitions in isolation, with 0.00048828125
+maximum BF16 output drift and exact cache output.
+
+On `DevEnv_132987`, the resident 32-row Seed-TTS A/B completed 32/32 with the
+same 2,649 generated tokens, 298.92 seconds of audio, and 100% continuity. The
+megagraph reduced serving duration 3.13%, mean whole-audio RTF 4.41%, mean
+per-chunk RTF 2.85%, and mean audio TTFP 1.88%. Median TTFT moved from 392.69
+to 394.76 ms (+0.53%). A paired eight-row hard-set screen produced identical
+text and audio structure, exactly matched mean WER at 0.565030, and moved
+proxy SIM from 0.803156 to 0.803233. Keep this profile opt-in until full
+Seed-TTS, Daily-Omni, and Video-MME gates are rerun.
+
 Opt-in experiments, one at a time:
 
 ```bash
@@ -427,6 +461,8 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |
 | Fixed-width DiT MLP graph partition around eager convolution | Implemented; full Seed-TTS, Daily-Omni, and Video-MME gates passed |
+| Fixed-width DiT attention-preamble graph | Implemented, opt-in; exact isolated output, 30.6% isolated latency reduction |
+| Fixed-width DiT Conv+MLP megagraph | Implemented, opt-in; isolated partition -14-17%, real mean audio RTF -4.41%, paired EN8 WER unchanged and SIM +0.000077; full competition qualification pending |
 | HiFT inference weight-norm materialization | Implemented, opt-in; DevEnv_132987 three-run median mean chunk RTF -2.02%, mean whole-audio RTF -1.97%, E2E -1.91%, matched EN8 WER 0.0000 and proxy SIM +0.00032; full competition qualification still required before default-on promotion |
 | Broader cache-shape-bucketed DiT graph partitions | Stock SDPA operator gate rejected: fixed 384/512 cache widths were 8.1-12.8% slower before copy; retry only as part of a larger fused CANN boundary |
 | Ascend-specific DiT layout/cache kernels | Profiler-triggered fallback if partitioning cannot remove launch overhead |

@@ -8,9 +8,13 @@ import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    _dit_attention_preamble,
+    _dit_conv_mlp_residual,
     _dit_mlp_residual,
+    _npu_dit_conv_mlp_graph_enabled,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
+    _npu_dit_preamble_graph_enabled,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -376,6 +380,122 @@ def test_dit_mlp_residual_matches_eager_block_math():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_dit_attention_preamble_matches_eager_block_math():
+    torch.manual_seed(11)
+    x = torch.randn(2, 50, 512)
+    time_embedding = torch.randn(2, 1, 512)
+    adaln = nn.Linear(512, 9 * 512)
+    to_q = nn.Linear(512, 512)
+    to_k = nn.Linear(512, 512)
+    to_v = nn.Linear(512, 512)
+    q_norm = nn.LayerNorm(64)
+    k_norm = nn.LayerNorm(64)
+
+    modulation = adaln(F.silu(time_embedding))
+    shift_msa, scale_msa = modulation.chunk(9, dim=-1)[:2]
+    hidden = F.layer_norm(x, (512,), eps=1e-6) * (1 + scale_msa) + shift_msa
+    q = q_norm(to_q(hidden).reshape(2, 50, 8, 64).transpose(1, 2))
+    k = k_norm(to_k(hidden).reshape(2, 50, 8, 64).transpose(1, 2))
+    v = to_v(hidden).reshape(2, 50, 8, 64).transpose(1, 2)
+
+    actual = _dit_attention_preamble(
+        x,
+        time_embedding,
+        adaln.weight,
+        adaln.bias,
+        to_q.weight,
+        to_q.bias,
+        to_k.weight,
+        to_k.bias,
+        to_v.weight,
+        to_v.bias,
+        q_norm.weight,
+        q_norm.bias,
+        k_norm.weight,
+        k_norm.bias,
+    )
+
+    for result, expected in zip(actual, (modulation, q, k, v), strict=True):
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_attention_from_projected_qkv_matches_cached_sdpa_math():
+    torch.manual_seed(12)
+    attention = SimpleNamespace(proj=nn.Linear(512, 512), proj_drop=nn.Identity())
+    q = torch.randn(2, 8, 50, 64)
+    k = torch.randn(2, 8, 50, 64)
+    v = torch.randn(2, 8, 50, 64)
+    cache = torch.randn(2, 8, 7, 128)
+    cached_k, cached_v = cache.chunk(2, dim=3)
+    full_k = torch.cat((k, cached_k), dim=2)
+    full_v = torch.cat((v, cached_v), dim=2)
+    expected = F.scaled_dot_product_attention(q, full_k, full_v)
+    expected = attention.proj(expected.transpose(1, 2).reshape(2, 50, 512))
+
+    actual, new_cache = BatchedToken2Wav._attention_from_projected_qkv(attention, q, k, v, cache)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(new_cache, torch.cat((full_k, full_v), dim=3), rtol=0, atol=0)
+
+
+def test_dit_conv_mlp_residual_matches_partition_math():
+    torch.manual_seed(13)
+    hidden = torch.randn(2, 50, 512)
+    conv_input = torch.randn(2, 50, 512)
+    cache = torch.randn(2, 1024, 2)
+    gate_conv = torch.randn(2, 1, 512)
+    shift_mlp = torch.randn(2, 1, 512)
+    scale_mlp = torch.randn(2, 1, 512)
+    gate_mlp = torch.randn(2, 1, 512)
+    conv1 = nn.Conv1d(512, 512, 3)
+    conv_norm = nn.LayerNorm(512)
+    conv2 = nn.Conv1d(512, 512, 3)
+    fc1 = nn.Linear(512, 2048)
+    fc2 = nn.Linear(2048, 512)
+
+    cache1, cache2 = cache.split((512, 512), dim=1)
+    first_input = torch.cat((cache1, conv_input.transpose(1, 2)), dim=2)
+    convolution = conv1(first_input).transpose(1, 2)
+    convolution = F.mish(conv_norm(convolution))
+    second_input = torch.cat((cache2, convolution.transpose(1, 2)), dim=2)
+    convolution = conv2(second_input).transpose(1, 2)
+    expected_hidden = hidden + gate_conv * convolution
+    expected_hidden = _dit_mlp_residual(
+        expected_hidden,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+        fc1.weight,
+        fc1.bias,
+        fc2.weight,
+        fc2.bias,
+    )
+    expected_cache = torch.cat((first_input[:, :, -2:], second_input[:, :, -2:]), dim=1)
+
+    actual_hidden, actual_cache = _dit_conv_mlp_residual(
+        hidden,
+        conv_input,
+        cache,
+        gate_conv,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+        conv1.weight,
+        conv1.bias,
+        conv_norm.weight,
+        conv_norm.bias,
+        conv2.weight,
+        conv2.bias,
+        fc1.weight,
+        fc1.bias,
+        fc2.weight,
+        fc2.bias,
+    )
+
+    torch.testing.assert_close(actual_hidden, expected_hidden, rtol=0, atol=0)
+    torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(("value", "expected"), [(None, 50), ("64", 64)])
 def test_npu_dit_mlp_graph_width(monkeypatch, value: str | None, expected: int):
     if value is None:
@@ -391,6 +511,30 @@ def test_npu_dit_mlp_graph_config_is_used_without_environment(monkeypatch):
 
     assert _npu_dit_mlp_graph_enabled(True) is True
     assert _npu_dit_mlp_graph_width(64) == 64
+
+
+def test_npu_dit_preamble_graph_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH", raising=False)
+    assert _npu_dit_preamble_graph_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH", "off")
+    assert _npu_dit_preamble_graph_enabled(True) is False
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH", "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_PREAMBLE_GRAPH"):
+        _npu_dit_preamble_graph_enabled()
+
+
+def test_npu_dit_conv_mlp_graph_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH", raising=False)
+    assert _npu_dit_conv_mlp_graph_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH", "off")
+    assert _npu_dit_conv_mlp_graph_enabled(True) is False
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH", "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_CONV_MLP_GRAPH"):
+        _npu_dit_conv_mlp_graph_enabled()
 
 
 def test_npu_dit_mlp_graph_environment_overrides_profile(monkeypatch):

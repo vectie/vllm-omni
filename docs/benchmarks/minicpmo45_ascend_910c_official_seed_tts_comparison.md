@@ -1843,3 +1843,77 @@ b6776685bc31b20c170b3daa9fb70cfe05feca0ceda8743fd7fae527ad2cc145  candidate-run3
 4add22514e235a6b8b82fa2d1f3b59092e3d60ff2cd60bc859f1226380024611  control-quality-en8.json
 dcb3021833e7d59ecd7925c8aa1ec75627a149b3c4661aafcfbe764105474d61  candidate-quality-en8.json
 ```
+
+## Fixed-width DiT preamble and Conv+MLP megagraph
+
+This major candidate widens the model-specific 910C graph boundary instead of
+wrapping another individual operator. It adds an exact attention preamble
+(AdaLN, normalization, Q/K/V projection, Q/K normalization) and a Conv+MLP
+megagraph (both causal Conv1D operations and cache updates, normalization,
+activation, gated residual, and the full MLP residual). The opt-in profile is
+`minicpmo_4_5_2npu_910c_cfm6_dit_megagraph_competition.yaml`.
+
+This is a TorchAir megagraph rather than a hand-written monolithic AscendC
+kernel. A direct CANN `super_kernel_optimize` prototype was bit-exact but
+regressed from 148.6 us to 337.6 us. Packed QKV tied/regressed, while a
+post-attention graph had 0.03125 maximum drift and no stable win. At the fixed
+`[2, 50, 512]` BF16 shape, the selected preamble was exact and improved from
+253.7 us to 176.2 us (-30.6%). Combined Conv+MLP measured about 300 us versus
+348-362 us for separate graphs (-14% to -17%). Its cache was exact; hidden
+output had 0.00048828125 maximum and 1.16e-5 mean absolute BF16 drift.
+
+The resident service comparison used the same 32 Seed-TTS English rows,
+temperature zero, seed 42, three warmups, and concurrency one. All variants
+completed 32/32 with zero failures and 100% continuity. Control and megagraph
+produced exactly 2,649 text tokens, 298.92 seconds, and 7,174,080 audio frames.
+The same 16th row exhibited the known long model-generation tail in both.
+
+| Metric (lower is better) | Accepted control | Preamble only | Megagraph | Megagraph vs control |
+| --- | ---: | ---: | ---: | ---: |
+| Serving duration | 116.244 s | 114.738 s | 112.602 s | -3.13% |
+| Mean TTFT | 1,562.85 ms | 1,542.31 ms | 1,550.31 ms | -0.80% |
+| Median TTFT | 392.69 ms | 380.58 ms | 394.76 ms | +0.53% |
+| P99 TTFT | 26,160.89 ms | 25,941.11 ms | 25,932.31 ms | -0.87% |
+| Mean audio TTFP | 2,122.02 ms | 2,097.98 ms | 2,082.10 ms | -1.88% |
+| Median audio TTFP | 904.42 ms | 893.47 ms | 888.51 ms | -1.76% |
+| P99 audio TTFP | 27,498.24 ms | 27,287.06 ms | 27,265.11 ms | -0.85% |
+| Mean whole-audio RTF | 0.29780 | 0.29809 | 0.28466 | -4.41% |
+| Median whole-audio RTF | 0.28611 | 0.28610 | 0.27487 | -3.93% |
+| P99 whole-audio RTF | 0.56306 | 0.54743 | 0.54586 | -3.06% |
+| Mean per-chunk RTF | 0.42500 | 0.42039 | 0.41290 | -2.85% |
+| Median per-chunk RTF | 0.18523 | 0.17509 | 0.17983 | -2.92% |
+| P99 per-chunk RTF | 1.21962 | 1.19344 | 1.17427 | -3.72% |
+
+The service log confirmed compile and live replay of all three Stage-2
+partitions. Focused production tests passed 25/25 on the host.
+
+The paired quality screen used the same current-manifest seed-42 rows. It is a
+hard sample, so only its paired delta is meaningful. Both variants completed
+8/8, generated the same 151 text tokens and 53.80 seconds of audio, and had no
+ASR or embedding failures.
+
+| Paired EN8 metric | Accepted control | Megagraph | Change |
+| --- | ---: | ---: | ---: |
+| Mean WER (lower) | 0.565030 | 0.565030 | 0.000000 |
+| Median WER (lower) | 0.537500 | 0.537500 | 0.000000 |
+| Mean WavLM proxy SIM (higher) | 0.803156 | 0.803233 | +0.000077 |
+| Median WavLM proxy SIM (higher) | 0.818616 | 0.818385 | -0.000231 |
+
+An attempted seed-zero rerun was invalidated and stopped: the current manifest
+order did not reproduce the historical eight rows and selected a runaway
+2,169-token item. It is excluded. The candidate remains opt-in until the full
+1,088-row Seed-TTS and full Daily-Omni and Video-MME gates are repeated.
+
+Raw results:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dit-preamble-20260813/results
+```
+
+```text
+52665bd691f82bdd13f1823d9ce9f450c59b7ba94cbf2dda08e10f68ee0738cd  control-run1.json
+a9d6f775c1cfe689e3e5bbd78bd97485de6d3798d56f9161bda9b388aa60e34e  candidate-run1.json
+ec80c8970bd58c541725afd3aef7789cfd897716142d33160ae5605152b2700f  megagraph-run1.json
+7a088c9a9d5744d761203d9aef176f597bb1d0c006267dca78f9b30da85c289b  control-quality-en8-seed42.json
+3fa82e102bdfef3b6607bfeecf47a22754709c10b37b46227757b71d0eab6b40  megagraph-quality-en8.json
+```

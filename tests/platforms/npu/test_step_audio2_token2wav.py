@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.utils import parametrize
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -194,3 +195,48 @@ def test_hift_patch_reports_incompatible_layout(monkeypatch: pytest.MonkeyPatch)
 
     with pytest.raises(TypeError, match=r"m_source\.l_sin_gen\._f02sine"):
         module.patch_step_audio2_hift_for_npu(SimpleNamespace())
+
+
+def test_hift_weight_norm_materialization_is_exact_and_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    hift = torch.nn.Sequential(
+        torch.nn.utils.parametrizations.weight_norm(torch.nn.Conv1d(3, 4, 3)),
+        torch.nn.SiLU(),
+        torch.nn.utils.parametrizations.weight_norm(torch.nn.ConvTranspose1d(4, 2, 4, stride=2)),
+    ).eval()
+    sample = torch.randn(2, 3, 16)
+    expected = hift(sample)
+
+    assert module.materialize_hift_weight_norm_for_npu(hift) == 2
+    assert module.materialize_hift_weight_norm_for_npu(hift) == 0
+    assert not parametrize.is_parametrized(hift[0], "weight")
+    assert not parametrize.is_parametrized(hift[2], "weight")
+    torch.testing.assert_close(hift(sample), expected, rtol=0, atol=0)
+
+
+def test_hift_weight_norm_materialization_preserves_unrelated_parametrization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+
+    class AbsWeight(torch.nn.Module):
+        def forward(self, weight):
+            return weight.abs()
+
+    layer = torch.nn.Conv1d(2, 2, 1)
+    parametrize.register_parametrization(layer, "weight", AbsWeight())
+    hift = torch.nn.Sequential(layer)
+
+    assert module.materialize_hift_weight_norm_for_npu(hift) == 0
+    assert parametrize.is_parametrized(layer, "weight")
+
+
+@pytest.mark.parametrize(("value", "expected"), [("1", True), ("true", True), ("yes", True), ("0", False)])
+def test_hift_weight_norm_materialization_env_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: bool,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_MATERIALIZE_WEIGHT_NORM_ENV, value)
+    assert module._env_flag_enabled(module._HIFT_MATERIALIZE_WEIGHT_NORM_ENV) is expected

@@ -376,6 +376,7 @@ Opt-in experiments, one at a time:
 
 ```bash
 VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH=1
+VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM=1
 VLLM_OMNI_NPU_SYNC_BEFORE_DEVICE_EVENT=0  # TP=1 only
 # Native duplex profile: duplex_session.cache_control_embeddings=true
 # Keep false when dynamic LoRA/adapters can mutate embedding weights.
@@ -426,6 +427,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Session TTL/reaper, cancellation, pending-input limits, max-session admission | Shipped |
 | Per-session accelerator KV metrics and fair multi-session scheduling | Required before multi-session production promotion |
 | Fixed-width DiT MLP graph partition around eager convolution | Implemented; full Seed-TTS, Daily-Omni, and Video-MME gates passed |
+| HiFT inference weight-norm materialization | Implemented, opt-in; DevEnv_132987 three-run median mean chunk RTF -2.02%, mean whole-audio RTF -1.97%, E2E -1.91%, matched EN8 WER 0.0000 and proxy SIM +0.00032; full competition qualification still required before default-on promotion |
 | Broader cache-shape-bucketed DiT graph partitions | Stock SDPA operator gate rejected: fixed 384/512 cache widths were 8.1-12.8% slower before copy; retry only as part of a larger fused CANN boundary |
 | Ascend-specific DiT layout/cache kernels | Profiler-triggered fallback if partitioning cannot remove launch overhead |
 | Deployment-distribution distillation/LoRA | Research fallback, not serving baseline |

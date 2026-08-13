@@ -1756,3 +1756,90 @@ c62724cc2961ef621a3f823967ae934e7069bb0c2c9f4bbcf790f09b1cacb426  speaker-cache-
 7b5adf0fa934dcd4564d6fafd1cf1f9e4b60176eee7940722690bc826efd8814  speaker-cache-run2.json
 477b47c9365c8ba2744118f903ac54f3dd7e5431e23d823e4f032669c23ffdd2  speaker-cache-run3.json
 ```
+
+## Opt-in HiFT inference weight-norm materialization
+
+After the previous environment became unavailable, this candidate was
+reproduced on `DevEnv_132987`, an Atlas A3-class host exposing two logical
+64-GiB Ascend 910C devices. The model was copied from shared storage to the
+host-local overlay before measurement. The service used the qualified CFM6,
+DiT-MLP-graph competition profile with the existing automatic SDPA adapter.
+
+HiFT applies PyTorch weight-normalization parametrizations to its convolution
+stack. In immutable inference those parametrizations recompute normalized
+weights on every access. With the following opt-in switch, the NPU adapter
+materializes the effective weights once after checkpoint loading and removes
+only standard `_WeightNorm` parametrizations:
+
+```bash
+VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND=auto \
+VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM=1 \
+vllm serve /models/OpenBMB/MiniCPM-o-4_5 --omni \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml \
+  --trust-remote-code --interleave-mm-strings --host 127.0.0.1 --port 8099
+```
+
+Startup reported 82 materialized parametrizations. The transformation is
+idempotent, leaves unrelated parametrizations intact, and preserves exact CPU
+module output in its focused test. The complete focused NPU patch suite passed
+18/18 on the host.
+
+Control and candidate each ran three times with the same 32 fixed English
+Seed-TTS prompts, three warmups, concurrency one, seed zero, nested MiniCPM-o
+TTS request body, and CFM6 competition profile. Every run completed 32/32 with
+zero failures and 100% streaming continuity and produced 4,801 input tokens,
+480 output tokens, 3,362,880 frames, and 140.12 seconds of audio.
+
+| Three-run median metric | Control | Materialized weight norm | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 47.675 s | 46.766 s | -1.91% |
+| Request throughput | 0.6712 req/s | 0.6843 req/s | +1.94% |
+| Mean E2E | 1,489.43 ms | 1,461.05 ms | -1.91% |
+| Median E2E | 1,512.57 ms | 1,497.82 ms | -0.98% |
+| P99 E2E | 2,016.09 ms | 1,970.98 ms | -2.24% |
+| Mean TTFT | 316.17 ms | 313.21 ms | -0.94% |
+| Median TTFT | 320.19 ms | 317.54 ms | -0.83% |
+| P99 TTFT | 450.17 ms | 449.12 ms | -0.23% |
+| Mean audio TTFP | 846.63 ms | 835.21 ms | -1.35% |
+| Median audio TTFP | 844.89 ms | 835.75 ms | -1.08% |
+| P99 audio TTFP | 997.60 ms | 976.99 ms | -2.07% |
+| Mean whole-audio RTF | 0.3479 | 0.3410 | -1.97% |
+| Median whole-audio RTF | 0.3448 | 0.3381 | -1.93% |
+| P99 whole-audio RTF | 0.4713 | 0.4540 | -3.67% |
+| Mean per-chunk RTF | 0.3639 | 0.3565 | -2.02% |
+| Median per-chunk RTF | 0.1765 | 0.1733 | -1.80% |
+| P99 per-chunk RTF | 1.1416 | 1.1196 | -1.93% |
+
+Lower is better except for throughput. All measured speed gates moved in the
+desired direction, including the competition's per-chunk RTF, TTFT, and TTFP
+targets.
+
+A paired eight-row English Seed-TTS screen then used the same prompt order,
+temperature-zero generation, and the exact nested TTS request body. Both
+variants completed 8/8 with WER 0.0000, 1,197 input tokens, 116 output tokens,
+31.84 seconds/764,160 frames of output, and no evaluation errors. The in-tree
+WavLM Base Plus mean-pooling proxy moved from 0.838845 to 0.839166
+(+0.000321); its median moved from 0.847123 to 0.848490. This proxy is not the
+official fine-tuned Seed-TTS speaker-verification model, so it is an aligned
+regression screen rather than a replacement for the organizer's full gate.
+The candidate stays opt-in until full Seed-TTS, Daily-Omni, and Video-MME
+qualification is repeated on this environment.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-materialize-20260813/results
+```
+
+Result checksums:
+
+```text
+82a706504b06b68a82d954e71b0c5eddfa240e9a35ceae7d860a78ec57d0fb50  control-run1.json
+658ca0449a3265a36ce9b2d2dc1df3d402ad8d9cf9e239882817f4a848eaedae  control-run2.json
+48f4413b1a31d44dc7066e7f31363ed48472aa68daf40fa636edd184c39e4ef6  control-run3.json
+e88e6661604eaaa5eeb42514474053f065de1f0132ae91b0f9a86663e2cc1798  candidate-run1.json
+ffe92e082d415e9cbe28942c286cec95b0dc1078be56be770830e7409c9a81ef  candidate-run2.json
+b6776685bc31b20c170b3daa9fb70cfe05feca0ceda8743fd7fae527ad2cc145  candidate-run3.json
+4add22514e235a6b8b82fa2d1f3b59092e3d60ff2cd60bc859f1226380024611  control-quality-en8.json
+dcb3021833e7d59ecd7925c8aa1ec75627a149b3c4661aafcfbe764105474d61  candidate-quality-en8.json
+```

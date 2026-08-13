@@ -8,10 +8,13 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
    downsample with its exact midpoint form while keeping HiFT on NPU.
 2. CosyVoice2 DiT SDPA — expand the DiT attention mask and let the adapter
    probe fused attention with a sticky MATH fallback for older CANN stacks.
+3. HiFT weight norm — optionally freeze inference-only normalized convolution
+   weights after checkpoint loading instead of recomputing them per chunk.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import MethodType
@@ -19,6 +22,7 @@ from types import MethodType
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.utils import parametrize
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -27,6 +31,41 @@ _PATCHED = False
 _original_ensure_models_loaded = None
 _original_forward = None
 _original_stream_chunk_for = None
+
+_HIFT_MATERIALIZE_WEIGHT_NORM_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM"
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def materialize_hift_weight_norm_for_npu(hift: torch.nn.Module) -> int:
+    """Replace HiFT inference-time weight-norm parametrizations with weights.
+
+    PyTorch's parametrization API recomputes every normalized convolution
+    weight on every attribute access. HiFT is immutable in serving, so the
+    effective weights can be stored once after checkpoint loading. Only the
+    standard ``_WeightNorm`` parametrization is removed; unrelated or mixed
+    parametrizations are left untouched.
+    """
+    if getattr(hift, "_step_audio2_npu_weight_norm_materialized", False):
+        return 0
+
+    materialized = 0
+    for module in hift.modules():
+        if not parametrize.is_parametrized(module, "weight"):
+            continue
+        weight_parametrizations = module.parametrizations.weight
+        if not weight_parametrizations or any(
+            type(item).__name__ != "_WeightNorm" for item in weight_parametrizations
+        ):
+            continue
+        parametrize.remove_parametrizations(module, "weight", leave_parametrized=True)
+        materialized += 1
+
+    hift._step_audio2_npu_weight_norm_materialized = True
+    logger.info("Materialized %d HiFT weight-norm parametrizations for Ascend NPU", materialized)
+    return materialized
 
 
 def _linear_downsample_even_scale(x: torch.Tensor, scale: int) -> torch.Tensor:
@@ -140,6 +179,8 @@ def _patched_ensure_models_loaded(self) -> None:
     if was_loaded or self.device.type != "npu" or self._hift is None:
         return
     patch_step_audio2_hift_for_npu(self._hift)
+    if _env_flag_enabled(_HIFT_MATERIALIZE_WEIGHT_NORM_ENV):
+        materialize_hift_weight_norm_for_npu(self._hift)
 
 
 def _patched_forward(self, generated_speech_tokens, prompt_wav, return_bytes=True):

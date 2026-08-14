@@ -2061,3 +2061,76 @@ Mixed-result checksums:
 c950e6bf4c0e0d822b3f7866fe16c5c6c8c3af8b9b8c37fd0ebde05ce3f33332  mix-block-megagraph-run2.json
 0abb9ae8e0403d30f8c02672f61cdc3f98f606fee631fe9f0a60fd32f1ee5377  mix-block-split-run1.json
 ```
+
+## GE-visible lowering of the aggressive Conv profile
+
+The opaque mixed-block boundary has now been removed from resident graph
+replay. Two integration layers enforce that boundary:
+
+1. The vLLM Ascend converter for
+   `npu_minicpmo_causal_conv_block` decomposes the block into two small
+   `MinicpmoCausalConvPack` layout nodes and native GE `MatMulV2`, `Reshape`,
+   `LayerNormV4`, `Mish`, `Mul`, `Add`, `SplitV`, and `ConcatV2` nodes.
+2. The vLLM-Omni serving path goes further and selects the already-proven
+   causal-pack Conv+MLP callable directly. This lets Dynamo and TorchAir use
+   their normal ATen-to-GE lowering and gives the aggressive and competition
+   profiles one canonical graph and cache key.
+
+The mixed `MIX_AIC_1_2` kernel remains available for eager operator research;
+it is not inserted into the resident graph. A kernel cannot simultaneously be
+one opaque custom launch and expose its internal GEMMs and vector operations
+to GE. The graph-visible path therefore keeps custom code only where it is
+profitable: the causal history packing and two-frame cache extraction.
+
+On-device validation on the same `DevEnv_132987` Ascend 910C host produced the
+following sequence. The hand-authored GE converter compiled successfully but
+measured `57.64 s` and `2.44x` audio throughput. The direct canonical lowering
+also compiled and logged live replay:
+
+```text
+Compiled MiniCPM-o NPU DiT Conv+MLP megagraph for 2x50x512
+MiniCPM-o NPU DiT GE-visible Conv-block + MLP graph replay active
+```
+
+Because the historical `41.786 s` native-pack result was no longer
+reproducible on the current machine state, a fresh block-off control was run
+immediately after the graph-visible trial with the same source, model, 32
+Seed-TTS rows, CFM6 schedule, three warmups, concurrency one, and temperature
+zero:
+
+| Current-state metric | Native-pack control | GE-visible aggressive profile | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration (lower) | 55.09 s | 56.49 s | +2.54% |
+| Request throughput (higher) | 0.58 req/s | 0.57 req/s | -1.72% |
+| Mean TTFT (lower) | 326.27 ms | 318.36 ms | -2.42% |
+| Median TTFT (lower) | 332.39 ms | 319.06 ms | -4.01% |
+| P99 TTFT (lower) | 461.37 ms | 455.17 ms | -1.34% |
+| Audio throughput (higher) | 2.56x | 2.49x | -2.73% |
+
+Both paths completed 32/32 requests with zero failures, 100% continuity,
+4,801 input tokens, 481 output tokens, 3,380,160 audio frames, and 140.84
+seconds of audio. Since both profiles now select the exact same graph callable,
+the small duration/throughput spread is run-to-run service variance, not a
+different Conv graph. The change fixes the optimizer boundary but does not
+claim a new speedup over the causal-pack graph; that path was already the
+graph-profitable implementation.
+
+Focused validation passed 55/55 vLLM-Omni Code2Wav tests and the vLLM Ascend
+converter structure test. Full Seed-TTS WER/SIM, Daily-Omni, and Video-MME
+qualification remains required before changing the competition accuracy
+status.
+
+New raw results are in the existing experiment directory:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-fused-conv-20260814/results
+```
+
+Result checksums:
+
+```text
+c644fdefc4571eace58c7f604a37d0b36ae3e5ae258f5fe85f7b93d2c72220b7  ge-visible-run1.json
+645a85a36274e6a7864f47400af4d51611e0fac2f54942e17bb10944a8cfdf12  ge-visible-direct-run1.json
+24f49fce2bbc349768544dd4df28f31e5e56168fb42c85a1a0aa1dd900f5aa02  ge-visible-canonical-run1.json
+b9f9e88e26ed5724f4558855461a713bea35c3c0cd4efba3e38c4bf2fe664083  current-native-pack-control-run1.json
+```

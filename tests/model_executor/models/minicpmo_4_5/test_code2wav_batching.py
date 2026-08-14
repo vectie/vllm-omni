@@ -564,46 +564,18 @@ def test_dit_fused_conv_mlp_residual_matches_partition_math(monkeypatch):
 def test_dit_fused_conv_block_mlp_residual_matches_partition_math(monkeypatch):
     torch.manual_seed(15)
 
-    def causal_block(
-        hidden,
-        conv_input,
-        cnn_cache,
-        gate_conv,
-        conv1_weight,
-        conv1_bias,
-        norm_weight,
-        norm_bias,
-        conv2_weight,
-        conv2_bias,
-    ):
-        cache1, cache2 = cnn_cache.split((512, 512), dim=1)
-        first = torch.cat((cache1, conv_input.transpose(1, 2)), dim=2)
-        new_cache1 = first[:, :, -2:]
-        convolution = F.linear(
-            torch.stack(
-                [first[:, :, offset : offset + 3].transpose(1, 2).reshape(2, -1) for offset in range(50)],
-                dim=1,
-            ),
-            conv1_weight,
-            conv1_bias,
-        )
-        convolution = F.mish(F.layer_norm(convolution, (512,), norm_weight, norm_bias, 1e-5))
-        second = torch.cat((cache2, convolution.transpose(1, 2)), dim=2)
-        new_cache2 = second[:, :, -2:]
-        convolution = F.linear(
-            torch.stack(
-                [second[:, :, offset : offset + 3].transpose(1, 2).reshape(2, -1) for offset in range(50)],
-                dim=1,
-            ),
-            conv2_weight,
-            conv2_bias,
-        )
-        return hidden + gate_conv * convolution, torch.cat((new_cache1, new_cache2), dim=1)
+    def causal_pack(x, cache):
+        history = torch.cat((cache, x.transpose(1, 2)), dim=2)
+        packed = torch.stack(
+            [history[:, :, offset : offset + 3].transpose(1, 2).reshape(2, -1) for offset in range(50)],
+            dim=1,
+        ).reshape(100, 1536)
+        return packed, x[:, -2:, :].transpose(1, 2).contiguous()
 
     monkeypatch.setattr(
         torch.ops._C_ascend,
-        "npu_minicpmo_causal_conv_block",
-        causal_block,
+        "npu_minicpmo_causal_conv_pack",
+        causal_pack,
         raising=False,
     )
     hidden = torch.randn(2, 50, 512)

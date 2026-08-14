@@ -318,30 +318,33 @@ def _dit_fused_conv_block_mlp_residual(
     fc2_weight: torch.Tensor,
     fc2_bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """910C MIX-kernel Conv block followed by the existing compiled MLP."""
-    hidden, new_cache = torch.ops._C_ascend.npu_minicpmo_causal_conv_block(
+    """Compile the aggressive Conv profile as a fully visible GE graph.
+
+    The eager MIX kernel is valuable in isolation, but treating the whole
+    block as one custom node prevents GE from optimizing its GEMMs,
+    normalization, activation, residual, and the following MLP together.  Use
+    the native causal-pack kernel only for the layout transform and let
+    TorchAir lower the compute-heavy portion through its normal ATen path.
+    """
+    return _dit_fused_conv_mlp_residual(
         hidden,
         conv_input,
         cnn_cache,
         gate_conv,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
         conv1_flat_weight,
         conv1_bias,
         conv_norm_weight,
         conv_norm_bias,
         conv2_flat_weight,
         conv2_bias,
-    )
-    hidden = _dit_mlp_residual(
-        hidden,
-        shift_mlp,
-        scale_mlp,
-        gate_mlp,
         fc1_weight,
         fc1_bias,
         fc2_weight,
         fc2_bias,
     )
-    return hidden, new_cache
 
 
 def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
@@ -638,20 +641,7 @@ class BatchedToken2Wav(nn.Module):
         conv1 = block.conv.block[1]
         conv_norm = block.conv.block[3]
         conv2 = block.conv.block[6]
-        if self._npu_dit_fused_conv_block_enabled:
-            try:
-                from vllm_ascend.compilation.minicpmo_causal_conv import (
-                    register_minicpmo_causal_conv_block_converter,
-                )
-
-                register_minicpmo_causal_conv_block_converter()
-            except (ImportError, AttributeError, RuntimeError):
-                self._npu_dit_fused_conv_block_enabled = False
-                logger.warning(
-                    "MiniCPM-o native MIX Conv block unavailable; falling back to the causal-pack graph",
-                    exc_info=True,
-                )
-        if self._npu_dit_fused_conv_pack_enabled and not self._npu_dit_fused_conv_block_enabled:
+        if self._npu_dit_fused_conv_block_enabled or self._npu_dit_fused_conv_pack_enabled:
             try:
                 from vllm_ascend.compilation.minicpmo_causal_conv import (
                     register_minicpmo_causal_conv_pack_converter,
@@ -659,6 +649,7 @@ class BatchedToken2Wav(nn.Module):
 
                 register_minicpmo_causal_conv_pack_converter()
             except (ImportError, AttributeError, RuntimeError):
+                self._npu_dit_fused_conv_block_enabled = False
                 self._npu_dit_fused_conv_pack_enabled = False
                 logger.warning(
                     "MiniCPM-o native causal Conv pack unavailable; compiling the standard Conv+MLP graph",
@@ -712,9 +703,10 @@ class BatchedToken2Wav(nn.Module):
 
             _ensure_torchair_broadcast_alias()
             compiler_config = torchair.CompilerConfig()
-            if self._npu_dit_fused_conv_block_enabled:
-                graph_partition = _dit_fused_conv_block_mlp_residual
-            elif self._npu_dit_fused_conv_pack_enabled:
+            if self._npu_dit_fused_conv_block_enabled or self._npu_dit_fused_conv_pack_enabled:
+                # Select the proven pack partition directly so the aggressive
+                # and competition profiles share one canonical GE graph and
+                # cache key.
                 graph_partition = _dit_fused_conv_mlp_residual
             else:
                 graph_partition = _dit_conv_mlp_residual
@@ -943,7 +935,7 @@ class BatchedToken2Wav(nn.Module):
                         self._npu_dit_preamble_graph_used = True
                     if conv_mlp_graph_fn is not None and not self._npu_dit_conv_mlp_graph_used:
                         if self._npu_dit_fused_conv_block_enabled:
-                            logger.info("MiniCPM-o NPU DiT MIX Conv-block + MLP graph replay active")
+                            logger.info("MiniCPM-o NPU DiT GE-visible Conv-block + MLP graph replay active")
                             self._npu_dit_fused_conv_block_used = True
                         else:
                             logger.info("MiniCPM-o NPU DiT Conv+MLP megagraph replay active")

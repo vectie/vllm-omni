@@ -1,0 +1,18 @@
+# Atlas 800I A3 / Ascend 910C HiFT F0 graph candidate.
+#
+# The steady streaming shape is batch 1 x 80 mel channels x 58 frames. The
+# stage-2 adapter compiles only HiFT's five Conv+ELU feature layers for that
+# exact shape and falls back to upstream eager execution for every other
+# shape. The original classifier remains outside GE to preserve its exact
+# accumulation order.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_megagraph_competition.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM: "1"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH: "58"

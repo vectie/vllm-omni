@@ -2214,3 +2214,94 @@ Raw results remain in:
 604970b0820f58412b50cd406d11efb579668e608c16eb1ca80ce63b5d586da2  conv-linear-k1-seedtts-32.json
 12f204d43a0775c5afdfdd1cc8e08238c2eb03c6ae76f2c92ea55f5550b9b22e  paired-pack-control-seedtts-32.json
 ```
+
+## HiFT F0 feature-graph upgrade
+
+A fresh native Torch-NPU profile of a warmed Seed-TTS request showed that the
+remaining Stage-2 cost is no longer dominated by a single DiT boundary. The
+largest operator families were `MatMulV2` (49.250 ms, 12.36%), `TransData`
+(48.408 ms, 12.15%), `Transpose` (40.329 ms, 10.12%), the custom causal pack
+(37.112 ms, 9.31%), and `LayerNormV3` (33.268 ms, 8.35%). Shape aggregation
+also exposed a repeated fixed HiFT F0 stack: 405 weight-layout conversions for
+`[512, 512, 1, 3]` convolution weights consumed 24.122 ms in the profiled
+request.
+
+The new candidate compiles HiFT's five fixed Conv1d+ELU feature layers as one
+static TorchAir graph for the steady streaming shape `[1, 80, 58]`. It keeps
+the checkpoint's original per-timestep Linear classifier outside GE. The
+first `[1, 80, 50]` chunk and every incompatible shape fall back to the
+original predictor. Startup checks materialize the immutable inference-only
+weight-normalized convolutions and require bit-exact feature output before the
+patch is installed. A 910C screening run measured 407.790 us for the complete
+eager predictor, 248.509 us for an experimental complete static graph, and
+241.228 us for the promoted five-Conv feature graph. The complete graph was
+rejected because replacing Linear with a 1x1 Conv changed its accumulation
+order; the promoted boundary retains Linear unchanged.
+
+This experiment also found and fixed an orchestration defect: `runtime.env`
+from platform stage overlays was not applied while local LLM workers were
+spawned. Stage environment variables are now scoped to the serialized spawn,
+inherited by only the intended child, and restored afterward. The candidate
+log consequently proves both configuration and live execution:
+
+```text
+[stage_init] Stage-2 applied runtime env keys: [...HIFT_F0_GRAPH, ...HIFT_F0_GRAPH_WIDTH, ...HIFT_MATERIALIZE_WEIGHT_NORM]
+Compiled HiFT F0 feature graph for Ascend NPU: batch=1 width=58
+HiFT F0 graph falling back for runtime shape (1, 80, 50); compiled shape is (1, 80, 58)
+HiFT F0 feature graph replay active for runtime shape (1, 80, 58)
+```
+
+The paired service test used fresh restarts, the same source and model, the
+same 32 English Seed-TTS rows, seed zero, temperature zero, three warmups,
+CFM6, and concurrency one. The control retained weight-norm materialization
+and every existing DiT optimization but disabled only the new F0 graph.
+
+| Paired metric | Weight-norm control | HiFT F0 graph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.724 s | 42.505 s | -4.96% |
+| Request throughput | 0.7155 req/s | 0.7529 req/s | +5.22% |
+| Audio throughput | 3.133x | 3.297x | +5.22% |
+| Mean E2E | 1,397.18 ms | 1,327.91 ms | -4.96% |
+| Median E2E | 1,420.00 ms | 1,335.23 ms | -5.97% |
+| Mean TTFT | 324.60 ms | 314.55 ms | -3.10% |
+| Median TTFT | 330.48 ms | 313.13 ms | -5.25% |
+| P99 TTFT | 465.85 ms | 445.42 ms | -4.39% |
+| Mean audio TTFP | 809.87 ms | 787.02 ms | -2.82% |
+| Median audio TTFP | 819.56 ms | 790.42 ms | -3.56% |
+| Mean per-chunk RTF | 0.34559 | 0.32990 | -4.54% |
+| Median per-chunk RTF | 0.17820 | 0.14090 | -20.93% |
+
+Lower is better except for throughput. Both paths completed 32/32 requests
+with zero failures and 100% streaming continuity. They produced identical
+aggregate structure: 4,801 input tokens, 480 output tokens, 3,362,880 audio
+frames, and 140.12 seconds of audio.
+
+An additional paired eight-item export preserved the sample rate and exact
+frame count for all eight utterances. Fresh service restarts make HiFT's
+random excitation prevent byte-identical WAV files; nevertheless, candidate
+versus control waveform correlation averaged 0.999938 (minimum 0.999808) with
+40.205 dB mean SNR. The exact NPU feature-partition test and 113/113 affected
+CPU unit tests also passed. The host did not contain the official Whisper WER
+checkpoint and could not reach Hugging Face, so full Seed-TTS WER/SIM remains
+an explicit promotion gate alongside Daily-Omni and Video-MME. The graph
+profile therefore remains opt-in despite the positive speed result.
+
+Use these paired profiles:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_weight_norm_control.yaml
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_f0_graph_experimental.yaml
+```
+
+Raw results and WAV exports are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-f0-20260815
+```
+
+Result checksums:
+
+```text
+7581689ff07792a4d1952c4543dbee1d40ad19195e6f545478e828ca2bbc68ab  control-en32.json
+e30299874e9f5d02f235740ed8b9e68ea26658282fa806a4685a78a2b03e0a61  candidate-en32.json
+```

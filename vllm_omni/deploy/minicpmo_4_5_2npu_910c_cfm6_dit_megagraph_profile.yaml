@@ -1,0 +1,23 @@
+# Development-only profiler overlay for the current Ascend 910C competition
+# candidate. Profiling is intentionally restricted to Code2Wav (stage 2), so
+# Thinker/Talker traffic remains representative while the remaining DiT and
+# HiFT operator costs are captured with shapes.
+#
+# Start the server with this deploy config, then bracket one warmed request:
+#
+#   curl -X POST http://127.0.0.1:8099/start_profile \
+#     -H 'Content-Type: application/json' -d '{"stages":[2]}'
+#   # issue one representative request
+#   curl -X POST http://127.0.0.1:8099/stop_profile \
+#     -H 'Content-Type: application/json' -d '{"stages":[2]}'
+#
+# Never use a profiler-enabled process for latency measurements.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_megagraph_competition.yaml
+
+stages:
+  - stage_id: 2
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /tmp/vllm-omni-profiles/minicpmo45/stage2
+      torch_profiler_record_shapes: true

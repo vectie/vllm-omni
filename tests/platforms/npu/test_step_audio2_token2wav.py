@@ -231,6 +231,52 @@ def test_hift_weight_norm_materialization_preserves_unrelated_parametrization(
     assert parametrize.is_parametrized(layer, "weight")
 
 
+def test_hift_f0_feature_partition_matches_sequential_stack(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    layers: list[torch.nn.Module] = []
+    channels = (3, 4, 4, 4, 4, 4)
+    for in_channels, out_channels in zip(channels, channels[1:]):
+        layers.extend(
+            (
+                torch.nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1),
+                torch.nn.ELU(),
+            )
+        )
+    condnet = torch.nn.Sequential(*layers).eval()
+    convolutions = [layer for layer in condnet if isinstance(layer, torch.nn.Conv1d)]
+    value = torch.randn(1, 3, 11)
+
+    expected = condnet(value)
+    actual = module._hift_f0_features(
+        value,
+        *(tensor for layer in convolutions for tensor in (layer.weight, layer.bias)),
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(("value", "expected"), [("58", 58), ("1", 1)])
+def test_hift_f0_graph_width_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: int,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_F0_GRAPH_WIDTH_ENV, value)
+    assert module._hift_f0_graph_width() == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "bad"])
+def test_hift_f0_graph_width_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_F0_GRAPH_WIDTH_ENV, value)
+    with pytest.raises(ValueError):
+        module._hift_f0_graph_width()
+
+
 @pytest.mark.parametrize(("value", "expected"), [("1", True), ("true", True), ("yes", True), ("0", False)])
 def test_hift_weight_norm_materialization_env_flag(
     monkeypatch: pytest.MonkeyPatch,

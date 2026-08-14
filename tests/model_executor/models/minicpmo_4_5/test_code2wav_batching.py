@@ -11,10 +11,12 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_attention_preamble,
     _dit_conv_mlp_residual,
     _dit_fused_conv_block_mlp_residual,
+    _dit_fused_conv_linear_mlp_residual,
     _dit_fused_conv_mlp_residual,
     _dit_mlp_residual,
     _npu_dit_conv_mlp_graph_enabled,
     _npu_dit_fused_conv_block_enabled,
+    _npu_dit_fused_conv_linear_enabled,
     _npu_dit_fused_conv_pack_enabled,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
@@ -622,6 +624,68 @@ def test_dit_fused_conv_block_mlp_residual_matches_partition_math(monkeypatch):
     torch.testing.assert_close(fused[1], standard[1], rtol=0, atol=0)
 
 
+def test_dit_fused_conv_linear_mlp_residual_matches_partition_math(monkeypatch):
+    torch.manual_seed(16)
+
+    def causal_linear(x, cache, weight, bias):
+        history = torch.cat((cache, x.transpose(1, 2)), dim=2)
+        packed = torch.stack(
+            [history[:, :, offset : offset + 3].transpose(1, 2).reshape(2, -1) for offset in range(50)],
+            dim=1,
+        ).reshape(100, 1536)
+        projected = F.linear(packed, weight, bias).reshape(2, 50, 512)
+        return projected, x[:, -2:, :].transpose(1, 2).contiguous()
+
+    monkeypatch.setattr(
+        torch.ops._C_ascend,
+        "npu_minicpmo_causal_conv_linear",
+        causal_linear,
+        raising=False,
+    )
+    hidden = torch.randn(2, 50, 512)
+    conv_input = torch.randn(2, 50, 512)
+    cache = torch.randn(2, 1024, 2)
+    modulations = [torch.randn(2, 1, 512) for _ in range(4)]
+    conv1 = nn.Conv1d(512, 512, 3)
+    conv_norm = nn.LayerNorm(512)
+    conv2 = nn.Conv1d(512, 512, 3)
+    fc1 = nn.Linear(512, 2048)
+    fc2 = nn.Linear(2048, 512)
+    common = (*modulations, conv_norm.weight, conv_norm.bias)
+    standard = _dit_conv_mlp_residual(
+        hidden,
+        conv_input,
+        cache,
+        *common[:4],
+        conv1.weight,
+        conv1.bias,
+        *common[4:],
+        conv2.weight,
+        conv2.bias,
+        fc1.weight,
+        fc1.bias,
+        fc2.weight,
+        fc2.bias,
+    )
+    fused = _dit_fused_conv_linear_mlp_residual(
+        hidden,
+        conv_input,
+        cache,
+        *common[:4],
+        conv1.weight.permute(0, 2, 1).reshape(512, 1536),
+        conv1.bias,
+        *common[4:],
+        conv2.weight.permute(0, 2, 1).reshape(512, 1536),
+        conv2.bias,
+        fc1.weight,
+        fc1.bias,
+        fc2.weight,
+        fc2.bias,
+    )
+    torch.testing.assert_close(fused[0], standard[0], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(fused[1], standard[1], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(("value", "expected"), [(None, 50), ("64", 64)])
 def test_npu_dit_mlp_graph_width(monkeypatch, value: str | None, expected: int):
     if value is None:
@@ -685,6 +749,18 @@ def test_npu_dit_fused_conv_block_config_and_environment(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_BLOCK", "sometimes")
     with pytest.raises(ValueError, match="NPU_DIT_FUSED_CONV_BLOCK"):
         _npu_dit_fused_conv_block_enabled()
+
+
+def test_npu_dit_fused_conv_linear_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR", raising=False)
+    assert _npu_dit_fused_conv_linear_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR", "off")
+    assert _npu_dit_fused_conv_linear_enabled(True) is False
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR", "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_FUSED_CONV_LINEAR"):
+        _npu_dit_fused_conv_linear_enabled()
 
 
 def test_npu_dit_mlp_graph_environment_overrides_profile(monkeypatch):

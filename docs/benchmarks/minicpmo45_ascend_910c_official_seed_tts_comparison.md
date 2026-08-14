@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 on Ascend 910C: official Seed-TTS comparison
 
-Date: 2026-08-09; optimization update: 2026-08-12
+Date: 2026-08-09; optimization update: 2026-08-14
 
 This report compares the pinned LunaNexa vLLM-Omni candidate, an optimized
 candidate built from it, and the competition's published Seed-TTS performance
@@ -2133,4 +2133,84 @@ c644fdefc4571eace58c7f604a37d0b36ae3e5ae258f5fe85f7b93d2c72220b7  ge-visible-run
 645a85a36274e6a7864f47400af4d51611e0fac2f54942e17bb10944a8cfdf12  ge-visible-direct-run1.json
 24f49fce2bbc349768544dd4df28f31e5e56168fb42c85a1a0aa1dd900f5aa02  ge-visible-canonical-run1.json
 b9f9e88e26ed5724f4558855461a713bea35c3c0cd4efba3e38c4bf2fe664083  current-native-pack-control-run1.json
+```
+
+## Causal-pack plus Cube-projection fusion experiment
+
+The next kernel experiment narrows the opaque boundary that hurt the mixed
+two-Conv block. Each custom node now contains exactly one fixed-shape causal
+history pack, its immediately consuming FP32 `512 x 1536` Cube projection,
+the projection bias, and the two-frame cache update. LayerNorm, Mish, the
+gated residual, cache assembly, and the complete MLP remain ordinary nodes in
+the surrounding TorchAir graph so GE retains visibility across the expensive
+rest of the block.
+
+The `KERNEL_TYPE_MIX_AIC_1_2` implementation uses AIV cores to materialize the
+tap-major history while 16 AIC cores split the projection's output channels.
+The vLLM Ascend package adds the ACLNN binding, meta function, TorchAir
+converter, fixed-shape tiling, and a paired microbenchmark. Its build wrapper
+now also removes generated `csrc/build` metadata when the selected operator
+set changes. This was required after a stale `binary_info_config.json`
+packaged a compiled kernel without registering it.
+
+The clean CANN 9.0 `ascend910_93` package registered all three MiniCPM-o
+operators. Five direct NPU tests passed: three pack dtypes, the mixed block,
+and the new fused projection. The fused FP32 output matched pack plus
+`F.linear` within `rtol=1e-4, atol=1e-3`; the cache was bit-exact. The complete
+vLLM-Omni Code2Wav routing suite passed 57/57.
+
+Fifteen paired microbenchmark trials alternated execution order; each trial
+contained 100 calls after 50 warmups:
+
+| 910C operator path | Median latency | Minimum latency | Change |
+| --- | ---: | ---: | ---: |
+| Native pack + projection | 78.320 us | 77.226 us | baseline |
+| Fused pack + Cube projection | 69.537 us | 68.813 us | -11.21% (1.126x) |
+
+The resident service then used the same 32 English Seed-TTS rows, seed zero,
+temperature zero, three warmups, CFM6, and concurrency one. The candidate log
+confirmed live use rather than fallback:
+
+```text
+MiniCPM-o NPU DiT fused Conv+Linear + MLP graph replay active
+```
+
+It was followed immediately by a clean service restart with fused linear off
+and the native pack graph on. Both runs completed 32/32 with zero failures,
+100% continuity, 4,801 input tokens, 481 output tokens, 3,380,160 audio frames,
+and 140.84 seconds of audio.
+
+| Paired metric | Native-pack control | Fused projection | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 53.954 s | 54.661 s | +1.31% |
+| Request throughput | 0.5931 req/s | 0.5854 req/s | -1.30% |
+| Audio throughput | 2.610x | 2.577x | -1.30% |
+| Mean E2E | 1,685.52 ms | 1,707.81 ms | +1.32% |
+| Median E2E | 1,727.27 ms | 1,768.22 ms | +2.37% |
+| Mean TTFT | 318.77 ms | 324.25 ms | +1.72% |
+| Median TTFT | 320.18 ms | 324.38 ms | +1.31% |
+| Mean audio TTFP | 865.62 ms | 880.60 ms | +1.73% |
+| Median audio TTFP | 871.47 ms | 881.26 ms | +1.12% |
+| Mean per-chunk RTF | 0.40310 | 0.40801 | +1.22% |
+| Median per-chunk RTF | 0.25755 | 0.26315 | +2.17% |
+
+Lower is better except for throughput. The isolated boundary is faster, but
+the saving is too diluted inside the complete Code2Wav stage to clear service
+variance or the promotion gate; every paired end-to-end metric moved in the
+wrong direction. The feature therefore remains disabled by default and is
+available only through
+`minicpmo_4_5_2npu_910c_cfm6_dit_conv_linear_experimental.yaml`. The native
+pack plus GE-visible projection remains the competition path. Future kernel
+work must remove a larger amount of Stage-2 work without hiding GE-profitable
+operations; a sub-10-us boundary saving is not large enough by itself.
+
+Raw results remain in:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-fused-conv-20260814/results
+```
+
+```text
+604970b0820f58412b50cd406d11efb579668e608c16eb1ca80ce63b5d586da2  conv-linear-k1-seedtts-32.json
+12f204d43a0775c5afdfdd1cc8e08238c2eb03c6ae76f2c92ea55f5550b9b22e  paired-pack-control-seedtts-32.json
 ```

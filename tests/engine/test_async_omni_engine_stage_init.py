@@ -420,6 +420,54 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
     assert captured["client_log_stats"] is True
 
 
+def test_stage_runtime_scopes_runtime_env_to_llm_replica_launch(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = StageRuntime(
+        stage_configs=[types.SimpleNamespace()],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+    cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=cfg).replicas[0]
+    plan.engine_args_dict = {}
+    env_key = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
+    plan.metadata.runtime_cfg = {
+        "devices": "0",
+        "env": {env_key: "stage-value"},
+    }
+
+    captured: dict[str, object] = {}
+    addresses = types.SimpleNamespace(
+        inputs=["tcp://127.0.0.1:1"],
+        outputs=["tcp://127.0.0.1:2"],
+        frontend_stats_publish_address=None,
+    )
+    resources = types.SimpleNamespace(manager=object(), coordinator=None, addresses=addresses)
+    stage_client = types.SimpleNamespace()
+
+    @contextlib.contextmanager
+    def _capture_launch_stage_replica(**_kwargs):
+        captured["runtime_env"] = os.environ.get(env_key)
+        yield resources
+
+    monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _capture_launch_stage_replica)
+    monkeypatch.setattr(
+        runtime_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        lambda **_kwargs: stage_client,
+    )
+
+    assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=1) is stage_client
+    assert captured["runtime_env"] == "stage-value"
+    assert env_key not in os.environ
+
+
 def test_stage_runtime_passes_log_stats_to_output_processor(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
 

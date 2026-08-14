@@ -1,8 +1,10 @@
-# Atlas 800I A3 / Ascend 910C mixed-core causal-Conv candidate.
+# Atlas 800I A3 / Ascend 910C mixed-core causal-Conv experiment.
 #
 # Replaces the two native pack operators and external Conv projections with
-# one FP32 MIX_AIC_1_2 kernel. Keep opt-in until direct NPU correctness,
-# resident performance, and all three competition accuracy gates qualify it.
+# one FP32 MIX_AIC_1_2 kernel. A 2026-08-14 resident Seed-TTS comparison
+# regressed serving duration by 31.88% against the native-pack megagraph, so
+# this profile is deliberately experimental and must not be used as the
+# competition default. See the benchmark report for the complete result.
 
 base_config: minicpmo_4_5_2npu_910c_cfm6_dit_megagraph_competition.yaml
 

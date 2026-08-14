@@ -2000,3 +2000,64 @@ a04d5892cb2e27f5d7208d672e7e9a223580f43282cf378341a92c4a7140e436  control-run1.j
 e992bad2d94af35119103e6ff6a14baaae0b413fcee56249cdb7ea972c056f03  fused-run1.json
 8a748f910534e6985cf5ecdcee4c9977b6b74c6531e2aef7ab9ee298c3d47627  fused-run2.json
 ```
+
+## Mixed AIC/AIV two-Conv block experiment
+
+A more aggressive `MIX_AIC_1_2` kernel was then implemented for the fixed
+FP32 `[2, 50, 512]` Code2Wav block. One launch performs both causal packing
+operations, both Cube matrix multiplications, LayerNorm, Mish, the gated
+residual, and both cache updates. C220 AIV sub-block folding, explicit
+MTE2/MTE3 event ordering, and a 16-AIC channel split are used on
+`ascend910_93`.
+
+The direct 910C operator suite passed for the mixed block and FP16, FP32, and
+BF16 pack paths. Against the eager operator boundary, 300-iteration timing
+gave:
+
+| Path | Median latency | P95 latency | Change vs native pack |
+| --- | ---: | ---: | ---: |
+| Standard eager block | 387.796 us | 389.459 us | +55.08% |
+| Native pack path | 250.058 us | 257.685 us | baseline |
+| Mixed two-Conv block | 145.516 us | 146.022 us | -41.81% |
+
+The mixed output stayed within the kernel's explicit FP32 approximation
+bounds: hidden maximum/mean absolute error `0.003918/0.000198`, and cache
+maximum/mean absolute error `0.011787/0.000313`. The error comes from the raw
+AscendC vector transcendental approximation used by Mish rather than indexing
+or cache corruption.
+
+That microbenchmark win did not survive the resident graph. After adding the
+required tiling parse metadata, TorchAir compiled the full mixed Conv+MLP
+megagraph and logged live replay with no fallback. Two matched CFM6 runs used
+the same 32 English Seed-TTS rows, seed zero, temperature zero, three warmups,
+and concurrency one as the native-pack experiment:
+
+| Two-run mean metric | Native fused pack | Mixed block megagraph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.786 s | 55.109 s | +31.88% |
+| Request throughput | 0.7658 req/s | 0.5808 req/s | -24.16% |
+| Audio throughput | 3.353x | 2.556x | -23.77% |
+| Mean TTFT | 318.27 ms | 326.19 ms | +2.49% |
+| Median TTFT | 322.76 ms | 328.90 ms | +1.90% |
+| P99 TTFT | 456.31 ms | 464.79 ms | +1.86% |
+
+A second deployment kept the mixed block outside GE and preserved the
+separate MLP graph. Its single confirmation run was also slower: `54.440 s`,
+`0.5878 req/s`, and `2.587x` audio throughput. The opaque block removes graph
+optimizer freedom worth more than its eager launch savings. It also changed
+the aggregate output from 480 tokens / 140.12 seconds to 481 tokens / 140.84
+seconds, so the official WER/SIM gates would be required before any use.
+
+Decision: keep the mixed kernel and profile as opt-in experimental research,
+but retain the native causal-pack megagraph as the 910C competition default.
+The next kernel work should fuse within a graph-profitable boundary or use a
+GE-visible decomposition; eager microbenchmark wins alone are not promotion
+criteria.
+
+Mixed-result checksums:
+
+```text
+2247cb0f9d85700349fd4f168fd6163f8b70eb21ceb4946b0336ed2fe3cb3002  mix-block-megagraph-run1.json
+c950e6bf4c0e0d822b3f7866fe16c5c6c8c3af8b9b8c37fd0ebde05ce3f33332  mix-block-megagraph-run2.json
+0abb9ae8e0403d30f8c02672f61cdc3f98f606fee631fe9f0a60fd32f1ee5377  mix-block-split-run1.json
+```

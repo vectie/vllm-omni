@@ -794,4 +794,5 @@ class MiniCPMO45Code2Wav(nn.Module):
             npu_dit_mlp_graph_width=extra.get("npu_dit_mlp_graph_width"),
             npu_dit_preamble_graph=extra.get("npu_dit_preamble_graph"),
             npu_dit_conv_mlp_graph=extra.get("npu_dit_conv_mlp_graph"),
+            npu_dit_fused_conv_pack=extra.get("npu_dit_fused_conv_pack"),
         )

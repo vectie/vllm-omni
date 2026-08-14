@@ -1917,3 +1917,86 @@ ec80c8970bd58c541725afd3aef7789cfd897716142d33160ae5605152b2700f  megagraph-run1
 7a088c9a9d5744d761203d9aef176f597bb1d0c006267dca78f9b30da85c289b  control-quality-en8-seed42.json
 3fa82e102bdfef3b6607bfeecf47a22754709c10b37b46227757b71d0eab6b40  megagraph-quality-en8.json
 ```
+
+## Native 910C causal-Conv pack kernel
+
+The next megagraph revision replaces each fixed `[2, 50, 512]` causal-Conv
+layout sequence (`transpose + cache concat + cache slice`) with a native
+AscendC AIV operator. The operator emits the three-frame, tap-major matrix
+consumed by a Cube `Linear` and returns the next two-frame cache in the same
+launch. A TorchAir AscendIR converter keeps this boundary inside the existing
+Conv+MLP graph; both Conv1D weights are prepacked once during startup.
+
+The implementation was compiled with CANN 9.0 for `ascend910_93` and executed
+on `DevEnv_132987` (Atlas A3 / Ascend 910C). FP16, FP32, and BF16 all pass the
+direct NPU correctness test: all 153,600 packed elements and all 2,048 cache
+elements match the PyTorch reference bit-for-bit. The FP32 TorchAir graph used
+by the live Code2Wav stage also compiled and returned zero maximum error for
+both outputs. Seven repetitions of 300 iterations measured the single
+Conv/cache boundary for FP16 and BF16:
+
+| Dtype | Standard Conv/cache | Native pack + Linear | Speedup | Latency change |
+| --- | ---: | ---: | ---: | ---: |
+| FP16 | 0.08375 ms | 0.05963 ms | 1.405x | -28.80% |
+| BF16 | 0.08480 ms | 0.06049 ms | 1.402x | -28.68% |
+
+The more representative compiled BF16 partition includes both causal
+convolutions, cache updates, normalization, Mish, gated residual, and MLP.
+Seven repetitions of 100 graph replays improved median latency from 0.21419 ms
+to 0.20269 ms: 1.057x, or 5.37% lower. Cache output remained bit-exact. The
+hidden output had maximum absolute error 0.03125 and mean absolute error
+0.00001360 from the equivalent GEMM accumulation order.
+
+The resident service then compared the opt-in fused-pack profile with the same
+profile with only `VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_PACK=0`. Each
+variant ran twice with 32 fixed English Seed-TTS requests, three warmups,
+concurrency one, seed zero, temperature zero, and the CFM6 competition
+profile. The candidate log contains the required live marker:
+
+```text
+Compiled MiniCPM-o NPU DiT Conv+MLP megagraph for 2x50x512
+```
+
+There was no fused-path fallback. All four runs completed 32/32 with zero
+failures and 100% streaming continuity. Every run produced 4,801 input
+tokens, 480 output tokens, 3,362,880 audio frames, and 140.12 seconds of audio.
+
+| Two-run mean metric | Control | Native fused pack | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.928 s | 41.786 s | -6.99% |
+| Request throughput | 0.7123 req/s | 0.7658 req/s | +7.51% |
+| Mean E2E | 1,403.59 ms | 1,305.25 ms | -7.01% |
+| Median E2E | 1,415.14 ms | 1,318.58 ms | -6.82% |
+| P99 E2E | 1,962.05 ms | 1,768.28 ms | -9.88% |
+| Mean TTFT | 320.44 ms | 318.27 ms | -0.68% |
+| Median TTFT | 323.01 ms | 322.76 ms | -0.08% |
+| P99 TTFT | 462.15 ms | 456.31 ms | -1.26% |
+| Mean audio TTFP | 812.00 ms | 776.10 ms | -4.42% |
+| Median audio TTFP | 809.86 ms | 775.14 ms | -4.29% |
+| P99 audio TTFP | 977.86 ms | 927.21 ms | -5.18% |
+| Mean per-chunk RTF | 0.34609 | 0.32315 | -6.63% |
+| Median per-chunk RTF | 0.17689 | 0.13709 | -22.50% |
+| P99 per-chunk RTF | 1.12229 | 1.07311 | -4.38% |
+| Audio throughput | 3.119x | 3.353x | +7.51% |
+
+Lower is better except for throughput. All measured competition-facing speed
+metrics moved in the desired direction. The matching output totals and exact
+FP32 operator/graph tests are strong semantic regression screens, but they do
+not replace the organizer's full WER/SIM and multimodal accuracy gates. The
+profile remains opt-in until full Seed-TTS, Daily-Omni, and Video-MME
+qualification confirms no more than a two-point decline.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-fused-conv-20260814/results
+```
+
+Result checksums:
+
+```text
+a04d5892cb2e27f5d7208d672e7e9a223580f43282cf378341a92c4a7140e436  control-run1.json
+15c61548ebd1fefd54046c70c39ef729b6246db2407c3de2e2316cb423e53a72  control-run2.json
+e992bad2d94af35119103e6ff6a14baaae0b413fcee56249cdb7ea972c056f03  fused-run1.json
+8a748f910534e6985cf5ecdcee4c9977b6b74c6531e2aef7ab9ee298c3d47627  fused-run2.json
+```

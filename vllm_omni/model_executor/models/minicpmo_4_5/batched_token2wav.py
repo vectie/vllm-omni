@@ -21,6 +21,7 @@ _NPU_DIT_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH"
 _NPU_DIT_MLP_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH"
 _NPU_DIT_PREAMBLE_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH"
 _NPU_DIT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH"
+_NPU_DIT_FUSED_CONV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_PACK"
 logger = logging.getLogger(__name__)
 
 
@@ -85,6 +86,21 @@ def _npu_dit_conv_mlp_graph_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_DIT_CONV_MLP_GRAPH_ENV}={raw!r}")
+
+
+def _npu_dit_fused_conv_pack_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_FUSED_CONV_PACK_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_FUSED_CONV_PACK_ENV}={raw!r}")
 
 
 def _npu_dit_mlp_graph_width(config_value: Any = None) -> int:
@@ -220,6 +236,53 @@ def _dit_conv_mlp_residual(
     return hidden, torch.cat((new_cache1, new_cache2), dim=1)
 
 
+def _dit_fused_conv_mlp_residual(
+    hidden: torch.Tensor,
+    conv_input: torch.Tensor,
+    cnn_cache: torch.Tensor,
+    gate_conv: torch.Tensor,
+    shift_mlp: torch.Tensor,
+    scale_mlp: torch.Tensor,
+    gate_mlp: torch.Tensor,
+    conv1_flat_weight: torch.Tensor,
+    conv1_bias: torch.Tensor,
+    conv_norm_weight: torch.Tensor,
+    conv_norm_bias: torch.Tensor,
+    conv2_flat_weight: torch.Tensor,
+    conv2_bias: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc1_bias: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    fc2_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """910C Conv/cache + MLP graph using the native causal-pack boundary."""
+    cache1, cache2 = cnn_cache.split((512, 512), dim=1)
+    packed, new_cache1 = torch.ops._C_ascend.npu_minicpmo_causal_conv_pack(conv_input, cache1)
+    convolution = F.linear(packed, conv1_flat_weight, conv1_bias).reshape(2, 50, 512)
+    convolution = F.layer_norm(
+        convolution,
+        (512,),
+        conv_norm_weight,
+        conv_norm_bias,
+        1e-5,
+    )
+    convolution = F.mish(convolution)
+    packed, new_cache2 = torch.ops._C_ascend.npu_minicpmo_causal_conv_pack(convolution, cache2)
+    convolution = F.linear(packed, conv2_flat_weight, conv2_bias).reshape(2, 50, 512)
+    hidden = hidden + gate_conv * convolution
+    hidden = _dit_mlp_residual(
+        hidden,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+        fc1_weight,
+        fc1_bias,
+        fc2_weight,
+        fc2_bias,
+    )
+    return hidden, torch.cat((new_cache1, new_cache2), dim=1)
+
+
 def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
     flow = tuple((name, tensor_signature(state.flow_cache[name])) for name in sorted(state.flow_cache))
     hift = tuple((name, tensor_signature(state.hift_cache[name])) for name in sorted(state.hift_cache))
@@ -256,6 +319,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_mlp_graph_width: Any = None,
         npu_dit_preamble_graph: Any = None,
         npu_dit_conv_mlp_graph: Any = None,
+        npu_dit_fused_conv_pack: Any = None,
     ):
         super().__init__()
         self._token2wav = token2wav
@@ -316,6 +380,8 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_conv_mlp_graph: Any | None = None
         self._npu_dit_conv_mlp_graph_disabled = False
         self._npu_dit_conv_mlp_graph_used = False
+        self._npu_dit_fused_conv_pack_enabled = _npu_dit_fused_conv_pack_enabled(npu_dit_fused_conv_pack)
+        self._npu_dit_fused_conv_pack_used = False
         self._warmup_npu_dit_mlp_graph()
         self._warmup_npu_dit_preamble_graph()
         self._warmup_npu_dit_conv_mlp_graph()
@@ -508,6 +574,27 @@ class BatchedToken2Wav(nn.Module):
         conv1 = block.conv.block[1]
         conv_norm = block.conv.block[3]
         conv2 = block.conv.block[6]
+        if self._npu_dit_fused_conv_pack_enabled:
+            try:
+                from vllm_ascend.compilation.minicpmo_causal_conv import (
+                    register_minicpmo_causal_conv_pack_converter,
+                )
+
+                register_minicpmo_causal_conv_pack_converter()
+                for estimator_block in blocks:
+                    for index in (1, 6):
+                        convolution = estimator_block.conv.block[index]
+                        convolution.register_buffer(
+                            "_minicpmo_flat_weight",
+                            convolution.weight.detach().permute(0, 2, 1).reshape(512, 1536).contiguous(),
+                            persistent=False,
+                        )
+            except (ImportError, AttributeError, RuntimeError):
+                self._npu_dit_fused_conv_pack_enabled = False
+                logger.warning(
+                    "MiniCPM-o native causal Conv pack unavailable; compiling the standard Conv+MLP graph",
+                    exc_info=True,
+                )
         try:
             graph_fn = self._get_npu_dit_conv_mlp_graph()
             if graph_fn is None:
@@ -521,11 +608,11 @@ class BatchedToken2Wav(nn.Module):
                     modulation,
                     modulation,
                     modulation,
-                    conv1.weight,
+                    self._dit_conv_graph_weight(conv1),
                     conv1.bias,
                     conv_norm.weight,
                     conv_norm.bias,
-                    conv2.weight,
+                    self._dit_conv_graph_weight(conv2),
                     conv2.bias,
                     block.mlp.fc1.weight,
                     block.mlp.fc1.bias,
@@ -547,13 +634,26 @@ class BatchedToken2Wav(nn.Module):
 
             _ensure_torchair_broadcast_alias()
             compiler_config = torchair.CompilerConfig()
+            graph_partition = (
+                _dit_fused_conv_mlp_residual
+                if self._npu_dit_fused_conv_pack_enabled
+                else _dit_conv_mlp_residual
+            )
             self._npu_dit_conv_mlp_graph = torch.compile(
-                _dit_conv_mlp_residual,
+                graph_partition,
                 backend=torchair.get_npu_backend(compiler_config=compiler_config),
                 fullgraph=True,
                 dynamic=False,
             )
         return self._npu_dit_conv_mlp_graph
+
+    def _dit_conv_graph_weight(self, convolution: nn.Conv1d) -> torch.Tensor:
+        if not self._npu_dit_fused_conv_pack_enabled:
+            return convolution.weight
+        flat_weight = getattr(convolution, "_minicpmo_flat_weight", None)
+        if not isinstance(flat_weight, torch.Tensor):
+            raise RuntimeError("MiniCPM-o native causal Conv weight was not prepacked")
+        return flat_weight
 
     def _timeline_for(self, value: torch.Tensor) -> torch.Tensor:
         key = (value.device.type, value.device.index, value.dtype)
@@ -781,8 +881,8 @@ class BatchedToken2Wav(nn.Module):
         )
         return result, cnn_out, att_out
 
-    @staticmethod
     def _estimator_blocks_forward_chunk_mlp_graph(
+        self,
         estimator: nn.Module,
         estimator_input: torch.Tensor,
         time_embedding: torch.Tensor,
@@ -878,11 +978,11 @@ class BatchedToken2Wav(nn.Module):
                     shift_mlp,
                     scale_mlp,
                     gate_mlp,
-                    conv1.weight,
+                    self._dit_conv_graph_weight(conv1),
                     conv1.bias,
                     conv_norm.weight,
                     conv_norm.bias,
-                    conv2.weight,
+                    self._dit_conv_graph_weight(conv2),
                     conv2.bias,
                     block.mlp.fc1.weight,
                     block.mlp.fc1.bias,

@@ -397,6 +397,32 @@ was exact and 30.6% faster in isolation. The combined Conv+MLP boundary was
 14-17% faster than two graph partitions in isolation, with 0.00048828125
 maximum BF16 output drift and exact cache output.
 
+The current profile additionally enables
+`npu_dit_fused_conv_pack`. vLLM-Ascend now owns a fixed-shape AscendC operator
+that fuses causal-window packing and two-frame cache update on AIV cores; the
+existing Cube `Linear` performs the dense projection. This is deliberately a
+two-engine boundary rather than an unsafe single-source AIV/Cube megakernel:
+CANN does not provide a portable grid-wide synchronization point between the
+vector packing phase and a following Cube projection inside this operator.
+TorchAir sees the operator through an explicit AscendIR converter, so it stays
+inside the wider Conv+MLP graph and preserves graph replay.
+
+On the measured 910C, one BF16 Conv/cache boundary improved 28.68%, while the
+complete two-Conv + MLP graph improved 5.37%. FP16, FP32, and BF16 packing and
+cache outputs were bit-exact; a focused FP32 TorchAir graph also compiled and
+returned zero maximum error. The BF16 graph hidden-state maximum/mean absolute
+errors were 0.03125/0.00001360 due to GEMM accumulation order. These are
+performance and numerical screens; they do not replace the three official
+accuracy gates.
+
+A matched resident A/B then isolated the native fused-pack switch on the CFM6
+megagraph profile. Across two 32-request Seed-TTS runs per variant, mean
+serving duration fell 6.99%, mean E2E fell 7.01%, mean audio TTFP fell 4.42%,
+and mean per-chunk RTF fell 6.63%. P99 E2E/audio TTFP/per-chunk RTF improved
+9.88%/5.18%/4.38%. All 128 requests succeeded with 100% continuity and
+identical token, frame, and audio-duration totals. Full competition accuracy
+qualification remains pending.
+
 On `DevEnv_132987`, the resident 32-row Seed-TTS A/B completed 32/32 with the
 same 2,649 generated tokens, 298.92 seconds of audio, and 100% continuity. The
 megagraph reduced serving duration 3.13%, mean whole-audio RTF 4.41%, mean
@@ -465,5 +491,5 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Fixed-width DiT Conv+MLP megagraph | Implemented, opt-in; isolated partition -14-17%, real mean audio RTF -4.41%, paired EN8 WER unchanged and SIM +0.000077; full competition qualification pending |
 | HiFT inference weight-norm materialization | Implemented, opt-in; DevEnv_132987 three-run median mean chunk RTF -2.02%, mean whole-audio RTF -1.97%, E2E -1.91%, matched EN8 WER 0.0000 and proxy SIM +0.00032; full competition qualification still required before default-on promotion |
 | Broader cache-shape-bucketed DiT graph partitions | Stock SDPA operator gate rejected: fixed 384/512 cache widths were 8.1-12.8% slower before copy; retry only as part of a larger fused CANN boundary |
-| Ascend-specific DiT layout/cache kernels | Profiler-triggered fallback if partitioning cannot remove launch overhead |
+| Native AscendC DiT causal-pack/cache kernel | Implemented, opt-in; FP16/FP32/BF16 state exact, Conv/cache boundary -28.7%, full BF16 Conv+MLP graph -5.37%, resident mean E2E -7.01% and per-chunk RTF -6.63%; official qualification pending |
 | Deployment-distribution distillation/LoRA | Research fallback, not serving baseline |

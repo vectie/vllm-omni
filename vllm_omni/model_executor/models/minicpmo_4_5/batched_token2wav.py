@@ -19,6 +19,7 @@ import torch.nn.functional as F
 _SILENCE_TOKEN = 4218
 _NPU_DIT_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH"
 _NPU_DIT_MLP_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH"
+_NPU_DIT_GRAPH_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS"
 _NPU_DIT_PREAMBLE_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH"
 _NPU_DIT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH"
 _NPU_DIT_FUSED_CONV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_PACK"
@@ -147,6 +148,26 @@ def _npu_dit_mlp_graph_width(config_value: Any = None) -> int:
     return width
 
 
+def _npu_dit_graph_buckets(config_value: Any = None) -> tuple[int, ...]:
+    """Return additional static DiT widths to compile beside the stream width."""
+    env_value = os.environ.get(_NPU_DIT_GRAPH_BUCKETS_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw in (None, ""):
+        return ()
+    values = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    widths: list[int] = []
+    for value in values:
+        try:
+            width = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid {_NPU_DIT_GRAPH_BUCKETS_ENV}={raw!r}") from exc
+        if width <= 0:
+            raise ValueError(f"{_NPU_DIT_GRAPH_BUCKETS_ENV} widths must be positive, got {width}")
+        if width not in widths:
+            widths.append(width)
+    return tuple(widths)
+
+
 def _ensure_torchair_broadcast_alias() -> None:
     """Repair a TorchAir registration-order incompatibility in vLLM workers.
 
@@ -211,9 +232,10 @@ def _dit_attention_preamble(
     scale_msa = modulation[:, :, 512:1024]
     hidden = F.layer_norm(x, (512,), eps=1e-6)
     hidden = hidden * (1 + scale_msa) + shift_msa
-    q = F.linear(hidden, q_weight, q_bias).reshape(2, 50, 8, 64).transpose(1, 2)
-    k = F.linear(hidden, k_weight, k_bias).reshape(2, 50, 8, 64).transpose(1, 2)
-    v = F.linear(hidden, v_weight, v_bias).reshape(2, 50, 8, 64).transpose(1, 2)
+    width = x.shape[1]
+    q = F.linear(hidden, q_weight, q_bias).reshape(2, width, 8, 64).transpose(1, 2)
+    k = F.linear(hidden, k_weight, k_bias).reshape(2, width, 8, 64).transpose(1, 2)
+    v = F.linear(hidden, v_weight, v_bias).reshape(2, width, 8, 64).transpose(1, 2)
     q = F.layer_norm(q, (64,), q_norm_weight, q_norm_bias, 1e-5)
     k = F.layer_norm(k, (64,), k_norm_weight, k_norm_bias, 1e-5)
     return modulation, q, k, v
@@ -452,6 +474,7 @@ class BatchedToken2Wav(nn.Module):
         *,
         npu_dit_mlp_graph: Any = None,
         npu_dit_mlp_graph_width: Any = None,
+        npu_dit_graph_buckets: Any = None,
         npu_dit_preamble_graph: Any = None,
         npu_dit_conv_mlp_graph: Any = None,
         npu_dit_fused_conv_pack: Any = None,
@@ -506,12 +529,18 @@ class BatchedToken2Wav(nn.Module):
         self._npu_cfm_graph_disabled = False
         self._npu_dit_mlp_graph_enabled = _npu_dit_mlp_graph_enabled(npu_dit_mlp_graph)
         self._npu_dit_mlp_graph_width = _npu_dit_mlp_graph_width(npu_dit_mlp_graph_width)
+        extra_graph_widths = _npu_dit_graph_buckets(npu_dit_graph_buckets)
+        self._npu_dit_graph_widths = tuple(
+            dict.fromkeys((self._npu_dit_mlp_graph_width, *extra_graph_widths))
+        )
         self._npu_dit_mlp_graph: Any | None = None
         self._npu_dit_mlp_graph_disabled = False
+        self._npu_dit_mlp_graph_disabled_widths: set[int] = set()
         self._npu_dit_mlp_graph_used = False
         self._npu_dit_preamble_graph_enabled = _npu_dit_preamble_graph_enabled(npu_dit_preamble_graph)
         self._npu_dit_preamble_graph: Any | None = None
         self._npu_dit_preamble_graph_disabled = False
+        self._npu_dit_preamble_graph_disabled_widths: set[int] = set()
         self._npu_dit_preamble_graph_used = False
         self._npu_dit_conv_mlp_graph_enabled = _npu_dit_conv_mlp_graph_enabled(npu_dit_conv_mlp_graph)
         self._npu_dit_conv_mlp_graph: Any | None = None
@@ -544,37 +573,42 @@ class BatchedToken2Wav(nn.Module):
             self._npu_dit_mlp_graph_disabled = True
             logger.warning("MiniCPM-o NPU DiT MLP graph disabled: estimator is not on NPU")
             return
-        width = self._npu_dit_mlp_graph_width
         hidden_size = int(weight.shape[1])
-        x = weight.new_zeros((2, width, hidden_size))
         shift = weight.new_zeros((2, 1, hidden_size))
         scale = weight.new_zeros((2, 1, hidden_size))
         gate = weight.new_zeros((2, 1, hidden_size))
-        try:
-            graph_fn = self._get_npu_dit_mlp_graph()
-            if graph_fn is None:
-                return
-            with torch.inference_mode():
-                graph_fn(
-                    x,
-                    shift,
-                    scale,
-                    gate,
-                    block.mlp.fc1.weight,
-                    block.mlp.fc1.bias,
-                    block.mlp.fc2.weight,
-                    block.mlp.fc2.bias,
+        graph_fn = self._get_npu_dit_mlp_graph()
+        if graph_fn is None:
+            return
+        for width in self._npu_dit_graph_widths:
+            try:
+                x = weight.new_zeros((2, width, hidden_size))
+                with torch.inference_mode():
+                    graph_fn(
+                        x,
+                        shift,
+                        scale,
+                        gate,
+                        block.mlp.fc1.weight,
+                        block.mlp.fc1.bias,
+                        block.mlp.fc2.weight,
+                        block.mlp.fc2.bias,
+                    )
+                torch.npu.synchronize()
+                logger.info(
+                    "Compiled MiniCPM-o NPU DiT MLP graph partition for CFG batch=2, width=%d, hidden=%d",
+                    width,
+                    hidden_size,
                 )
-            torch.npu.synchronize()
-            logger.info(
-                "Compiled MiniCPM-o NPU DiT MLP graph partition for CFG batch=2, width=%d, hidden=%d",
-                width,
-                hidden_size,
-            )
-        except Exception:
-            self._npu_dit_mlp_graph = None
+            except Exception:
+                self._npu_dit_mlp_graph_disabled_widths.add(width)
+                logger.warning(
+                    "MiniCPM-o NPU DiT MLP graph compilation failed at width=%d; using eager blocks for that width",
+                    width,
+                    exc_info=True,
+                )
+        if self._npu_dit_mlp_graph_width in self._npu_dit_mlp_graph_disabled_widths:
             self._npu_dit_mlp_graph_disabled = True
-            logger.warning("MiniCPM-o NPU DiT MLP graph compilation failed; using eager blocks", exc_info=True)
 
     def _get_npu_dit_mlp_graph(self):
         if self._npu_dit_mlp_graph_disabled:
@@ -595,7 +629,7 @@ class BatchedToken2Wav(nn.Module):
     @staticmethod
     def _dit_preamble_compatible(block: nn.Module, width: int) -> bool:
         return (
-            width == 50
+            width > 0
             and not block.training
             and int(block.attn.num_heads) == 8
             and int(block.attn.head_dim) == 64
@@ -626,35 +660,44 @@ class BatchedToken2Wav(nn.Module):
                 "MiniCPM-o NPU DiT preamble graph disabled: estimator does not match the fixed 2x50x512, 8x64 layout"
             )
             return
-        x = weight.new_zeros((2, 50, 512))
         time_embedding = weight.new_zeros((2, 1, 512))
-        try:
-            graph_fn = self._get_npu_dit_preamble_graph()
-            if graph_fn is None:
-                return
-            with torch.inference_mode():
-                graph_fn(
-                    x,
-                    time_embedding,
-                    block.adaLN_modulation[1].weight,
-                    block.adaLN_modulation[1].bias,
-                    block.attn.to_q.weight,
-                    block.attn.to_q.bias,
-                    block.attn.to_k.weight,
-                    block.attn.to_k.bias,
-                    block.attn.to_v.weight,
-                    block.attn.to_v.bias,
-                    block.attn.q_norm.weight,
-                    block.attn.q_norm.bias,
-                    block.attn.k_norm.weight,
-                    block.attn.k_norm.bias,
+        graph_fn = self._get_npu_dit_preamble_graph()
+        if graph_fn is None:
+            return
+        for width in self._npu_dit_graph_widths:
+            try:
+                x = weight.new_zeros((2, width, 512))
+                with torch.inference_mode():
+                    graph_fn(
+                        x,
+                        time_embedding,
+                        block.adaLN_modulation[1].weight,
+                        block.adaLN_modulation[1].bias,
+                        block.attn.to_q.weight,
+                        block.attn.to_q.bias,
+                        block.attn.to_k.weight,
+                        block.attn.to_k.bias,
+                        block.attn.to_v.weight,
+                        block.attn.to_v.bias,
+                        block.attn.q_norm.weight,
+                        block.attn.q_norm.bias,
+                        block.attn.k_norm.weight,
+                        block.attn.k_norm.bias,
+                    )
+                torch.npu.synchronize()
+                logger.info(
+                    "Compiled MiniCPM-o NPU DiT attention preamble graph for 2x%dx512, 8x64 heads",
+                    width,
                 )
-            torch.npu.synchronize()
-            logger.info("Compiled MiniCPM-o NPU DiT attention preamble graph for 2x50x512, 8x64 heads")
-        except Exception:
-            self._npu_dit_preamble_graph = None
+            except Exception:
+                self._npu_dit_preamble_graph_disabled_widths.add(width)
+                logger.warning(
+                    "MiniCPM-o NPU DiT preamble graph compilation failed at width=%d; using eager attention for that width",
+                    width,
+                    exc_info=True,
+                )
+        if self._npu_dit_mlp_graph_width in self._npu_dit_preamble_graph_disabled_widths:
             self._npu_dit_preamble_graph_disabled = True
-            logger.warning("MiniCPM-o NPU DiT preamble graph compilation failed; using eager attention", exc_info=True)
 
     def _get_npu_dit_preamble_graph(self):
         if self._npu_dit_preamble_graph_disabled:
@@ -991,25 +1034,34 @@ class BatchedToken2Wav(nn.Module):
         cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
-        graph_width = self._npu_dit_mlp_graph_width
+        graph_width = int(estimator_input.shape[2])
         use_mlp_graph = (
             self._npu_dit_mlp_graph_enabled
             and not self._npu_dit_mlp_graph_disabled
             and estimator_input.device.type == "npu"
             and int(estimator_input.shape[0]) == 2
-            and int(estimator_input.shape[2]) == graph_width
-            and cnn_cache is not None
-            and att_cache is not None
+            and graph_width in self._npu_dit_graph_widths
+            and graph_width not in self._npu_dit_mlp_graph_disabled_widths
         )
         if use_mlp_graph:
             try:
                 graph_fn = self._get_npu_dit_mlp_graph()
                 if graph_fn is not None:
                     preamble_graph_fn = None
-                    if self._npu_dit_preamble_graph_enabled and not self._npu_dit_preamble_graph_disabled:
+                    if (
+                        self._npu_dit_preamble_graph_enabled
+                        and not self._npu_dit_preamble_graph_disabled
+                        and graph_width not in self._npu_dit_preamble_graph_disabled_widths
+                    ):
                         preamble_graph_fn = self._get_npu_dit_preamble_graph()
                     conv_mlp_graph_fn = None
-                    if self._npu_dit_conv_mlp_graph_enabled and not self._npu_dit_conv_mlp_graph_disabled:
+                    if (
+                        graph_width == self._npu_dit_mlp_graph_width
+                        and cnn_cache is not None
+                        and att_cache is not None
+                        and self._npu_dit_conv_mlp_graph_enabled
+                        and not self._npu_dit_conv_mlp_graph_disabled
+                    ):
                         conv_mlp_graph_fn = self._get_npu_dit_conv_mlp_graph()
                     result = self._estimator_blocks_forward_chunk_mlp_graph(
                         estimator,
@@ -1044,9 +1096,12 @@ class BatchedToken2Wav(nn.Module):
                         self._npu_dit_conv_mlp_graph_used = True
                     return result, cnn_out, att_out
             except Exception:
-                self._npu_dit_mlp_graph = None
-                self._npu_dit_mlp_graph_disabled = True
-                logger.warning("MiniCPM-o NPU DiT MLP graph execution failed; using eager blocks", exc_info=True)
+                self._npu_dit_mlp_graph_disabled_widths.add(graph_width)
+                logger.warning(
+                    "MiniCPM-o NPU DiT graph execution failed at width=%d; using eager blocks for that width",
+                    graph_width,
+                    exc_info=True,
+                )
         result = estimator.blocks_forward_chunk(
             estimator_input,
             time_embedding,
@@ -1071,7 +1126,7 @@ class BatchedToken2Wav(nn.Module):
         preamble_graph_fn: Any | None = None,
         conv_mlp_graph_fn: Any | None = None,
     ) -> torch.Tensor:
-        """Replay enabled fixed-width partitions with exact eager fallbacks."""
+        """Replay enabled shape-bucketed partitions with exact eager fallbacks."""
         hidden = estimator.in_proj(estimator_input.transpose(1, 2))
         for block_idx, block in enumerate(estimator.blocks):
             if block.training or block.norm2.weight is not None or block.norm2.bias is not None:

@@ -18,6 +18,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_fused_conv_block_enabled,
     _npu_dit_fused_conv_linear_enabled,
     _npu_dit_fused_conv_pack_enabled,
+    _npu_dit_graph_buckets,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
     _npu_dit_preamble_graph_enabled,
@@ -386,9 +387,10 @@ def test_dit_mlp_residual_matches_eager_block_math():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_dit_attention_preamble_matches_eager_block_math():
+@pytest.mark.parametrize("width", [20, 50, 302])
+def test_dit_attention_preamble_matches_eager_block_math(width: int):
     torch.manual_seed(11)
-    x = torch.randn(2, 50, 512)
+    x = torch.randn(2, width, 512)
     time_embedding = torch.randn(2, 1, 512)
     adaln = nn.Linear(512, 9 * 512)
     to_q = nn.Linear(512, 512)
@@ -400,9 +402,9 @@ def test_dit_attention_preamble_matches_eager_block_math():
     modulation = adaln(F.silu(time_embedding))
     shift_msa, scale_msa = modulation.chunk(9, dim=-1)[:2]
     hidden = F.layer_norm(x, (512,), eps=1e-6) * (1 + scale_msa) + shift_msa
-    q = q_norm(to_q(hidden).reshape(2, 50, 8, 64).transpose(1, 2))
-    k = k_norm(to_k(hidden).reshape(2, 50, 8, 64).transpose(1, 2))
-    v = to_v(hidden).reshape(2, 50, 8, 64).transpose(1, 2)
+    q = q_norm(to_q(hidden).reshape(2, width, 8, 64).transpose(1, 2))
+    k = k_norm(to_k(hidden).reshape(2, width, 8, 64).transpose(1, 2))
+    v = to_v(hidden).reshape(2, width, 8, 64).transpose(1, 2)
 
     actual = _dit_attention_preamble(
         x,
@@ -701,6 +703,21 @@ def test_npu_dit_mlp_graph_config_is_used_without_environment(monkeypatch):
 
     assert _npu_dit_mlp_graph_enabled(True) is True
     assert _npu_dit_mlp_graph_width(64) == 64
+
+
+def test_npu_dit_graph_buckets_support_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS", raising=False)
+    assert _npu_dit_graph_buckets([20, 302, 20]) == (20, 302)
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS", "302,20")
+    assert _npu_dit_graph_buckets([64]) == (302, 20)
+
+
+@pytest.mark.parametrize("value", ["0,20", "-1", "20,bad"])
+def test_invalid_npu_dit_graph_buckets_are_rejected(monkeypatch, value: str):
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS", value)
+    with pytest.raises(ValueError, match="NPU_DIT_GRAPH_BUCKETS"):
+        _npu_dit_graph_buckets()
 
 
 def test_npu_dit_preamble_graph_config_and_environment(monkeypatch):

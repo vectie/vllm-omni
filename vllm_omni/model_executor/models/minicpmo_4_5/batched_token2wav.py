@@ -22,6 +22,7 @@ _NPU_DIT_MLP_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH"
 _NPU_DIT_GRAPH_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS"
 _NPU_DIT_PREAMBLE_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH"
 _NPU_DIT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH"
+_NPU_DIT_PROMPT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PROMPT_CONV_MLP_GRAPH"
 _NPU_DIT_FUSED_CONV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_PACK"
 _NPU_DIT_FUSED_CONV_BLOCK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_BLOCK"
 _NPU_DIT_FUSED_CONV_LINEAR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR"
@@ -89,6 +90,21 @@ def _npu_dit_conv_mlp_graph_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_DIT_CONV_MLP_GRAPH_ENV}={raw!r}")
+
+
+def _npu_dit_prompt_conv_mlp_graph_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_PROMPT_CONV_MLP_GRAPH_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_PROMPT_CONV_MLP_GRAPH_ENV}={raw!r}")
 
 
 def _npu_dit_fused_conv_pack_enabled(config_value: Any = None) -> bool:
@@ -477,6 +493,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_graph_buckets: Any = None,
         npu_dit_preamble_graph: Any = None,
         npu_dit_conv_mlp_graph: Any = None,
+        npu_dit_prompt_conv_mlp_graph: Any = None,
         npu_dit_fused_conv_pack: Any = None,
         npu_dit_fused_conv_block: Any = None,
         npu_dit_fused_conv_linear: Any = None,
@@ -546,6 +563,12 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_conv_mlp_graph: Any | None = None
         self._npu_dit_conv_mlp_graph_disabled = False
         self._npu_dit_conv_mlp_graph_used = False
+        self._npu_dit_prompt_conv_mlp_graph_enabled = _npu_dit_prompt_conv_mlp_graph_enabled(
+            npu_dit_prompt_conv_mlp_graph
+        )
+        self._npu_dit_prompt_conv_mlp_graph: Any | None = None
+        self._npu_dit_prompt_conv_mlp_graph_disabled_widths: set[int] = set()
+        self._npu_dit_prompt_conv_mlp_graph_used_widths: set[int] = set()
         self._npu_dit_fused_conv_pack_enabled = _npu_dit_fused_conv_pack_enabled(npu_dit_fused_conv_pack)
         self._npu_dit_fused_conv_pack_used = False
         self._npu_dit_fused_conv_block_enabled = _npu_dit_fused_conv_block_enabled(npu_dit_fused_conv_block)
@@ -555,6 +578,7 @@ class BatchedToken2Wav(nn.Module):
         self._warmup_npu_dit_mlp_graph()
         self._warmup_npu_dit_preamble_graph()
         self._warmup_npu_dit_conv_mlp_graph()
+        self._warmup_npu_dit_prompt_conv_mlp_graphs()
 
     def _warmup_npu_dit_mlp_graph(self) -> None:
         """Compile the fixed-width post-convolution partition during startup."""
@@ -716,12 +740,11 @@ class BatchedToken2Wav(nn.Module):
         return self._npu_dit_preamble_graph
 
     @staticmethod
-    def _dit_conv_mlp_compatible(block: nn.Module, width: int) -> bool:
+    def _dit_conv_mlp_layout_compatible(block: nn.Module) -> bool:
         conv1 = block.conv.block[1]
         conv2 = block.conv.block[6]
         return (
-            width == 50
-            and not block.training
+            not block.training
             and int(conv1.in_channels) == 512
             and int(conv1.out_channels) == 512
             and tuple(conv1.kernel_size) == (3,)
@@ -735,6 +758,10 @@ class BatchedToken2Wav(nn.Module):
             and int(block.mlp.fc1.out_features) == 2048
             and int(block.mlp.fc2.out_features) == 512
         )
+
+    @staticmethod
+    def _dit_conv_mlp_compatible(block: nn.Module, width: int) -> bool:
+        return width == 50 and BatchedToken2Wav._dit_conv_mlp_layout_compatible(block)
 
     def _warmup_npu_dit_conv_mlp_graph(self) -> None:
         if not self._npu_dit_conv_mlp_graph_enabled:
@@ -855,6 +882,98 @@ class BatchedToken2Wav(nn.Module):
                 dynamic=False,
             )
         return self._npu_dit_conv_mlp_graph
+
+    def _warmup_npu_dit_prompt_conv_mlp_graphs(self) -> None:
+        """Compile regular Conv/cache + MLP graphs for non-stream buckets.
+
+        The width-50 stream graph keeps its native causal-pack kernel. Wider
+        setup/finalization buckets use the standard Conv1d partition so GE can
+        optimize its layout transitions without depending on a fixed-width
+        custom converter.
+        """
+        if not self._npu_dit_prompt_conv_mlp_graph_enabled:
+            return
+        widths = tuple(
+            width for width in self._npu_dit_graph_widths if width != self._npu_dit_mlp_graph_width
+        )
+        if not widths:
+            return
+        estimator = getattr(getattr(self.flow, "decoder", None), "estimator", None)
+        blocks = getattr(estimator, "blocks", None)
+        block = blocks[0] if blocks else None
+        weight = getattr(
+            getattr(getattr(block, "mlp", None), "fc1", None),
+            "weight",
+            None,
+        )
+        if (
+            block is None
+            or not isinstance(weight, torch.Tensor)
+            or weight.device.type != "npu"
+            or not self._dit_conv_mlp_layout_compatible(block)
+        ):
+            self._npu_dit_prompt_conv_mlp_graph_disabled_widths.update(widths)
+            logger.warning(
+                "MiniCPM-o NPU prompt Conv+MLP graphs disabled: block layout is incompatible"
+            )
+            return
+        graph_fn = self._get_npu_dit_prompt_conv_mlp_graph()
+        if graph_fn is None:
+            return
+        modulation = weight.new_zeros((2, 1, 512))
+        cnn_cache = weight.new_zeros((2, 1024, 2))
+        conv1 = block.conv.block[1]
+        conv_norm = block.conv.block[3]
+        conv2 = block.conv.block[6]
+        for width in widths:
+            try:
+                hidden = weight.new_zeros((2, width, 512))
+                with torch.inference_mode():
+                    graph_fn(
+                        hidden,
+                        hidden,
+                        cnn_cache,
+                        modulation,
+                        modulation,
+                        modulation,
+                        modulation,
+                        conv1.weight,
+                        conv1.bias,
+                        conv_norm.weight,
+                        conv_norm.bias,
+                        conv2.weight,
+                        conv2.bias,
+                        block.mlp.fc1.weight,
+                        block.mlp.fc1.bias,
+                        block.mlp.fc2.weight,
+                        block.mlp.fc2.bias,
+                    )
+                torch.npu.synchronize()
+                logger.info(
+                    "Compiled MiniCPM-o NPU prompt Conv+MLP megagraph for 2x%dx512",
+                    width,
+                )
+            except Exception:
+                self._npu_dit_prompt_conv_mlp_graph_disabled_widths.add(width)
+                logger.warning(
+                    "MiniCPM-o NPU prompt Conv+MLP graph compilation failed at width=%d; using split path",
+                    width,
+                    exc_info=True,
+                )
+
+    def _get_npu_dit_prompt_conv_mlp_graph(self):
+        if self._npu_dit_prompt_conv_mlp_graph is None:
+            from torch_npu.dynamo import torchair
+
+            _ensure_torchair_broadcast_alias()
+            compiler_config = torchair.CompilerConfig()
+            self._npu_dit_prompt_conv_mlp_graph = torch.compile(
+                _dit_conv_mlp_residual,
+                backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self._npu_dit_prompt_conv_mlp_graph
 
     def _dit_conv_graph_weight(self, convolution: nn.Conv1d) -> torch.Tensor:
         if not (
@@ -1055,6 +1174,7 @@ class BatchedToken2Wav(nn.Module):
                     ):
                         preamble_graph_fn = self._get_npu_dit_preamble_graph()
                     conv_mlp_graph_fn = None
+                    conv_mlp_standard_weights = False
                     if (
                         graph_width == self._npu_dit_mlp_graph_width
                         and cnn_cache is not None
@@ -1063,6 +1183,13 @@ class BatchedToken2Wav(nn.Module):
                         and not self._npu_dit_conv_mlp_graph_disabled
                     ):
                         conv_mlp_graph_fn = self._get_npu_dit_conv_mlp_graph()
+                    elif (
+                        graph_width != self._npu_dit_mlp_graph_width
+                        and self._npu_dit_prompt_conv_mlp_graph_enabled
+                        and graph_width not in self._npu_dit_prompt_conv_mlp_graph_disabled_widths
+                    ):
+                        conv_mlp_graph_fn = self._get_npu_dit_prompt_conv_mlp_graph()
+                        conv_mlp_standard_weights = conv_mlp_graph_fn is not None
                     result = self._estimator_blocks_forward_chunk_mlp_graph(
                         estimator,
                         estimator_input,
@@ -1074,6 +1201,7 @@ class BatchedToken2Wav(nn.Module):
                         graph_fn,
                         preamble_graph_fn,
                         conv_mlp_graph_fn,
+                        conv_mlp_standard_weights,
                     )
                     if not self._npu_dit_mlp_graph_used:
                         logger.info(
@@ -1084,7 +1212,14 @@ class BatchedToken2Wav(nn.Module):
                     if preamble_graph_fn is not None and not self._npu_dit_preamble_graph_used:
                         logger.info("MiniCPM-o NPU DiT attention preamble graph replay active")
                         self._npu_dit_preamble_graph_used = True
-                    if conv_mlp_graph_fn is not None and not self._npu_dit_conv_mlp_graph_used:
+                    if conv_mlp_graph_fn is not None and conv_mlp_standard_weights:
+                        if graph_width not in self._npu_dit_prompt_conv_mlp_graph_used_widths:
+                            logger.info(
+                                "MiniCPM-o NPU prompt Conv+MLP megagraph replay active at width=%d",
+                                graph_width,
+                            )
+                            self._npu_dit_prompt_conv_mlp_graph_used_widths.add(graph_width)
+                    elif conv_mlp_graph_fn is not None and not self._npu_dit_conv_mlp_graph_used:
                         if self._npu_dit_fused_conv_linear_enabled:
                             logger.info("MiniCPM-o NPU DiT fused Conv+Linear + MLP graph replay active")
                             self._npu_dit_fused_conv_linear_used = True
@@ -1125,6 +1260,7 @@ class BatchedToken2Wav(nn.Module):
         graph_fn: Any,
         preamble_graph_fn: Any | None = None,
         conv_mlp_graph_fn: Any | None = None,
+        conv_mlp_standard_weights: bool = False,
     ) -> torch.Tensor:
         """Replay enabled shape-bucketed partitions with exact eager fallbacks."""
         hidden = estimator.in_proj(estimator_input.transpose(1, 2))
@@ -1197,24 +1333,27 @@ class BatchedToken2Wav(nn.Module):
                     block.mlp.fc2.bias,
                 )
             else:
-                if not BatchedToken2Wav._dit_conv_mlp_compatible(block, int(hidden.shape[1])):
+                if not BatchedToken2Wav._dit_conv_mlp_layout_compatible(block):
                     raise RuntimeError("MiniCPM-o NPU DiT Conv+MLP graph encountered an incompatible block")
                 conv1 = block.conv.block[1]
                 conv_norm = block.conv.block[3]
                 conv2 = block.conv.block[6]
+                block_cnn_cache = old_cnn[block_idx]
+                if block_cnn_cache is None:
+                    block_cnn_cache = hidden.new_zeros((hidden.shape[0], 1024, 2))
                 hidden, new_cnn = conv_mlp_graph_fn(
                     hidden,
                     conv_input,
-                    old_cnn[block_idx],
+                    block_cnn_cache,
                     gate_conv,
                     shift_mlp,
                     scale_mlp,
                     gate_mlp,
-                    self._dit_conv_graph_weight(conv1),
+                    conv1.weight if conv_mlp_standard_weights else self._dit_conv_graph_weight(conv1),
                     conv1.bias,
                     conv_norm.weight,
                     conv_norm.bias,
-                    self._dit_conv_graph_weight(conv2),
+                    conv2.weight if conv_mlp_standard_weights else self._dit_conv_graph_weight(conv2),
                     conv2.bias,
                     block.mlp.fc1.weight,
                     block.mlp.fc1.bias,

@@ -22,6 +22,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
     _npu_dit_preamble_graph_enabled,
+    _npu_dit_prompt_conv_mlp_graph_enabled,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -446,10 +447,11 @@ def test_attention_from_projected_qkv_matches_cached_sdpa_math():
     torch.testing.assert_close(new_cache, torch.cat((full_k, full_v), dim=3), rtol=0, atol=0)
 
 
-def test_dit_conv_mlp_residual_matches_partition_math():
+@pytest.mark.parametrize("width", [20, 50, 302])
+def test_dit_conv_mlp_residual_matches_partition_math(width: int):
     torch.manual_seed(13)
-    hidden = torch.randn(2, 50, 512)
-    conv_input = torch.randn(2, 50, 512)
+    hidden = torch.randn(2, width, 512)
+    conv_input = torch.randn(2, width, 512)
     cache = torch.randn(2, 1024, 2)
     gate_conv = torch.randn(2, 1, 512)
     shift_mlp = torch.randn(2, 1, 512)
@@ -742,6 +744,18 @@ def test_npu_dit_conv_mlp_graph_config_and_environment(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH", "sometimes")
     with pytest.raises(ValueError, match="NPU_DIT_CONV_MLP_GRAPH"):
         _npu_dit_conv_mlp_graph_enabled()
+
+
+def test_npu_dit_prompt_conv_mlp_graph_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_PROMPT_CONV_MLP_GRAPH", raising=False)
+    assert _npu_dit_prompt_conv_mlp_graph_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_PROMPT_CONV_MLP_GRAPH", "off")
+    assert _npu_dit_prompt_conv_mlp_graph_enabled(True) is False
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_PROMPT_CONV_MLP_GRAPH", "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_PROMPT_CONV_MLP_GRAPH"):
+        _npu_dit_prompt_conv_mlp_graph_enabled()
 
 
 def test_npu_dit_fused_conv_pack_config_and_environment(monkeypatch):

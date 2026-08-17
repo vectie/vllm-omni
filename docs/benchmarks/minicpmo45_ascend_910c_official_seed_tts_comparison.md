@@ -2743,3 +2743,31 @@ a7a92998e8b6018e144848451114df0c0eaba0e0eacb0266891c14c0a907fb46  micro-stage0.l
 d17d90c7ca78ad195a85462157cd06a636884839b72f194cc86b52f6e57abd67  control-run2.json
 085bb5a82d07c5227d5654fa22b123b3f34b0036c6512b0b34755e71720ac08f  control-run3.json
 ```
+
+### Wider-stage screening
+
+Stages 1 and 2 were also screened at their derived steady shapes. In
+isolation, their three-block eager/graph totals were 3,542.261/1,704.709 us
+(2.078x) and 3,651.084/1,693.272 us (2.156x), respectively. All six graph
+outputs again had maximum absolute error `0.0`.
+
+Those microbenchmark wins were not additive in the complete service. A
+diagnostic candidate compiled and replayed all nine blocks across stages 0,
+1, and 2 without fallback, but its first warmed 32-row run took 45.941 s. That
+is 4.09% slower than the 44.136-second control median and 10.35% slower than
+the selected 41.632-second stage-0 median. Mean E2E was 1,435.34 ms, mean
+audio TTFP 797.35 ms, and mean chunk RTF 0.351995. It retained 32/32 success,
+100% continuity, and exact aggregate structure, so the loss is execution
+efficiency rather than a correctness failure.
+
+The wider boundary is rejected after this fail-fast run. Additional graph
+residency and GE/layout interactions outweigh the isolated launch savings;
+the committed profile therefore continues to compile stage 0 only.
+
+Additional artifact checksums:
+
+```text
+391cbe2476c75afc5b58490e3a0ea5fb855be4a3db0eab389d67ac3ea6beb1ea  micro-stage1.log
+1b6f5710dd93b5b0649fe413a93592ffaf6f7022da74ed0f4f19720c0f877d2e  micro-stage2.log
+fa4705e403b0d91473e5761138dd39c6725f244b180b73afdf92ad4fc40330c1  all-stages candidate-run1.json
+```

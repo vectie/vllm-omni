@@ -12,6 +12,9 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
    weights after checkpoint loading instead of recomputing them per chunk.
 4. HiFT F0 graph — replay the fixed steady-state five-convolution feature
    stack as one TorchAir graph while retaining the original eager classifier.
+5. HiFT residual graphs — replay one selected fixed-shape vocoder stage as
+   three fused residual-block graphs while keeping upsampling, source fusion,
+   and ISTFT visible to the surrounding eager execution.
 """
 
 from __future__ import annotations
@@ -39,6 +42,9 @@ _HIFT_MATERIALIZE_WEIGHT_NORM_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_W
 _HIFT_F0_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"
 _HIFT_F0_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"
 _HIFT_F0_GRAPH_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_BUCKETS"
+_HIFT_RESBLOCK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH"
+_HIFT_RESBLOCK_GRAPH_STAGE_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_STAGE"
+_HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_MEL_WIDTH"
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -72,6 +78,62 @@ def _hift_f0_graph_buckets() -> tuple[int, ...]:
         if width not in widths:
             widths.append(width)
     return tuple(widths)
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {name}={raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _hift_resblock_graph_stage() -> int:
+    raw = os.environ.get(_HIFT_RESBLOCK_GRAPH_STAGE_ENV, "0")
+    try:
+        stage = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {_HIFT_RESBLOCK_GRAPH_STAGE_ENV}={raw!r}") from exc
+    if stage < 0:
+        raise ValueError(f"{_HIFT_RESBLOCK_GRAPH_STAGE_ENV} must be non-negative, got {stage}")
+    return stage
+
+
+def _conv_transpose_output_width(layer: torch.nn.Module, width: int) -> int:
+    """Return the exact 1-D transposed-convolution output width."""
+    kernel = int(layer.kernel_size[0])
+    stride = int(layer.stride[0])
+    padding = int(layer.padding[0])
+    dilation = int(layer.dilation[0])
+    output_padding = int(layer.output_padding[0])
+    return (width - 1) * stride - 2 * padding + dilation * (kernel - 1) + output_padding + 1
+
+
+def _hift_resblock_stage_shape(
+    hift: torch.nn.Module,
+    *,
+    mel_width: int,
+    stage: int,
+) -> tuple[int, int, int]:
+    """Derive the fixed residual input shape from the checkpoint modules."""
+    upsamples = getattr(hift, "ups", None)
+    if upsamples is None or stage >= len(upsamples):
+        raise ValueError(f"HiFT residual graph stage {stage} is outside the upsample stack")
+    width = mel_width
+    channels = int(hift.conv_pre.out_channels)
+    for index, upsample in enumerate(upsamples):
+        width = _conv_transpose_output_width(upsample, width)
+        channels = int(upsample.out_channels)
+        if index == len(upsamples) - 1:
+            # flashcosyvoice pads the final upsample by one frame before the
+            # source/residual branches.
+            width += 1
+        if index == stage:
+            return (1, channels, width)
+    raise AssertionError("unreachable HiFT residual graph stage")
 
 
 def _ensure_torchair_broadcast_alias() -> None:
@@ -237,6 +299,122 @@ def prepare_hift_f0_graph_for_npu(
     return True
 
 
+def _resblock_with_npu_graph(self, value: torch.Tensor) -> torch.Tensor:
+    """Replay one exact-shape HiFT residual graph with an eager fallback."""
+    if (
+        value.device.type != "npu"
+        or tuple(value.shape) != self._step_audio2_npu_resblock_graph_shape
+        or self._step_audio2_npu_resblock_graph_disabled
+    ):
+        return self._step_audio2_original_forward(value)
+    try:
+        output = self._step_audio2_npu_resblock_graph(value)
+    except Exception:
+        self._step_audio2_npu_resblock_graph_disabled = True
+        logger.warning(
+            "HiFT residual-block graph failed for shape %s; using eager execution",
+            tuple(value.shape),
+            exc_info=True,
+        )
+        return self._step_audio2_original_forward(value)
+    if not self._step_audio2_npu_resblock_graph_replayed:
+        logger.info(
+            "HiFT residual-block graph replay active for shape %s",
+            tuple(value.shape),
+        )
+        self._step_audio2_npu_resblock_graph_replayed = True
+    return output
+
+
+def prepare_hift_resblock_graph_for_npu(
+    hift: torch.nn.Module,
+    *,
+    stage: int,
+    mel_width: int,
+) -> int:
+    """Compile the three residual blocks in one fixed HiFT upsample stage.
+
+    Each flashcosyvoice residual block contains three
+    ``Snake -> Conv1d -> Snake -> Conv1d -> add`` sequences. Compiling at the
+    block boundary removes the intervening Python/operator launch chain while
+    leaving ConvTranspose1d, source injection, and ISTFT outside the graph.
+    Unsupported shapes retain the package's original bound method.
+    """
+    if getattr(hift, "_step_audio2_npu_resblock_graph_patched", False):
+        return 0
+    if mel_width <= 0:
+        raise ValueError(f"HiFT residual graph mel width must be positive, got {mel_width}")
+
+    num_upsamples = int(getattr(hift, "num_upsamples", -1))
+    num_kernels = int(getattr(hift, "num_kernels", -1))
+    residuals = getattr(hift, "resblocks", None)
+    if (
+        num_upsamples <= 0
+        or num_kernels <= 0
+        or residuals is None
+        or len(residuals) != num_upsamples * num_kernels
+    ):
+        raise TypeError("expected the flashcosyvoice staged HiFT residual layout")
+    if stage < 0 or stage >= num_upsamples:
+        raise ValueError(f"HiFT residual graph stage {stage} must be in [0, {num_upsamples})")
+
+    shape = _hift_resblock_stage_shape(hift, mel_width=mel_width, stage=stage)
+    first = residuals[stage * num_kernels]
+    parameter = next(first.parameters(), None)
+    if parameter is None or parameter.device.type != "npu":
+        raise ValueError("HiFT residual graph requires NPU-resident weights")
+
+    # Graph parameters must be immutable, and fetching a parametrized weight
+    # from inside every residual convolution would recreate the work this
+    # optimization is intended to remove.
+    materialize_hift_weight_norm_for_npu(hift)
+
+    from torch_npu.dynamo import torchair
+
+    _ensure_torchair_broadcast_alias()
+    prepared: list[tuple[torch.nn.Module, object, object]] = []
+    for block_index in range(stage * num_kernels, (stage + 1) * num_kernels):
+        block = residuals[block_index]
+        original_forward = block.forward
+        graph = torch.compile(
+            original_forward,
+            backend=torchair.get_npu_backend(compiler_config=torchair.CompilerConfig()),
+            fullgraph=True,
+            dynamic=False,
+        )
+        # Exercise the periodic Snake path as well as convolution bias during
+        # the exactness gate; an all-zero sample would under-test the graph.
+        sample = parameter.new_full(shape, 0.125)
+        with torch.inference_mode():
+            expected = original_forward(sample)
+            actual = graph(sample)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.npu.synchronize()
+
+        prepared.append((block, original_forward, graph))
+
+    # Install only after every sibling compiled and passed the exactness gate.
+    # A failure in one block must leave the whole stage on its original path.
+    for block, original_forward, graph in prepared:
+        block._step_audio2_original_forward = original_forward
+        block._step_audio2_npu_resblock_graph = graph
+        block._step_audio2_npu_resblock_graph_shape = shape
+        block._step_audio2_npu_resblock_graph_disabled = False
+        block._step_audio2_npu_resblock_graph_replayed = False
+        block.forward = MethodType(_resblock_with_npu_graph, block)
+
+    hift._step_audio2_npu_resblock_graph_patched = True
+    hift._step_audio2_npu_resblock_graph_stage = stage
+    hift._step_audio2_npu_resblock_graph_shape = shape
+    logger.info(
+        "Compiled %d HiFT residual-block graphs for stage=%d shape=%s",
+        len(prepared),
+        stage,
+        shape,
+    )
+    return len(prepared)
+
+
 def _linear_downsample_even_scale(x: torch.Tensor, scale: int) -> torch.Tensor:
     """Match ``F.interpolate(..., mode="linear")`` for an even integer scale.
 
@@ -359,6 +537,15 @@ def _patched_ensure_models_loaded(self) -> None:
             )
         except Exception:
             logger.warning("HiFT F0 graph compilation failed; using eager predictor", exc_info=True)
+    if _env_flag_enabled(_HIFT_RESBLOCK_GRAPH_ENV):
+        try:
+            prepare_hift_resblock_graph_for_npu(
+                self._hift,
+                stage=_hift_resblock_graph_stage(),
+                mel_width=_positive_int_env(_HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV, 58),
+            )
+        except Exception:
+            logger.warning("HiFT residual-block graph compilation failed; using eager blocks", exc_info=True)
 
 
 def _patched_forward(self, generated_speech_tokens, prompt_wav, return_bytes=True):

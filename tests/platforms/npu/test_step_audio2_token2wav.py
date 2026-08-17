@@ -231,6 +231,93 @@ def test_hift_weight_norm_materialization_preserves_unrelated_parametrization(
     assert parametrize.is_parametrized(layer, "weight")
 
 
+def test_hift_resblock_stage_shapes_match_flashcosyvoice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    hift = SimpleNamespace(
+        conv_pre=SimpleNamespace(out_channels=512),
+        ups=torch.nn.ModuleList(
+            (
+                torch.nn.ConvTranspose1d(512, 256, 16, stride=8, padding=4),
+                torch.nn.ConvTranspose1d(256, 128, 11, stride=5, padding=3),
+                torch.nn.ConvTranspose1d(128, 64, 7, stride=3, padding=2),
+            )
+        ),
+    )
+
+    assert module._hift_resblock_stage_shape(hift, mel_width=58, stage=0) == (1, 256, 464)
+    assert module._hift_resblock_stage_shape(hift, mel_width=58, stage=1) == (1, 128, 2320)
+    assert module._hift_resblock_stage_shape(hift, mel_width=58, stage=2) == (1, 64, 6961)
+
+
+def test_hift_resblock_graph_uses_eager_fallback_off_npu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    calls: list[str] = []
+
+    block = SimpleNamespace(
+        _step_audio2_npu_resblock_graph_shape=(1, 4, 8),
+        _step_audio2_npu_resblock_graph_disabled=False,
+        _step_audio2_npu_resblock_graph_replayed=False,
+        _step_audio2_original_forward=lambda value: calls.append("eager") or value + 1,
+        _step_audio2_npu_resblock_graph=lambda _value: (_ for _ in ()).throw(
+            AssertionError("CPU must not enter the NPU graph")
+        ),
+    )
+    value = torch.zeros(1, 4, 8)
+
+    output = module._resblock_with_npu_graph(block, value)
+
+    assert calls == ["eager"]
+    torch.testing.assert_close(output, value + 1)
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", 0), ("2", 2)])
+def test_hift_resblock_graph_stage_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: int,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_RESBLOCK_GRAPH_STAGE_ENV, value)
+    assert module._hift_resblock_graph_stage() == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "bad"])
+def test_hift_resblock_graph_stage_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_RESBLOCK_GRAPH_STAGE_ENV, value)
+    with pytest.raises(ValueError):
+        module._hift_resblock_graph_stage()
+
+
+@pytest.mark.parametrize(("value", "expected"), [("58", 58), ("1", 1)])
+def test_hift_resblock_graph_mel_width_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: int,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV, value)
+    assert module._positive_int_env(module._HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV, 58) == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "bad"])
+def test_hift_resblock_graph_mel_width_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV, value)
+    with pytest.raises(ValueError):
+        module._positive_int_env(module._HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV, 58)
+
+
 def test_hift_f0_feature_partition_matches_sequential_stack(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load_patch_module(monkeypatch)
     layers: list[torch.nn.Module] = []

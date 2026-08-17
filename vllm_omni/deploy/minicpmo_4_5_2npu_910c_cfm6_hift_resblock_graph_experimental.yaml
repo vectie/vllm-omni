@@ -1,0 +1,19 @@
+# Atlas 800I A3 / Ascend 910C HiFT residual-block graph candidate.
+#
+# The steady vocoder input is batch 1 x 80 mel channels x 58 frames. HiFT's
+# first upsample stage produces three parallel 1x256x464 residual blocks; each
+# block contains six Conv1d operations, six Snake activations, and three
+# residual updates. Compile those blocks independently so GE can optimize the
+# full block while the transposed convolution, source branch, and ISTFT remain
+# outside the graph. Every other shape retains eager execution.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_STAGE: "0"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_MEL_WIDTH: "58"

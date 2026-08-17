@@ -8,9 +8,12 @@ import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    _dit_attention_cache_length,
     _dit_attention_preamble,
     _dit_conv_mlp_residual,
     _dit_fused_conv_block_mlp_residual,
+    _dit_fused_full_block,
+    _dit_explicit_attention,
     _dit_fused_conv_linear_mlp_residual,
     _dit_fused_conv_mlp_residual,
     _dit_mlp_residual,
@@ -18,6 +21,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_fused_conv_block_enabled,
     _npu_dit_fused_conv_linear_enabled,
     _npu_dit_fused_conv_pack_enabled,
+    _npu_dit_full_block_cache_buckets,
+    _npu_dit_full_block_graph_enabled,
+    _npu_dit_full_stack_graph_enabled,
     _npu_dit_graph_buckets,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
@@ -690,6 +696,120 @@ def test_dit_fused_conv_linear_mlp_residual_matches_partition_math(monkeypatch):
     torch.testing.assert_close(fused[1], standard[1], rtol=0, atol=0)
 
 
+def test_dit_fused_full_block_matches_split_partition_math(monkeypatch):
+    torch.manual_seed(17)
+
+    def causal_pack(x, cache):
+        history = torch.cat((cache, x.transpose(1, 2)), dim=2)
+        packed = torch.stack(
+            [history[:, :, offset : offset + 3].transpose(1, 2).reshape(2, -1) for offset in range(50)],
+            dim=1,
+        ).reshape(100, 1536)
+        return packed, x[:, -2:, :].transpose(1, 2).contiguous()
+
+    monkeypatch.setattr(
+        torch.ops._C_ascend,
+        "npu_minicpmo_causal_conv_pack",
+        causal_pack,
+        raising=False,
+    )
+    hidden = torch.randn(2, 50, 512)
+    time_embedding = torch.randn(2, 1, 512)
+    att_cache = torch.randn(2, 8, 4, 128)
+    cnn_cache = torch.randn(2, 1024, 2)
+    adaln = nn.Linear(512, 9 * 512)
+    q_proj = nn.Linear(512, 512)
+    k_proj = nn.Linear(512, 512)
+    v_proj = nn.Linear(512, 512)
+    q_norm = nn.LayerNorm(64)
+    k_norm = nn.LayerNorm(64)
+    out_proj = nn.Linear(512, 512)
+    conv1 = nn.Conv1d(512, 512, 3)
+    conv_norm = nn.LayerNorm(512)
+    conv2 = nn.Conv1d(512, 512, 3)
+    fc1 = nn.Linear(512, 2048)
+    fc2 = nn.Linear(2048, 512)
+
+    modulation, q, k, v = _dit_attention_preamble(
+        hidden,
+        time_embedding,
+        adaln.weight,
+        adaln.bias,
+        q_proj.weight,
+        q_proj.bias,
+        k_proj.weight,
+        k_proj.bias,
+        v_proj.weight,
+        v_proj.bias,
+        q_norm.weight,
+        q_norm.bias,
+        k_norm.weight,
+        k_norm.bias,
+    )
+    old_k, old_v = att_cache.chunk(2, dim=3)
+    k = torch.cat((k, old_k), dim=2)
+    v = torch.cat((v, old_v), dim=2)
+    expected_att = torch.cat((k, v), dim=3)
+    attention = F.scaled_dot_product_attention(q, k, v)
+    attention = out_proj(attention.transpose(1, 2).reshape(2, 50, 512))
+    modulations = modulation.chunk(9, dim=-1)
+    expected_hidden = hidden + modulations[2] * attention
+    conv_input = F.layer_norm(expected_hidden, (512,), eps=1e-6)
+    conv_input = conv_input * (1 + modulations[7]) + modulations[6]
+    expected_hidden, expected_cnn = _dit_conv_mlp_residual(
+        expected_hidden,
+        conv_input,
+        cnn_cache,
+        modulations[8],
+        modulations[3],
+        modulations[4],
+        modulations[5],
+        conv1.weight,
+        conv1.bias,
+        conv_norm.weight,
+        conv_norm.bias,
+        conv2.weight,
+        conv2.bias,
+        fc1.weight,
+        fc1.bias,
+        fc2.weight,
+        fc2.bias,
+    )
+    actual_hidden, actual_cnn, actual_att = _dit_fused_full_block(
+        hidden,
+        time_embedding,
+        att_cache,
+        cnn_cache,
+        adaln.weight,
+        adaln.bias,
+        q_proj.weight,
+        q_proj.bias,
+        k_proj.weight,
+        k_proj.bias,
+        v_proj.weight,
+        v_proj.bias,
+        q_norm.weight,
+        q_norm.bias,
+        k_norm.weight,
+        k_norm.bias,
+        out_proj.weight,
+        out_proj.bias,
+        conv1.weight.permute(0, 2, 1).reshape(512, 1536),
+        conv1.bias,
+        conv_norm.weight,
+        conv_norm.bias,
+        conv2.weight.permute(0, 2, 1).reshape(512, 1536),
+        conv2.bias,
+        fc1.weight,
+        fc1.bias,
+        fc2.weight,
+        fc2.bias,
+    )
+    torch.testing.assert_close(actual_hidden, expected_hidden, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(actual_cnn, expected_cnn, rtol=0, atol=0)
+    torch.testing.assert_close(actual_att, expected_att, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(("value", "expected"), [(None, 50), ("64", 64)])
 def test_npu_dit_mlp_graph_width(monkeypatch, value: str | None, expected: int):
     if value is None:
@@ -713,6 +833,38 @@ def test_npu_dit_graph_buckets_support_config_and_environment(monkeypatch):
 
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS", "302,20")
     assert _npu_dit_graph_buckets([64]) == (302, 20)
+
+
+def test_npu_dit_full_block_config_and_cache_buckets(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_GRAPH", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_STACK_GRAPH", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_CACHE_BUCKETS", raising=False)
+    assert _npu_dit_full_block_graph_enabled(True) is True
+    assert _npu_dit_full_stack_graph_enabled(True) is True
+    assert _npu_dit_full_block_cache_buckets([302, 352, 302]) == (302, 352)
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_GRAPH", "0")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_STACK_GRAPH", "0")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_CACHE_BUCKETS", "402,352")
+    assert _npu_dit_full_block_graph_enabled(True) is False
+    assert _npu_dit_full_stack_graph_enabled(True) is False
+    assert _npu_dit_full_block_cache_buckets([302]) == (402, 352)
+
+
+def test_dit_attention_cache_length_reads_sequence_axis():
+    cache = torch.empty(57, 2, 8, 302, 128)
+    assert _dit_attention_cache_length(cache) == 302
+    assert _dit_attention_cache_length(None) == 0
+
+
+def test_dit_explicit_attention_matches_sdpa_at_head_dim_64():
+    torch.manual_seed(23)
+    query = torch.randn(2, 8, 5, 64)
+    key = torch.randn(2, 8, 11, 64)
+    value = torch.randn(2, 8, 11, 64)
+    expected = F.scaled_dot_product_attention(query, key, value)
+    actual = _dit_explicit_attention(query, key, value)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("value", ["0,20", "-1", "20,bad"])

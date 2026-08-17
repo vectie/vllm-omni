@@ -1937,7 +1937,6 @@ class TestQwen3TTSPipeline:
             "top_p": 1.0,
         }
 
-
 class TestMingFlashOmniPipeline:
     def test_registered(self):
         p = resolve_pipeline_config("ming_flash_omni")
@@ -2349,6 +2348,39 @@ class TestPlatformOverrides:
         assert extra["npu_dit_graph_buckets"] == [20, 302]
         assert extra["npu_dit_preamble_graph"] is True
         assert extra["npu_dit_conv_mlp_graph"] is True
+
+    def test_minicpmo_4_5_910c_full_block_cache_buckets_are_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_full_block_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_dit_fused_conv_pack"] is True
+        assert extra["npu_dit_full_block_graph"] is True
+        assert extra["npu_dit_full_block_cache_buckets"] == [302, 352, 402]
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"] == "58"
+
+    def test_minicpmo_4_5_910c_full_stack_targets_only_capped_history(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_full_stack_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_full_stack_graph"] is True
+        assert extra["npu_dit_full_block_cache_buckets"] == [402]
+        assert "npu_dit_full_block_graph" not in extra
 
     def test_minicpmo_4_5_910c_prefix_cache_is_thinker_only(self):
         deploy_path = Path(

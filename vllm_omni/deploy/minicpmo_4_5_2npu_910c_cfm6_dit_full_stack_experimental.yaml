@@ -1,0 +1,30 @@
+# Atlas 800I A3 / Ascend 910C whole-stack DiT graph candidate.
+#
+# Keep prompt and early streaming caches on the qualified split graphs, then
+# fuse all 16 DiT blocks behind one GE boundary once history reaches its
+# steady 402-token cap. This amortizes graph replay overhead across the stack.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      raw_tensor_shm: false
+      shm_event_notifications: true
+      shm_notification_namespace: minicpmo45-910c
+      token2wav_n_timesteps: 6
+      npu_dit_mlp_graph: true
+      npu_dit_mlp_graph_width: 50
+      npu_dit_graph_buckets: [20, 302]
+      npu_dit_preamble_graph: true
+      npu_dit_conv_mlp_graph: true
+      npu_dit_prompt_conv_mlp_graph: true
+      npu_dit_fused_conv_pack: true
+      npu_dit_full_stack_graph: true
+      npu_dit_full_block_cache_buckets: [402]

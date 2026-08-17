@@ -23,6 +23,9 @@ _NPU_DIT_GRAPH_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS"
 _NPU_DIT_PREAMBLE_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH"
 _NPU_DIT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH"
 _NPU_DIT_PROMPT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PROMPT_CONV_MLP_GRAPH"
+_NPU_DIT_FULL_BLOCK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_GRAPH"
+_NPU_DIT_FULL_STACK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_STACK_GRAPH"
+_NPU_DIT_FULL_BLOCK_CACHE_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_CACHE_BUCKETS"
 _NPU_DIT_FUSED_CONV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_PACK"
 _NPU_DIT_FUSED_CONV_BLOCK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_BLOCK"
 _NPU_DIT_FUSED_CONV_LINEAR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR"
@@ -107,6 +110,36 @@ def _npu_dit_prompt_conv_mlp_graph_enabled(config_value: Any = None) -> bool:
     raise ValueError(f"Invalid {_NPU_DIT_PROMPT_CONV_MLP_GRAPH_ENV}={raw!r}")
 
 
+def _npu_dit_full_block_graph_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_FULL_BLOCK_GRAPH_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_FULL_BLOCK_GRAPH_ENV}={raw!r}")
+
+
+def _npu_dit_full_stack_graph_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_FULL_STACK_GRAPH_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_FULL_STACK_GRAPH_ENV}={raw!r}")
+
+
 def _npu_dit_fused_conv_pack_enabled(config_value: Any = None) -> bool:
     env_value = os.environ.get(_NPU_DIT_FUSED_CONV_PACK_ENV)
     raw = env_value if env_value not in (None, "") else config_value
@@ -182,6 +215,33 @@ def _npu_dit_graph_buckets(config_value: Any = None) -> tuple[int, ...]:
         if width not in widths:
             widths.append(width)
     return tuple(widths)
+
+
+def _npu_dit_full_block_cache_buckets(config_value: Any = None) -> tuple[int, ...]:
+    """Return fixed attention-cache lengths eligible for full-block replay."""
+    env_value = os.environ.get(_NPU_DIT_FULL_BLOCK_CACHE_BUCKETS_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw in (None, ""):
+        return ()
+    values = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    lengths: list[int] = []
+    for value in values:
+        try:
+            length = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid {_NPU_DIT_FULL_BLOCK_CACHE_BUCKETS_ENV}={raw!r}") from exc
+        if length <= 0:
+            raise ValueError(
+                f"{_NPU_DIT_FULL_BLOCK_CACHE_BUCKETS_ENV} lengths must be positive, got {length}"
+            )
+        if length not in lengths:
+            lengths.append(length)
+    return tuple(lengths)
+
+
+def _dit_attention_cache_length(att_cache: torch.Tensor | None) -> int:
+    """Return sequence length from [layers, batch, heads, sequence, width]."""
+    return int(att_cache.shape[-2]) if att_cache is not None else 0
 
 
 def _ensure_torchair_broadcast_alias() -> None:
@@ -456,6 +516,162 @@ def _dit_fused_conv_block_mlp_residual(
     )
 
 
+def _dit_explicit_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Small-shape attention that remains decomposed inside the GE graph."""
+    batch_size, num_heads, query_width, head_dim = query.shape
+    key_width = key.shape[2]
+    flat_query = query.reshape(batch_size * num_heads, query_width, head_dim)
+    flat_key = key.reshape(batch_size * num_heads, key_width, head_dim)
+    flat_value = value.reshape(batch_size * num_heads, key_width, head_dim)
+    scores = torch.bmm(flat_query, flat_key.transpose(1, 2)) * 0.125
+    attention = torch.bmm(torch.softmax(scores, dim=-1), flat_value)
+    return attention.reshape(batch_size, num_heads, query_width, head_dim)
+
+
+def _dit_fused_full_block(
+    x: torch.Tensor,
+    time_embedding: torch.Tensor,
+    att_cache: torch.Tensor,
+    cnn_cache: torch.Tensor,
+    adaln_weight: torch.Tensor,
+    adaln_bias: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_norm_bias: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    proj_weight: torch.Tensor,
+    proj_bias: torch.Tensor,
+    conv1_flat_weight: torch.Tensor,
+    conv1_bias: torch.Tensor,
+    conv_norm_weight: torch.Tensor,
+    conv_norm_bias: torch.Tensor,
+    conv2_flat_weight: torch.Tensor,
+    conv2_bias: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc1_bias: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    fc2_bias: torch.Tensor,
+    explicit_attention: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GE-visible steady DiT block with cached attention, Conv, and MLP."""
+    modulation, q, k, v = _dit_attention_preamble(
+        x,
+        time_embedding,
+        adaln_weight,
+        adaln_bias,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        v_weight,
+        v_bias,
+        q_norm_weight,
+        q_norm_bias,
+        k_norm_weight,
+        k_norm_bias,
+    )
+    k_cache, v_cache = att_cache.chunk(2, dim=3)
+    k = torch.cat((k, k_cache), dim=2)
+    v = torch.cat((v, v_cache), dim=2)
+    new_att_cache = torch.cat((k, v), dim=3)
+    if explicit_attention:
+        attention = _dit_explicit_attention(q, k, v)
+    else:
+        attention = F.scaled_dot_product_attention(q, k, v)
+    attention = attention.transpose(1, 2).reshape(x.shape[0], x.shape[1], 512)
+    attention = F.linear(attention, proj_weight, proj_bias)
+    modulations = modulation.chunk(9, dim=-1)
+    hidden = x + modulations[2] * attention
+    conv_input = F.layer_norm(hidden, (512,), eps=1e-6)
+    conv_input = conv_input * (1 + modulations[7]) + modulations[6]
+    hidden, new_cnn_cache = _dit_fused_conv_mlp_residual(
+        hidden,
+        conv_input,
+        cnn_cache,
+        modulations[8],
+        modulations[3],
+        modulations[4],
+        modulations[5],
+        conv1_flat_weight,
+        conv1_bias,
+        conv_norm_weight,
+        conv_norm_bias,
+        conv2_flat_weight,
+        conv2_bias,
+        fc1_weight,
+        fc1_bias,
+        fc2_weight,
+        fc2_bias,
+    )
+    return hidden, new_cnn_cache, new_att_cache
+
+
+class _DiTFullStackGraph(nn.Module):
+    """All DiT blocks behind one GE boundary for a fixed cache shape."""
+
+    def __init__(self, blocks: nn.ModuleList) -> None:
+        super().__init__()
+        self.blocks = blocks
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        time_embedding: torch.Tensor,
+        att_cache: torch.Tensor,
+        cnn_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cnn_results: list[torch.Tensor] = []
+        att_results: list[torch.Tensor] = []
+        for block_idx, block in enumerate(self.blocks):
+            conv1 = block.conv.block[1]
+            conv_norm = block.conv.block[3]
+            conv2 = block.conv.block[6]
+            hidden, new_cnn, new_att = _dit_fused_full_block(
+                hidden,
+                time_embedding,
+                att_cache[block_idx],
+                cnn_cache[block_idx],
+                block.adaLN_modulation[1].weight,
+                block.adaLN_modulation[1].bias,
+                block.attn.to_q.weight,
+                block.attn.to_q.bias,
+                block.attn.to_k.weight,
+                block.attn.to_k.bias,
+                block.attn.to_v.weight,
+                block.attn.to_v.bias,
+                block.attn.q_norm.weight,
+                block.attn.q_norm.bias,
+                block.attn.k_norm.weight,
+                block.attn.k_norm.bias,
+                block.attn.proj.weight,
+                block.attn.proj.bias,
+                conv1._minicpmo_flat_weight,
+                conv1.bias,
+                conv_norm.weight,
+                conv_norm.bias,
+                conv2._minicpmo_flat_weight,
+                conv2.bias,
+                block.mlp.fc1.weight,
+                block.mlp.fc1.bias,
+                block.mlp.fc2.weight,
+                block.mlp.fc2.bias,
+                True,
+            )
+            cnn_results.append(new_cnn)
+            att_results.append(new_att)
+        return hidden, torch.stack(cnn_results), torch.stack(att_results)
+
+
 def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
     flow = tuple((name, tensor_signature(state.flow_cache[name])) for name in sorted(state.flow_cache))
     hift = tuple((name, tensor_signature(state.hift_cache[name])) for name in sorted(state.hift_cache))
@@ -494,6 +710,9 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_preamble_graph: Any = None,
         npu_dit_conv_mlp_graph: Any = None,
         npu_dit_prompt_conv_mlp_graph: Any = None,
+        npu_dit_full_block_graph: Any = None,
+        npu_dit_full_stack_graph: Any = None,
+        npu_dit_full_block_cache_buckets: Any = None,
         npu_dit_fused_conv_pack: Any = None,
         npu_dit_fused_conv_block: Any = None,
         npu_dit_fused_conv_linear: Any = None,
@@ -569,6 +788,21 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_prompt_conv_mlp_graph: Any | None = None
         self._npu_dit_prompt_conv_mlp_graph_disabled_widths: set[int] = set()
         self._npu_dit_prompt_conv_mlp_graph_used_widths: set[int] = set()
+        self._npu_dit_full_block_graph_enabled = _npu_dit_full_block_graph_enabled(
+            npu_dit_full_block_graph
+        )
+        self._npu_dit_full_block_cache_buckets = _npu_dit_full_block_cache_buckets(
+            npu_dit_full_block_cache_buckets
+        )
+        self._npu_dit_full_block_graph: Any | None = None
+        self._npu_dit_full_block_graph_disabled_lengths: set[int] = set()
+        self._npu_dit_full_block_graph_used_lengths: set[int] = set()
+        self._npu_dit_full_stack_graph_enabled = _npu_dit_full_stack_graph_enabled(
+            npu_dit_full_stack_graph
+        )
+        self._npu_dit_full_stack_graph: Any | None = None
+        self._npu_dit_full_stack_graph_disabled_lengths: set[int] = set()
+        self._npu_dit_full_stack_graph_used_lengths: set[int] = set()
         self._npu_dit_fused_conv_pack_enabled = _npu_dit_fused_conv_pack_enabled(npu_dit_fused_conv_pack)
         self._npu_dit_fused_conv_pack_used = False
         self._npu_dit_fused_conv_block_enabled = _npu_dit_fused_conv_block_enabled(npu_dit_fused_conv_block)
@@ -579,6 +813,8 @@ class BatchedToken2Wav(nn.Module):
         self._warmup_npu_dit_preamble_graph()
         self._warmup_npu_dit_conv_mlp_graph()
         self._warmup_npu_dit_prompt_conv_mlp_graphs()
+        self._warmup_npu_dit_full_block_graphs()
+        self._warmup_npu_dit_full_stack_graphs()
 
     def _warmup_npu_dit_mlp_graph(self) -> None:
         """Compile the fixed-width post-convolution partition during startup."""
@@ -975,6 +1211,211 @@ class BatchedToken2Wav(nn.Module):
             )
         return self._npu_dit_prompt_conv_mlp_graph
 
+    def _warmup_npu_dit_full_block_graphs(self) -> None:
+        """Compile complete steady block graphs for bounded cache lengths."""
+        if not self._npu_dit_full_block_graph_enabled:
+            return
+        lengths = self._npu_dit_full_block_cache_buckets
+        if not lengths:
+            logger.warning("MiniCPM-o NPU full-block graph disabled: no cache buckets configured")
+            self._npu_dit_full_block_graph_enabled = False
+            return
+        estimator = getattr(getattr(self.flow, "decoder", None), "estimator", None)
+        blocks = getattr(estimator, "blocks", None)
+        block = blocks[0] if blocks else None
+        weight = getattr(getattr(getattr(block, "attn", None), "to_q", None), "weight", None)
+        if (
+            block is None
+            or not isinstance(weight, torch.Tensor)
+            or weight.device.type != "npu"
+            or not self._dit_full_block_compatible(block)
+            or not self._npu_dit_fused_conv_pack_enabled
+        ):
+            self._npu_dit_full_block_graph_enabled = False
+            logger.warning("MiniCPM-o NPU full-block graph disabled: block or causal-pack layout is incompatible")
+            return
+        graph_fn = self._get_npu_dit_full_block_graph()
+        hidden = weight.new_zeros((2, 50, 512))
+        time_embedding = weight.new_zeros((2, 1, 512))
+        cnn_cache = weight.new_zeros((2, 1024, 2))
+        for cache_length in lengths:
+            try:
+                att_cache = weight.new_zeros((2, 8, cache_length, 128))
+                with torch.inference_mode():
+                    self._call_npu_dit_full_block_graph(
+                        graph_fn,
+                        block,
+                        hidden,
+                        time_embedding,
+                        att_cache,
+                        cnn_cache,
+                    )
+                torch.npu.synchronize()
+                logger.info(
+                    "Compiled MiniCPM-o NPU full DiT block graph for width=50, attention cache=%d",
+                    cache_length,
+                )
+            except Exception:
+                self._npu_dit_full_block_graph_disabled_lengths.add(cache_length)
+                logger.warning(
+                    "MiniCPM-o NPU full-block graph compilation failed at cache=%d; using split path",
+                    cache_length,
+                    exc_info=True,
+                )
+
+    @staticmethod
+    def _dit_full_block_compatible(block: nn.Module) -> bool:
+        return (
+            BatchedToken2Wav._dit_preamble_compatible(block, 50)
+            and BatchedToken2Wav._dit_conv_mlp_compatible(block, 50)
+            and block.norm3.weight is None
+            and block.norm3.bias is None
+            and float(block.norm3.eps) == 1e-6
+            and int(block.attn.proj.in_features) == 512
+            and int(block.attn.proj.out_features) == 512
+        )
+
+    def _get_npu_dit_full_block_graph(self):
+        if self._npu_dit_full_block_graph is None:
+            from torch_npu.dynamo import torchair
+            from vllm_ascend.compilation.minicpmo_fusion_attention import (
+                register_minicpmo_fusion_attention_v3_converter,
+            )
+
+            _ensure_torchair_broadcast_alias()
+            register_minicpmo_fusion_attention_v3_converter()
+            compiler_config = torchair.CompilerConfig()
+            self._npu_dit_full_block_graph = torch.compile(
+                _dit_fused_full_block,
+                backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self._npu_dit_full_block_graph
+
+    def _call_npu_dit_full_block_graph(
+        self,
+        graph_fn: Any,
+        block: nn.Module,
+        hidden: torch.Tensor,
+        time_embedding: torch.Tensor,
+        att_cache: torch.Tensor,
+        cnn_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        conv1 = block.conv.block[1]
+        conv_norm = block.conv.block[3]
+        conv2 = block.conv.block[6]
+        return graph_fn(
+            hidden,
+            time_embedding,
+            att_cache,
+            cnn_cache,
+            block.adaLN_modulation[1].weight,
+            block.adaLN_modulation[1].bias,
+            block.attn.to_q.weight,
+            block.attn.to_q.bias,
+            block.attn.to_k.weight,
+            block.attn.to_k.bias,
+            block.attn.to_v.weight,
+            block.attn.to_v.bias,
+            block.attn.q_norm.weight,
+            block.attn.q_norm.bias,
+            block.attn.k_norm.weight,
+            block.attn.k_norm.bias,
+            block.attn.proj.weight,
+            block.attn.proj.bias,
+            self._dit_conv_graph_weight(conv1),
+            conv1.bias,
+            conv_norm.weight,
+            conv_norm.bias,
+            self._dit_conv_graph_weight(conv2),
+            conv2.bias,
+            block.mlp.fc1.weight,
+            block.mlp.fc1.bias,
+            block.mlp.fc2.weight,
+            block.mlp.fc2.bias,
+        )
+
+    def _warmup_npu_dit_full_stack_graphs(self) -> None:
+        """Compile the whole 16-block stack for selected steady cache shapes."""
+        if not self._npu_dit_full_stack_graph_enabled:
+            return
+        lengths = self._npu_dit_full_block_cache_buckets
+        estimator = getattr(getattr(self.flow, "decoder", None), "estimator", None)
+        blocks = getattr(estimator, "blocks", None)
+        weight = getattr(getattr(estimator, "in_proj", None), "weight", None)
+        if (
+            not lengths
+            or not isinstance(blocks, nn.ModuleList)
+            or not blocks
+            or not isinstance(weight, torch.Tensor)
+            or weight.device.type != "npu"
+            or not self._npu_dit_fused_conv_pack_enabled
+            or not all(self._dit_full_block_compatible(block) for block in blocks)
+        ):
+            self._npu_dit_full_stack_graph_enabled = False
+            logger.warning("MiniCPM-o NPU full-stack graph disabled: stack or cache buckets are incompatible")
+            return
+        graph_fn = self._get_npu_dit_full_stack_graph(blocks)
+        depth = len(blocks)
+        hidden = weight.new_zeros((2, 50, 512))
+        time_embedding = weight.new_zeros((2, 1, 512))
+        cnn_cache = weight.new_zeros((depth, 2, 1024, 2))
+        for cache_length in lengths:
+            try:
+                att_cache = weight.new_zeros((depth, 2, 8, cache_length, 128))
+                with torch.inference_mode():
+                    graph_fn(hidden, time_embedding, att_cache, cnn_cache)
+                torch.npu.synchronize()
+                logger.info(
+                    "Compiled MiniCPM-o NPU full DiT stack graph: blocks=%d, width=50, attention cache=%d",
+                    depth,
+                    cache_length,
+                )
+            except Exception:
+                self._npu_dit_full_stack_graph_disabled_lengths.add(cache_length)
+                logger.warning(
+                    "MiniCPM-o NPU full-stack graph compilation failed at cache=%d; using split path",
+                    cache_length,
+                    exc_info=True,
+                )
+
+    def _get_npu_dit_full_stack_graph(self, blocks: nn.ModuleList):
+        if self._npu_dit_full_stack_graph is None:
+            from torch_npu.dynamo import torchair
+
+            _ensure_torchair_broadcast_alias()
+            compiler_config = torchair.CompilerConfig()
+            module = _DiTFullStackGraph(blocks).eval()
+            graph = torch.compile(
+                module,
+                backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                fullgraph=True,
+                dynamic=False,
+            )
+            # The wrapper references the existing estimator parameters. Keep it
+            # out of this module's registry so state_dict ownership is unchanged.
+            object.__setattr__(self, "_npu_dit_full_stack_graph", graph)
+        return self._npu_dit_full_stack_graph
+
+    @staticmethod
+    def _call_npu_dit_full_stack_graph(
+        graph_fn: Any,
+        estimator: nn.Module,
+        estimator_input: torch.Tensor,
+        time_embedding: torch.Tensor,
+        old_cnn: torch.Tensor,
+        old_att: torch.Tensor,
+        cnn_out: torch.Tensor,
+        att_out: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = estimator.in_proj(estimator_input.transpose(1, 2))
+        hidden, new_cnn, new_att = graph_fn(hidden, time_embedding, old_att, old_cnn)
+        cnn_out.copy_(new_cnn)
+        att_out[:, :, :, : new_att.shape[3], :].copy_(new_att)
+        hidden = estimator.final_layer(hidden, time_embedding)
+        return hidden.transpose(1, 2)
+
     def _dit_conv_graph_weight(self, convolution: nn.Conv1d) -> torch.Tensor:
         if not (
             self._npu_dit_fused_conv_linear_enabled
@@ -1166,6 +1607,39 @@ class BatchedToken2Wav(nn.Module):
             try:
                 graph_fn = self._get_npu_dit_mlp_graph()
                 if graph_fn is not None:
+                    full_stack_cache_length = _dit_attention_cache_length(att_cache)
+                    if (
+                        graph_width == self._npu_dit_mlp_graph_width
+                        and isinstance(cnn_cache, torch.Tensor)
+                        and isinstance(att_cache, torch.Tensor)
+                        and self._npu_dit_full_stack_graph_enabled
+                        and full_stack_cache_length in self._npu_dit_full_block_cache_buckets
+                        and full_stack_cache_length
+                        not in self._npu_dit_full_stack_graph_disabled_lengths
+                    ):
+                        stack_graph_fn = self._get_npu_dit_full_stack_graph(estimator.blocks)
+                        result = self._call_npu_dit_full_stack_graph(
+                            stack_graph_fn,
+                            estimator,
+                            estimator_input,
+                            time_embedding,
+                            cnn_cache,
+                            att_cache,
+                            cnn_out,
+                            att_out,
+                        )
+                        if (
+                            full_stack_cache_length
+                            not in self._npu_dit_full_stack_graph_used_lengths
+                        ):
+                            logger.info(
+                                "MiniCPM-o NPU full DiT stack graph replay active at attention cache=%d",
+                                full_stack_cache_length,
+                            )
+                            self._npu_dit_full_stack_graph_used_lengths.add(
+                                full_stack_cache_length
+                            )
+                        return result, cnn_out, att_out
                     preamble_graph_fn = None
                     if (
                         self._npu_dit_preamble_graph_enabled
@@ -1175,7 +1649,18 @@ class BatchedToken2Wav(nn.Module):
                         preamble_graph_fn = self._get_npu_dit_preamble_graph()
                     conv_mlp_graph_fn = None
                     conv_mlp_standard_weights = False
-                    if (
+                    full_block_graph_fn = None
+                    full_block_cache_length = _dit_attention_cache_length(att_cache)
+                    if full_block_graph_fn is None and (
+                        graph_width == self._npu_dit_mlp_graph_width
+                        and cnn_cache is not None
+                        and att_cache is not None
+                        and self._npu_dit_full_block_graph_enabled
+                        and full_block_cache_length in self._npu_dit_full_block_cache_buckets
+                        and full_block_cache_length not in self._npu_dit_full_block_graph_disabled_lengths
+                    ):
+                        full_block_graph_fn = self._get_npu_dit_full_block_graph()
+                    if full_block_graph_fn is None and (
                         graph_width == self._npu_dit_mlp_graph_width
                         and cnn_cache is not None
                         and att_cache is not None
@@ -1183,7 +1668,7 @@ class BatchedToken2Wav(nn.Module):
                         and not self._npu_dit_conv_mlp_graph_disabled
                     ):
                         conv_mlp_graph_fn = self._get_npu_dit_conv_mlp_graph()
-                    elif (
+                    elif full_block_graph_fn is None and (
                         graph_width != self._npu_dit_mlp_graph_width
                         and self._npu_dit_prompt_conv_mlp_graph_enabled
                         and graph_width not in self._npu_dit_prompt_conv_mlp_graph_disabled_widths
@@ -1202,6 +1687,7 @@ class BatchedToken2Wav(nn.Module):
                         preamble_graph_fn,
                         conv_mlp_graph_fn,
                         conv_mlp_standard_weights,
+                        full_block_graph_fn,
                     )
                     if not self._npu_dit_mlp_graph_used:
                         logger.info(
@@ -1229,6 +1715,15 @@ class BatchedToken2Wav(nn.Module):
                         else:
                             logger.info("MiniCPM-o NPU DiT Conv+MLP megagraph replay active")
                         self._npu_dit_conv_mlp_graph_used = True
+                    if (
+                        full_block_graph_fn is not None
+                        and full_block_cache_length not in self._npu_dit_full_block_graph_used_lengths
+                    ):
+                        logger.info(
+                            "MiniCPM-o NPU full DiT block graph replay active at attention cache=%d",
+                            full_block_cache_length,
+                        )
+                        self._npu_dit_full_block_graph_used_lengths.add(full_block_cache_length)
                     return result, cnn_out, att_out
             except Exception:
                 self._npu_dit_mlp_graph_disabled_widths.add(graph_width)
@@ -1261,10 +1756,25 @@ class BatchedToken2Wav(nn.Module):
         preamble_graph_fn: Any | None = None,
         conv_mlp_graph_fn: Any | None = None,
         conv_mlp_standard_weights: bool = False,
+        full_block_graph_fn: Any | None = None,
     ) -> torch.Tensor:
         """Replay enabled shape-bucketed partitions with exact eager fallbacks."""
         hidden = estimator.in_proj(estimator_input.transpose(1, 2))
         for block_idx, block in enumerate(estimator.blocks):
+            if full_block_graph_fn is not None:
+                if not self._dit_full_block_compatible(block):
+                    raise RuntimeError("MiniCPM-o NPU full-block graph encountered an incompatible block")
+                hidden, new_cnn, new_att = self._call_npu_dit_full_block_graph(
+                    full_block_graph_fn,
+                    block,
+                    hidden,
+                    time_embedding,
+                    old_att[block_idx],
+                    old_cnn[block_idx],
+                )
+                cnn_out[block_idx].copy_(new_cnn)
+                att_out[block_idx, :, :, : new_att.shape[2], :].copy_(new_att)
+                continue
             if block.training or block.norm2.weight is not None or block.norm2.bias is not None:
                 raise RuntimeError("MiniCPM-o NPU DiT MLP graph requires eval-mode affine-free norm2")
             if float(block.norm2.eps) != 1e-6:

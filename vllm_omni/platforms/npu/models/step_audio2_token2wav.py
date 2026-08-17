@@ -38,6 +38,7 @@ _original_stream_chunk_for = None
 _HIFT_MATERIALIZE_WEIGHT_NORM_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM"
 _HIFT_F0_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"
 _HIFT_F0_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"
+_HIFT_F0_GRAPH_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_BUCKETS"
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -53,6 +54,24 @@ def _hift_f0_graph_width() -> int:
     if width <= 0:
         raise ValueError(f"{_HIFT_F0_GRAPH_WIDTH_ENV} must be positive, got {width}")
     return width
+
+
+def _hift_f0_graph_buckets() -> tuple[int, ...]:
+    """Return additional static F0 widths beside the steady-state width."""
+    raw = os.environ.get(_HIFT_F0_GRAPH_BUCKETS_ENV, "")
+    if not raw.strip():
+        return ()
+    widths: list[int] = []
+    for value in raw.split(","):
+        try:
+            width = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid {_HIFT_F0_GRAPH_BUCKETS_ENV}={raw!r}") from exc
+        if width <= 0:
+            raise ValueError(f"{_HIFT_F0_GRAPH_BUCKETS_ENV} widths must be positive, got {width}")
+        if width not in widths:
+            widths.append(width)
+    return tuple(widths)
 
 
 def _ensure_torchair_broadcast_alias() -> None:
@@ -87,20 +106,23 @@ def _hift_f0_features(
 
 
 def _f0_predictor_with_npu_graph(self, value: torch.Tensor) -> torch.Tensor:
-    expected = (1, int(self._step_audio2_npu_f0_input_channels), int(self._step_audio2_npu_f0_graph_width))
-    if value.device.type != "npu" or tuple(value.shape) != expected:
+    shape = tuple(value.shape)
+    expected_prefix = (1, int(self._step_audio2_npu_f0_input_channels))
+    graph_widths = self._step_audio2_npu_f0_graph_widths
+    if value.device.type != "npu" or shape[:2] != expected_prefix or shape[2] not in graph_widths:
         if value.device.type == "npu" and not getattr(self, "_step_audio2_npu_f0_graph_fallback_logged", False):
             logger.info(
-                "HiFT F0 graph falling back for runtime shape %s; compiled shape is %s",
-                tuple(value.shape),
-                expected,
+                "HiFT F0 graph falling back for runtime shape %s; compiled widths are %s",
+                shape,
+                graph_widths,
             )
             self._step_audio2_npu_f0_graph_fallback_logged = True
         return self._step_audio2_original_forward(value)
 
-    if not getattr(self, "_step_audio2_npu_f0_graph_replay_logged", False):
-        logger.info("HiFT F0 feature graph replay active for runtime shape %s", expected)
-        self._step_audio2_npu_f0_graph_replay_logged = True
+    replayed_widths = self._step_audio2_npu_f0_graph_replayed_widths
+    if shape[2] not in replayed_widths:
+        logger.info("HiFT F0 feature graph replay active for runtime shape %s", shape)
+        replayed_widths.add(shape[2])
     features = self._step_audio2_npu_f0_graph(value, *self._step_audio2_npu_f0_graph_weights)
     # Keep the checkpoint's original per-timestep Linear outside the graph.
     # TorchAir 8.5 lowers an equivalent 1x1 Conv faster, but its accumulation
@@ -137,8 +159,13 @@ def materialize_hift_weight_norm_for_npu(hift: torch.nn.Module) -> int:
     return materialized
 
 
-def prepare_hift_f0_graph_for_npu(hift: torch.nn.Module, *, width: int) -> bool:
-    """Compile the fixed-width HiFT F0 feature stack for Ascend inference.
+def prepare_hift_f0_graph_for_npu(
+    hift: torch.nn.Module,
+    *,
+    width: int,
+    extra_widths: tuple[int, ...] = (),
+) -> bool:
+    """Compile fixed-width HiFT F0 feature stacks for Ascend inference.
 
     Only the five Conv+ELU feature layers enter GE. The classifier remains the
     upstream eager Linear so the optimization changes neither its operation
@@ -182,21 +209,31 @@ def prepare_hift_f0_graph_for_npu(hift: torch.nn.Module, *, width: int) -> bool:
         fullgraph=True,
         dynamic=False,
     )
-    sample = convolutions[0].weight.new_zeros((1, int(convolutions[0].in_channels), width))
-    with torch.inference_mode():
-        expected_features = predictor.condnet(sample)
-        actual_features = graph(sample, *weights)
-    torch.testing.assert_close(actual_features, expected_features, rtol=0, atol=0)
-    torch.npu.synchronize()
+    widths = tuple(dict.fromkeys((width, *extra_widths)))
+    for graph_width in widths:
+        if graph_width <= 0:
+            raise ValueError(f"HiFT F0 graph widths must be positive, got {graph_width}")
+        sample = convolutions[0].weight.new_zeros(
+            (1, int(convolutions[0].in_channels), graph_width)
+        )
+        with torch.inference_mode():
+            expected_features = predictor.condnet(sample)
+            actual_features = graph(sample, *weights)
+        torch.testing.assert_close(actual_features, expected_features, rtol=0, atol=0)
+        torch.npu.synchronize()
+        logger.info(
+            "Compiled HiFT F0 feature graph for Ascend NPU: batch=1 width=%d",
+            graph_width,
+        )
 
     predictor._step_audio2_original_forward = predictor.forward
     predictor._step_audio2_npu_f0_graph = graph
     predictor._step_audio2_npu_f0_graph_weights = weights
-    predictor._step_audio2_npu_f0_graph_width = width
+    predictor._step_audio2_npu_f0_graph_widths = widths
+    predictor._step_audio2_npu_f0_graph_replayed_widths = set()
     predictor._step_audio2_npu_f0_input_channels = int(convolutions[0].in_channels)
     predictor.forward = MethodType(_f0_predictor_with_npu_graph, predictor)
     predictor._step_audio2_npu_f0_graph_patched = True
-    logger.info("Compiled HiFT F0 feature graph for Ascend NPU: batch=1 width=%d", width)
     return True
 
 
@@ -315,7 +352,11 @@ def _patched_ensure_models_loaded(self) -> None:
         materialize_hift_weight_norm_for_npu(self._hift)
     if _env_flag_enabled(_HIFT_F0_GRAPH_ENV):
         try:
-            prepare_hift_f0_graph_for_npu(self._hift, width=_hift_f0_graph_width())
+            prepare_hift_f0_graph_for_npu(
+                self._hift,
+                width=_hift_f0_graph_width(),
+                extra_widths=_hift_f0_graph_buckets(),
+            )
         except Exception:
             logger.warning("HiFT F0 graph compilation failed; using eager predictor", exc_info=True)
 

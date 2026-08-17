@@ -277,6 +277,25 @@ def test_hift_f0_graph_width_rejects_invalid_values(
         module._hift_f0_graph_width()
 
 
+def test_hift_f0_graph_buckets_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_F0_GRAPH_BUCKETS_ENV, "50,58,50")
+    assert module._hift_f0_graph_buckets() == (50, 58)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "bad", "50,bad"])
+def test_hift_f0_graph_buckets_reject_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_F0_GRAPH_BUCKETS_ENV, value)
+    with pytest.raises(ValueError):
+        module._hift_f0_graph_buckets()
+
+
 @pytest.mark.parametrize(("value", "expected"), [("1", True), ("true", True), ("yes", True), ("0", False)])
 def test_hift_weight_norm_materialization_env_flag(
     monkeypatch: pytest.MonkeyPatch,

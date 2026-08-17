@@ -251,6 +251,60 @@ def test_hift_resblock_stage_shapes_match_flashcosyvoice(
     assert module._hift_resblock_stage_shape(hift, mel_width=58, stage=2) == (1, 64, 6961)
 
 
+def test_hift_fixed_istft_matches_torch_istft(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    width = 17
+    window = torch.hann_window(16, periodic=True)
+    constants = module._hift_fixed_istft_constants(
+        width=width,
+        window=window,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    raw = torch.linspace(-2.0, 2.0, steps=18 * width).reshape(1, 18, width)
+    magnitude = torch.exp(raw[:, :9, :])
+    phase = torch.sin(raw[:, 9:, :])
+    real = torch.clip(magnitude, max=1e2) * torch.cos(phase)
+    imag = torch.clip(magnitude, max=1e2) * torch.sin(phase)
+
+    expected = torch.istft(torch.complex(real, imag), 16, 4, 16, window=window)
+    actual = module._hift_fixed_istft(magnitude, phase, *constants)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(("width", "window_size"), [(1, 16), (17, 15)])
+def test_hift_fixed_istft_constants_reject_invalid_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    window_size: int,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    with pytest.raises(ValueError):
+        module._hift_fixed_istft_constants(
+            width=width,
+            window=torch.ones(window_size),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+
+def test_hift_fixed_istft_uses_original_off_npu(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    hift = SimpleNamespace(
+        _step_audio2_original_istft=lambda magnitude, phase: calls.append((magnitude, phase))
+        or magnitude[:, 0],
+    )
+    magnitude = torch.ones(1, 9, 17)
+    phase = torch.zeros_like(magnitude)
+
+    actual = module._istft_with_npu_graph(hift, magnitude, phase)
+
+    assert calls == [(magnitude, phase)]
+    torch.testing.assert_close(actual, magnitude[:, 0])
+
+
 def test_hift_resblock_graph_uses_eager_fallback_off_npu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

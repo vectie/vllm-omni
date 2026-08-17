@@ -1,0 +1,17 @@
+# Atlas 800I A3 / Ascend 910C fixed-size HiFT inverse-transform candidate.
+#
+# MiniCPM-o 4.5 uses a 16-point, hop-4 ISTFT. The steady 58-frame mel chunk
+# reaches 6,961 spectral frames, so Stage 2 can replay a static real inverse
+# transform plus overlap-add graph instead of constructing a complex tensor
+# and dispatching the generic ISTFT implementation. Every other shape and any
+# graph failure retains the upstream path.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_hift_resblock_graph_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH: "58"

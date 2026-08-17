@@ -15,11 +15,14 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
 5. HiFT residual graphs — replay one selected fixed-shape vocoder stage as
    three fused residual-block graphs while keeping upsampling, source fusion,
    and ISTFT visible to the surrounding eager execution.
+6. HiFT fixed ISTFT — replace the steady 16-point complex ISTFT with a static
+   real inverse transform and four-way overlap-add graph.
 """
 
 from __future__ import annotations
 
 import importlib
+import math
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -45,6 +48,8 @@ _HIFT_F0_GRAPH_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_BUCKETS"
 _HIFT_RESBLOCK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH"
 _HIFT_RESBLOCK_GRAPH_STAGE_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_STAGE"
 _HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_MEL_WIDTH"
+_HIFT_FIXED_ISTFT_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH"
+_HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH"
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -415,6 +420,179 @@ def prepare_hift_resblock_graph_for_npu(
     return len(prepared)
 
 
+def _hift_fixed_istft(
+    magnitude: torch.Tensor,
+    phase: torch.Tensor,
+    real_weight: torch.Tensor,
+    imag_weight: torch.Tensor,
+    window: torch.Tensor,
+    envelope: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate MiniCPM-o's fixed 16-point ISTFT without complex tensors."""
+    magnitude = torch.clip(magnitude, max=1e2)
+    real = (magnitude * torch.cos(phase)).permute(0, 2, 1).contiguous()
+    imag = (magnitude * torch.sin(phase)).permute(0, 2, 1).contiguous()
+    frames = F.linear(real.reshape(-1, 9), real_weight)
+    frames = frames + F.linear(imag.reshape(-1, 9), imag_weight)
+    frames = frames.reshape(real.shape[0], real.shape[1], 16)
+
+    weighted = frames.reshape(frames.shape[0], frames.shape[1], 4, 4)
+    weighted = weighted * window.reshape(1, 1, 4, 4)
+    width = frames.shape[1]
+    parts: list[torch.Tensor] = []
+    for quarter in range(4):
+        padded = F.pad(weighted[:, :, quarter, :], (0, 0, 3, 3))
+        start = 5 - quarter
+        parts.append(padded[:, start : start + width - 1, :])
+    output = (parts[0] + parts[1] + parts[2] + parts[3]) / envelope
+    return output.reshape(output.shape[0], -1)
+
+
+def _hift_fixed_istft_constants(
+    *,
+    width: int,
+    window: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the real inverse-DFT weights and exact centered OLA envelope."""
+    if width <= 1:
+        raise ValueError(f"HiFT ISTFT graph width must exceed one, got {width}")
+    if window.numel() != 16:
+        raise ValueError(f"HiFT ISTFT graph requires a 16-sample window, got {window.numel()}")
+
+    real_weight = torch.empty((16, 9), dtype=torch.float32)
+    imag_weight = torch.empty((16, 9), dtype=torch.float32)
+    for sample in range(16):
+        for frequency in range(9):
+            scale = 1.0 if frequency in (0, 8) else 2.0
+            angle = 2.0 * math.pi * frequency * sample / 16
+            real_weight[sample, frequency] = scale * math.cos(angle) / 16
+            imag_weight[sample, frequency] = -scale * math.sin(angle) / 16
+
+    window_cpu = window.detach().to(device="cpu", dtype=torch.float32).reshape(4, 4)
+    envelope = torch.zeros((width - 1, 4), dtype=torch.float32)
+    for output_block, block in enumerate(range(2, width + 1)):
+        for quarter in range(4):
+            frame = block - quarter
+            if 0 <= frame < width:
+                envelope[output_block] += window_cpu[quarter].square()
+
+    return (
+        real_weight.to(device=device, dtype=dtype),
+        imag_weight.to(device=device, dtype=dtype),
+        window_cpu.reshape(16).to(device=device, dtype=dtype),
+        envelope.reshape(1, width - 1, 4).to(device=device, dtype=dtype),
+    )
+
+
+def _istft_with_npu_graph(
+    self,
+    magnitude: torch.Tensor,
+    phase: torch.Tensor,
+) -> torch.Tensor:
+    """Replay the exact-shape fixed ISTFT graph, otherwise use upstream."""
+    if (
+        magnitude.device.type != "npu"
+        or tuple(magnitude.shape) != self._step_audio2_npu_istft_graph_shape
+        or tuple(phase.shape) != self._step_audio2_npu_istft_graph_shape
+        or magnitude.dtype != self._step_audio2_npu_istft_graph_dtype
+        or phase.dtype != self._step_audio2_npu_istft_graph_dtype
+        or self._step_audio2_npu_istft_graph_disabled
+    ):
+        return self._step_audio2_original_istft(magnitude, phase)
+    try:
+        output = self._step_audio2_npu_istft_graph(
+            magnitude,
+            phase,
+            *self._step_audio2_npu_istft_graph_constants,
+        )
+    except Exception:
+        self._step_audio2_npu_istft_graph_disabled = True
+        logger.warning(
+            "HiFT fixed ISTFT graph failed for shape %s; using eager ISTFT",
+            tuple(magnitude.shape),
+            exc_info=True,
+        )
+        return self._step_audio2_original_istft(magnitude, phase)
+    if not self._step_audio2_npu_istft_graph_replayed:
+        logger.info("HiFT fixed ISTFT graph replay active for shape %s", tuple(magnitude.shape))
+        self._step_audio2_npu_istft_graph_replayed = True
+    return output
+
+
+def prepare_hift_fixed_istft_graph_for_npu(
+    hift: torch.nn.Module,
+    *,
+    mel_width: int,
+) -> bool:
+    """Compile MiniCPM-o's steady 16-point, hop-4 HiFT inverse transform."""
+    if getattr(hift, "_step_audio2_npu_istft_graph_patched", False):
+        return True
+    params = getattr(hift, "istft_params", None)
+    if not isinstance(params, dict) or params.get("n_fft") != 16 or params.get("hop_len") != 4:
+        raise TypeError("HiFT fixed ISTFT graph requires n_fft=16 and hop_len=4")
+    original_istft = getattr(hift, "_istft", None)
+    window = getattr(hift, "stft_window", None)
+    parameter = next(hift.parameters(), None)
+    if original_istft is None or not isinstance(window, torch.Tensor):
+        raise TypeError("expected HiFT _istft and stft_window")
+    if parameter is None or parameter.device.type != "npu":
+        raise ValueError("HiFT fixed ISTFT graph requires NPU-resident weights")
+
+    stage = int(getattr(hift, "num_upsamples", 0)) - 1
+    width = _hift_resblock_stage_shape(hift, mel_width=mel_width, stage=stage)[2]
+    shape = (1, 9, width)
+    constants = _hift_fixed_istft_constants(
+        width=width,
+        window=window,
+        device=parameter.device,
+        dtype=parameter.dtype,
+    )
+
+    from torch_npu.dynamo import torchair
+
+    _ensure_torchair_broadcast_alias()
+    graph = torch.compile(
+        _hift_fixed_istft,
+        backend=torchair.get_npu_backend(compiler_config=torchair.CompilerConfig()),
+        fullgraph=True,
+        dynamic=False,
+    )
+    values = 9 * width
+    magnitude = torch.linspace(
+        0.1,
+        4.0,
+        steps=values,
+        device=parameter.device,
+        dtype=parameter.dtype,
+    ).reshape(shape)
+    phase = torch.linspace(
+        -1.0,
+        1.0,
+        steps=values,
+        device=parameter.device,
+        dtype=parameter.dtype,
+    ).reshape(shape)
+    with torch.inference_mode():
+        expected = original_istft(magnitude, phase)
+        actual = graph(magnitude, phase, *constants)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    torch.npu.synchronize()
+
+    hift._step_audio2_original_istft = original_istft
+    hift._step_audio2_npu_istft_graph = graph
+    hift._step_audio2_npu_istft_graph_constants = constants
+    hift._step_audio2_npu_istft_graph_shape = shape
+    hift._step_audio2_npu_istft_graph_dtype = parameter.dtype
+    hift._step_audio2_npu_istft_graph_disabled = False
+    hift._step_audio2_npu_istft_graph_replayed = False
+    hift._istft = MethodType(_istft_with_npu_graph, hift)
+    hift._step_audio2_npu_istft_graph_patched = True
+    logger.info("Compiled HiFT fixed ISTFT graph for shape=%s", shape)
+    return True
+
+
 def _linear_downsample_even_scale(x: torch.Tensor, scale: int) -> torch.Tensor:
     """Match ``F.interpolate(..., mode="linear")`` for an even integer scale.
 
@@ -546,6 +724,14 @@ def _patched_ensure_models_loaded(self) -> None:
             )
         except Exception:
             logger.warning("HiFT residual-block graph compilation failed; using eager blocks", exc_info=True)
+    if _env_flag_enabled(_HIFT_FIXED_ISTFT_GRAPH_ENV):
+        try:
+            prepare_hift_fixed_istft_graph_for_npu(
+                self._hift,
+                mel_width=_positive_int_env(_HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH_ENV, 58),
+            )
+        except Exception:
+            logger.warning("HiFT fixed ISTFT graph compilation failed; using eager ISTFT", exc_info=True)
 
 
 def _patched_forward(self, generated_speech_tokens, prompt_wav, return_bytes=True):

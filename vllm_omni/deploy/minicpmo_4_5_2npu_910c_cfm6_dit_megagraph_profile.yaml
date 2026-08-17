@@ -13,11 +13,11 @@
 #
 # Never use a profiler-enabled process for latency measurements.
 
-base_config: minicpmo_4_5_2npu_910c_cfm6_hift_f0_graph_experimental.yaml
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
 
 stages:
   - stage_id: 2
     profiler_config:
       profiler: torch
-      torch_profiler_dir: /tmp/vllm-omni-profiles/minicpmo45/post-f0-stage2
+      torch_profiler_dir: /tmp/vllm-omni-profiles/minicpmo45/targeted-kernel-stage2
       torch_profiler_record_shapes: true

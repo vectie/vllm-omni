@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 on Ascend 910C: official Seed-TTS comparison
 
-Date: 2026-08-09; optimization update: 2026-08-14
+Date: 2026-08-09; optimization update: 2026-08-17
 
 This report compares the pinned LunaNexa vLLM-Omni candidate, an optimized
 candidate built from it, and the competition's published Seed-TTS performance
@@ -2487,4 +2487,99 @@ de07894d23922b864cbb4489c0927bf9bcd70961579156dc617e7734cf2ee5c3  full-dit-v3-ax
 c078a44dae35b4c0677e6b6e83d3efaa2dd56a45512354bb49d2bebe7e94dca7  full-stack-bmm-smoke2.json
 0de7ea26751f335318d5ac944d85a0258b03b15e51cf2b7dfc4e1a9a5116f35b  restored-prompt-en32.json
 901f70df0afbc529445f141ff043464f83fc940d0b13f15673affe40be1df133  restored-prompt-en32-run2.json
+```
+
+## Cache-major native causal-convolution path
+
+A fresh Stage-2 NPU trace of the restored prompt-width profile identified
+`MinicpmoCausalConvPack` as a repeated small-kernel cost: 576 calls consumed
+38.321 ms, or 66.53 us per call. Its channel-major cache layout
+`[batch, channels, 2]` requires scalar gathers for the two historical taps and
+scalar writes for every cache update. The native AscendC operator now also
+accepts a cache-major `[batch, 2, channels]` layout. That layout makes both
+historical taps and the returned cache contiguous DMA copies while preserving
+the old ABI and path.
+
+The vLLM-Omni adapter retains this cache-major layout across the steady
+50-frame CFM stream instead of transposing it at each of the 16 DiT blocks.
+Prompt and final non-steady boundaries remain on the existing layout. The new
+path is guarded by `VLLM_OMNI_MINICPMO45_NPU_DIT_CACHE_MAJOR`, requires the
+qualified native pack plus Conv+MLP graph, and fails closed to the existing
+implementation.
+
+Post-install NPU validation passed all six dtype/layout cases with exact
+outputs. An alternating-order kernel microbenchmark measured the following;
+lower is better:
+
+| Native causal-pack layout | Median | Minimum |
+| --- | ---: | ---: |
+| Channel-major control | 62.777 us | 62.746 us |
+| Cache-major candidate | 27.161 us | 26.741 us |
+
+The cache-major kernel is 2.31x faster by median. The custom-op subset build
+also exposed stale CMake `AICPU_CUST_OBJ_TARGETS` state when changing the
+selected operator list. The build now clears that derived cache before
+collecting targets. A clean package containing both `AddRmsNormBias` and
+`MinicpmoCausalConvPack` installed with SHA-256:
+
+```text
+999387e27f4547660164719ab43a0147e0899823346cf3f1153befde1ab276a6
+```
+
+The end-to-end A/B used fresh service starts, followed by three resident runs
+per side. Every run used the same 32 Seed-TTS English rows, three warmups,
+concurrency one, seed zero, temperature zero, and CFM6 request body. Each run
+completed 32/32 requests with zero failures and generated exactly 4,801 input
+tokens, 480 output tokens, 3,362,880 frames, and 140.12 seconds of audio.
+
+| Metric (three-run median) | Prompt-width control | Cache-major candidate | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.200 s | 43.754 s | -1.01% |
+| Request throughput | 0.7240 req/s | 0.7314 req/s | +1.02% |
+| Audio throughput | 3.170x realtime | 3.202x realtime | +1.02% |
+| Mean E2E | 1,380.78 ms | 1,366.86 ms | -1.01% |
+| Median E2E | 1,421.81 ms | 1,407.19 ms | -1.03% |
+| Mean TTFT | 315.74 ms | 315.49 ms | -0.08% |
+| Mean audio TTFP | 783.94 ms | 775.40 ms | -1.09% |
+| Median audio TTFP | 781.19 ms | 783.18 ms | +0.25% |
+| Mean per-chunk RTF | 0.33907 | 0.33443 | -1.37% |
+| Median per-chunk RTF | 0.18370 | 0.18478 | +0.59% |
+| P99 per-chunk RTF | 1.08678 | 1.06626 | -1.89% |
+
+Lower is better except for throughput. The live service logged
+`MiniCPM-o NPU cache-major Conv+MLP megagraph replay active`, with no compile
+failure or eager fallback. The result is a small end-to-end win rather than a
+2.31x service gain because the causal-pack kernel is only one small component
+of the full text, audio-token, CFM, and vocoder pipeline. Median TTFP and
+median chunk RTF are effectively neutral and slightly worse, so the new
+profile remains opt-in:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_cache_major_experimental.yaml
+```
+
+The aggregate-output and exact native-kernel checks are structural evidence,
+not a replacement for the full official Seed-TTS WER/SIM, Daily-Omni, and
+Video-MME accuracy gates. Those gates are still required before promotion.
+
+A separately tested HiFT static-weight conversion was rejected: frozen and
+unfrozen paths measured 213.259 us and 212.383 us respectively (0.996x), and
+the attempted FRACTAL_Z lowering was not semantically valid for this Conv1d
+weight layout. Neither experiment is enabled.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-cache-major-20260817
+```
+
+Result checksums:
+
+```text
+fd0f3623d1adb1ab25e0de14891d5cb7de0b40f510c11851ff6620fa952a9122  candidate-run1.json
+c021eca41c2e99afe8b3b0c5650542e14ae322d7d9f2ba95072e24103843eb07  candidate-run2.json
+967163735a4001ab69bf370815846bb8ffd28c676a079231a7b8912d4b6321ce  candidate-run3.json
+3ec715f54c52f23cf730feb3a8b5f47495ea39bb9c7d9c4a61498414ed524936  control-run1.json
+0cc6dc6f17b104de35ea2139b433519da3c5d68176a0c49732a9ee29d0033f5e  control-run2.json
+96251e1a84d9f6bee266f67e48578ed46c9da051e11190b532158323e74b4fae  control-run3.json
 ```

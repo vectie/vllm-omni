@@ -2305,3 +2305,90 @@ Result checksums:
 7581689ff07792a4d1952c4543dbee1d40ad19195e6f545478e828ca2bbc68ab  control-en32.json
 e30299874e9f5d02f235740ed8b9e68ea26658282fa806a4685a78a2b03e0a61  candidate-en32.json
 ```
+
+## Prompt-width DiT graph buckets and widened Conv+MLP boundary
+
+The post-HiFT-F0 Stage-2 trace showed that the fixed 50-frame streaming path
+was no longer the only relevant DiT shape. Prompt setup and finalization also
+repeated stable 302- and 20-frame shapes, but both fell back to the original
+eager block. The first candidate generalized the existing TorchAir MLP and
+attention-preamble partitions to an explicit `[20, 50, 302]` width set. It
+also allowed the uncached setup pass to use the graph path: upstream
+`CausalConv1d.forward_chunk(None)` creates an all-zero causal history, so the
+adapter can preserve exact cache semantics without requiring a prior chunk.
+
+All six MLP/preamble shapes compiled and replayed on the same 910C host. The
+three-run split-boundary median was effectively neutral versus the immediately
+preceding HiFT-F0 result: serving duration improved 0.08% and mean per-chunk
+RTF improved 0.91%, while mean TTFP regressed 1.01% and median per-chunk RTF
+regressed 9.33%. This confirmed that compiling more small islands alone did
+not remove enough eager layout and launch overhead.
+
+The widened candidate therefore adds a regular Conv/cache + gated residual +
+MLP megagraph for the 20- and 302-frame buckets. It deliberately does not use
+the fixed-width native causal-pack converter: regular Conv1d remains visible
+inside GE at these widths, while the qualified 50-frame path continues to use
+the native-pack megagraph. Both additional graphs compiled, and a live request
+logged independent replay at widths 302 and 20 with no fallback:
+
+```text
+Compiled MiniCPM-o NPU prompt Conv+MLP megagraph for 2x20x512
+Compiled MiniCPM-o NPU prompt Conv+MLP megagraph for 2x302x512
+MiniCPM-o NPU prompt Conv+MLP megagraph replay active at width=302
+MiniCPM-o NPU prompt Conv+MLP megagraph replay active at width=20
+```
+
+Three resident candidate runs used the same 32 fixed English Seed-TTS rows,
+three warmups, concurrency one, seed zero, temperature zero, CFM6, and nested
+TTS request body. The comparison below uses the three-run candidate median
+and the immediately preceding HiFT-F0 control. Lower is better except for
+throughput.
+
+| Metric | HiFT-F0 control | Widened prompt graph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 42.505 s | 41.281 s | -2.88% |
+| Request throughput | 0.7529 req/s | 0.7752 req/s | +2.96% |
+| Audio throughput | 3.297x | 3.394x | +2.96% |
+| Mean E2E | 1,327.91 ms | 1,289.58 ms | -2.89% |
+| Median E2E | 1,335.23 ms | 1,318.25 ms | -1.27% |
+| P99 E2E | 1,755.99 ms | 1,705.56 ms | -2.87% |
+| Mean TTFT | 314.55 ms | 310.09 ms | -1.42% |
+| Median TTFT | 313.13 ms | 315.62 ms | +0.79% |
+| P99 TTFT | 445.42 ms | 450.95 ms | +1.24% |
+| Mean audio TTFP | 787.02 ms | 749.41 ms | -4.78% |
+| Median audio TTFP | 790.42 ms | 752.99 ms | -4.74% |
+| P99 audio TTFP | 933.19 ms | 915.84 ms | -1.86% |
+| Mean per-chunk RTF | 0.32990 | 0.31848 | -3.46% |
+| Median per-chunk RTF | 0.14090 | 0.15142 | +7.47% |
+| P99 per-chunk RTF | 1.05869 | 1.01870 | -3.78% |
+
+Every widened run completed 32/32 requests with zero failures and retained
+the exact aggregate structure: 4,801 input tokens, 480 output tokens,
+3,362,880 audio frames, and 140.12 seconds of audio. The full Code2Wav
+regression file passed 66/66, including exact partition math at widths 20, 50,
+and 302. The candidate remains opt-in because median/P99 TTFT and median chunk
+RTF did not improve, and structural parity is not a substitute for the full
+Seed-TTS WER/SIM, Daily-Omni, and Video-MME accuracy gates.
+
+Use the experimental profile:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
+```
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-prompt-graph-buckets-20260815/results
+```
+
+Result checksums:
+
+```text
+27ae6871bc2043d6bc553c9825a31f60335af63781ff4826f7bbabc5ff8c7e07  candidate-en32-valid.json
+104c1ccf6e1cfc135106f5a975e7efb8d99e8724c42bdc7759153f5202405c0e  candidate-en32-run2.json
+a34cf535a89e5331e120113e720be3c4fd950626d14757789e1a8063227900a5  candidate-en32-run3.json
+bdc4a6ba38a45f5848429cba24749096fff7bcb0bf9f9b78b441cfc9d0e0dcda  prompt-wide-en32-run1.json
+0396c16fdc8cb55aca790f9085cfa80305f963e31f1f6a07f8d78c6e67b8c563  prompt-wide-en32-run2.json
+83b355b474c1d4ef094b18f6aaec97847da7fd9a8f4c302054eb1d4e67a3c372  prompt-wide-en32-run3.json
+```

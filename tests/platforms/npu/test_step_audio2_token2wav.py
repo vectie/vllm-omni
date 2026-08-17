@@ -273,6 +273,24 @@ def test_hift_fixed_istft_matches_torch_istft(monkeypatch: pytest.MonkeyPatch) -
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_hift_stft_window_placement_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    hift = SimpleNamespace(stft_window=torch.arange(16, dtype=torch.float32))
+    target = torch.device("meta")
+
+    assert module._place_hift_stft_window(hift, target) is True
+    assert hift.stft_window.device == target
+    assert module._place_hift_stft_window(hift, target) is False
+
+
+def test_hift_stft_window_placement_rejects_missing_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    with pytest.raises(TypeError, match="stft_window tensor"):
+        module._place_hift_stft_window(SimpleNamespace(stft_window=None), torch.device("cpu"))
+
+
 @pytest.mark.parametrize(("width", "window_size"), [(1, 16), (17, 15)])
 def test_hift_fixed_istft_constants_reject_invalid_layout(
     monkeypatch: pytest.MonkeyPatch,

@@ -17,6 +17,8 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
    and ISTFT visible to the surrounding eager execution.
 6. HiFT fixed ISTFT — replace the steady 16-point complex ISTFT with a static
    real inverse transform and four-way overlap-add graph.
+7. HiFT window residency — keep the immutable Hann window on NPU instead of
+   copying it from CPU in every STFT and ISTFT call.
 """
 
 from __future__ import annotations
@@ -50,10 +52,23 @@ _HIFT_RESBLOCK_GRAPH_STAGE_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_S
 _HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_MEL_WIDTH"
 _HIFT_FIXED_ISTFT_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH"
 _HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH"
+_HIFT_RESIDENT_STFT_WINDOW_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESIDENT_STFT_WINDOW"
 
 
 def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _place_hift_stft_window(hift: torch.nn.Module, device: torch.device) -> bool:
+    """Place HiFT's unregistered immutable Hann window on its compute device."""
+    window = getattr(hift, "stft_window", None)
+    if not isinstance(window, torch.Tensor):
+        raise TypeError("expected HiFT stft_window tensor")
+    if window.device == device:
+        return False
+    hift.stft_window = window.to(device=device)
+    logger.info("Placed HiFT STFT window on %s", device)
+    return True
 
 
 def _hift_f0_graph_width() -> int:
@@ -704,6 +719,11 @@ def _patched_ensure_models_loaded(self) -> None:
     if was_loaded or self.device.type != "npu" or self._hift is None:
         return
     patch_step_audio2_hift_for_npu(self._hift)
+    if _env_flag_enabled(_HIFT_RESIDENT_STFT_WINDOW_ENV):
+        try:
+            _place_hift_stft_window(self._hift, self.device)
+        except Exception:
+            logger.warning("Unable to keep HiFT STFT window on NPU; using per-call copies", exc_info=True)
     if _env_flag_enabled(_HIFT_MATERIALIZE_WEIGHT_NORM_ENV):
         materialize_hift_weight_norm_for_npu(self._hift)
     if _env_flag_enabled(_HIFT_F0_GRAPH_ENV):

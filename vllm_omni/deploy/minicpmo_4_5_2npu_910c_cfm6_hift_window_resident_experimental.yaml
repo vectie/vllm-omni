@@ -1,0 +1,16 @@
+# Atlas 800I A3 / Ascend 910C HiFT window-residency candidate.
+#
+# flashcosyvoice stores its 16-value Hann window as an ordinary CPU tensor,
+# not a registered module buffer. Its STFT and ISTFT paths consequently call
+# window.to(NPU) for every streamed chunk. Keep that immutable tensor beside
+# the Stage-2 model so those calls become no-ops while retaining the exact
+# upstream STFT and ISTFT operators.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_hift_resblock_graph_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_RESIDENT_STFT_WINDOW: "1"

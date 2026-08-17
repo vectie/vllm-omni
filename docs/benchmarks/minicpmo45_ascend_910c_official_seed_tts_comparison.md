@@ -2771,3 +2771,80 @@ Additional artifact checksums:
 1b6f5710dd93b5b0649fe413a93592ffaf6f7022da74ed0f4f19720c0f877d2e  micro-stage2.log
 fa4705e403b0d91473e5761138dd39c6725f244b180b73afdf92ad4fc40330c1  all-stages candidate-run1.json
 ```
+
+### Native full-block and aggregate-graph screening
+
+Two more aggressive ways of reducing the three stage-0 graph replays were
+implemented and measured on the same 910C host. Neither passed the promotion
+gate, so both implementations were removed rather than retained behind another
+environment flag.
+
+The first candidate was a native AscendC operator covering one complete HiFT
+residual block. Its isolated ACLNN package and Torch extension built and ran on
+the target NPU, but the hand-packed convolution path was both slower and less
+accurate than CANN's native Conv1d sequence:
+
+| Kernel size | Eager | Native fused op | Speed | Max / mean absolute error | Cosine |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 3 | 700.381 us | 1,217.207 us | 0.575x | 0.029517 / 0.000091 | 0.999961 |
+| 7 | 764.729 us | 2,244.750 us | 0.341x | 0.051999 / 0.000198 | 0.999858 |
+| 11 | 777.552 us | 2,388.385 us | 0.326x | 0.106543 / 0.013123 | 0.987252 |
+
+This rejects hand-lowering HiFT Conv1d through im2col plus Matmul. A future
+native attempt needs a real CANN/AscendC convolution primitive or a
+layout-specialized direct convolution; pointwise fusion alone cannot recover a
+2--3x convolution regression or the changed accumulation order.
+
+The second candidate kept CANN's existing convolution kernels but compiled all
+three parallel residual blocks and their exact sum into one static TorchAir
+graph. The first patched block returned the aggregate and the two siblings
+returned neutral tensors, while every mismatch or graph failure used the exact
+eager sum. Compilation required bit-exact output before installation.
+
+Its real-checkpoint NPU microbenchmark was compelling but misleading in
+isolation:
+
+| Three stage-0 residual blocks | Total latency | Relative |
+| --- | ---: | ---: |
+| Eager | 3,671.139 us | 1.000x |
+| Existing three graphs | 1,671.924 us | 2.196x faster than this eager run |
+| Aggregate graph | 1,189.099 us | 3.087x faster than eager; 28.88% below three graphs |
+
+The aggregate output had maximum absolute error `0.0`, and the resident service
+logged the aggregate replay marker without fallback. End-to-end behavior still
+regressed. The first run took 53.211 seconds; after all lazy compilation was
+resident, the second run took 46.523 seconds. The table compares that faster
+second run with the accepted stage-0 three-graph median. Lower is better except
+for throughput:
+
+| Metric | Accepted three-graph median | Aggregate warm run | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.632 s | 46.523 s | +11.75% |
+| Request throughput | 0.7686 req/s | 0.6878 req/s | -10.51% |
+| Mean / median / P99 E2E | 1,300.67 / 1,314.86 / 1,767.13 ms | 1,453.44 / 1,495.60 / 1,980.69 ms | +11.75% / +13.75% / +12.09% |
+| Mean / median / P99 TTFT | 310.72 / 311.90 / 451.33 ms | 340.62 / 338.50 / 553.26 ms | +9.62% / +8.53% / +22.58% |
+| Mean / median / P99 audio TTFP | 760.16 / 763.25 / 919.56 ms | 818.34 / 821.03 / 1,023.54 ms | +7.65% / +7.57% / +11.31% |
+| Mean / median / P99 chunk RTF | 0.319996 / 0.160253 / 1.025924 | 0.353397 / 0.175568 / 1.112279 | +10.44% / +9.56% / +8.42% |
+
+Both aggregate runs completed 32/32 requests with zero failures, 100%
+continuity, 4,801 input tokens, 480 output tokens, 3,362,880 audio frames, and
+140.12 seconds of audio. The regression is therefore execution efficiency, not
+workload or output-structure drift. The larger opaque graph boundary removes
+three replay launches but prevents more valuable scheduling/layout optimization
+around the existing HiFT path. The result closes aggregate sibling capture for
+this software stack: retain the three independent stage-0 graphs, and make any
+next HiFT fusion transparent to GE or lower it inside CANN's convolution
+implementation.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-aggregate-20260817
+```
+
+Artifact checksums:
+
+```text
+c200cee3144ec4312eaf8c9116ccb7e103b86992b0db47debcce08ff1c13f016  candidate-run1.json
+6bfb71ade93dfb06bb75d201d7be7d1fd1d2b084d938814d6073825f9d207705  candidate-run2.json
+```

@@ -2392,3 +2392,99 @@ bdc4a6ba38a45f5848429cba24749096fff7bcb0bf9f9b78b441cfc9d0e0dcda  prompt-wide-en
 0396c16fdc8cb55aca790f9085cfa80305f963e31f1f6a07f8d78c6e67b8c563  prompt-wide-en32-run2.json
 83b355b474c1d4ef094b18f6aaec97847da7fd9a8f4c302054eb1d4e67a3c372  prompt-wide-en32-run3.json
 ```
+
+## Further tuning: HiFT bucket and complete-DiT graph screening
+
+The next tuning pass tested two wider boundaries rather than assuming that
+more graph coverage is automatically faster. Both candidates remain disabled
+because same-host measurements rejected them.
+
+### HiFT first-chunk bucket
+
+The HiFT feature compiler now supports an optional static-width list through
+`VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_BUCKETS`. The candidate added width 50
+beside the accepted width 58. Both shapes compiled, matched the eager feature
+stack bit-for-bit, and replayed on NPU. Three 32-item runs completed without a
+failure, but their 42.650-second median was 3.31% slower than the preceding
+41.281-second prompt-width median. The extra bucket is therefore not enabled
+by any promoted profile.
+
+This experiment also exposed a configuration correctness issue: stage `env`
+maps were replaced rather than recursively merged while resolving a derived
+deploy profile. `env` now follows the same deep-merge rule as engine arguments,
+so a child profile can add one stage variable without dropping inherited HiFT
+flags.
+
+Result checksums:
+
+```text
+5183bebda37cfce1a49a2aefae7b5abf6d30932a6bae02ed72e042b028e1ad4a  f0-buckets-en32-run1.json
+0b5e277d41fc99a0a917361d1b88f36e04d8c95b4dcaf1aa858a75339f79a2e2  f0-buckets-en32-run2.json
+8b9e954e74a43a6e059f2877a2ad39778d2d962fef113e5fb68a3519f3784fec  f0-buckets-en32-run3.json
+```
+
+### Full DiT block and 16-block stack graphs
+
+Torch-NPU 2.10 rewrites SDPA to the six-output
+`npu_fusion_attention_v3` overload, while the competition image's TorchAir
+contains a converter only for the older seven-output overload. The Ascend fork
+now has a lazy inference converter that lowers the v3 BNSD/no-dropout subset to
+GE `FlashAttentionScore`. With it, complete width-50 DiT block graphs compiled
+at the three observed cache lengths 302, 352, and 402 and replayed at all three
+lengths in a real request.
+
+That successful lowering was not a speed win. A warmed same-row request took
+6.312 seconds versus 1.166 seconds on the restored split boundary; audio TTFP
+regressed from 0.760 to 6.014 seconds. Combining all 16 blocks into one graph
+removed per-block replay overhead but still took 6.168 seconds. Replacing
+small-shape FlashAttention (`q=50`, `kv<=452`, head dimension 64) with explicit
+`BatchMatMulV2 -> softmax -> BatchMatMulV2` also compiled as one stack graph,
+but took 6.149 seconds. The near-identical results show that the opaque call
+boundary was not the limiting cost: this CANN/TorchAir version produces a
+large GE plan whose execution is substantially slower than the qualified
+split eager/graph path. Cold first use was also 49-59 seconds for these plans.
+
+| Same first Seed-TTS row, warmed | E2E | Audio TTFP | First chunk RTF | Decision |
+| --- | ---: | ---: | ---: | --- |
+| Restored prompt-width split profile | 1.166 s | 0.760 s | 0.905 | Keep |
+| Complete graph per DiT block | 6.312 s | 6.014 s | 7.160 | Reject |
+| One 16-block stack, FlashAttention | 6.168 s | 5.820 s | 6.928 | Reject |
+| One 16-block stack, explicit BMM attention | 6.149 s | 5.814 s | 6.921 | Reject |
+
+The graph implementations and profiles remain opt-in diagnostics for newer
+CANN/TorchAir releases; neither flag is set by the accepted profile. Runtime
+guards fail closed to the existing split path on an unsupported layout, cache
+length, or compile failure.
+
+After restoring
+`minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml`, two
+fresh resident 32-item checks completed 32/32 with zero failures and exact
+aggregate parity (4,801 input tokens, 480 output tokens, 3,362,880 frames, and
+140.12 seconds of audio). They measured 44.681 and 44.619 seconds on the current
+host state. This is slower than the earlier 41.281-second three-run median but
+matches the older 44.724-second HiFT control; because all active graph markers
+and request structure are unchanged, it is recorded as host/run variance, not
+as a promoted regression or improvement. The directly affected Code2Wav and
+NPU-platform suites passed 99/99. Official Seed-TTS WER/SIM, Daily-Omni, and
+Video-MME gates remain required before promoting any accuracy-changing
+attention replacement.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-f0-buckets-20260817
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-full-dit-v3-20260817
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-full-stack-20260817
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-full-stack-bmm-20260817
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-further-tuning-20260817
+```
+
+Selected warmed/restored checksums:
+
+```text
+de07894d23922b864cbb4489c0927bf9bcd70961579156dc617e7734cf2ee5c3  full-dit-v3-axis-smoke-2.json
+161cbd79fb766f6b591ffe6636bbc4b979f2970b12c9ee248246c33c4a3099bc  full-stack-smoke2.json
+c078a44dae35b4c0677e6b6e83d3efaa2dd56a45512354bb49d2bebe7e94dca7  full-stack-bmm-smoke2.json
+0de7ea26751f335318d5ac944d85a0258b03b15e51cf2b7dfc4e1a9a5116f35b  restored-prompt-en32.json
+901f70df0afbc529445f141ff043464f83fc940d0b13f15673affe40be1df133  restored-prompt-en32-run2.json
+```

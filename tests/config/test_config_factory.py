@@ -2331,7 +2331,6 @@ class TestPlatformOverrides:
         assert extra["npu_dit_mlp_graph"] is True
         assert extra["npu_dit_preamble_graph"] is True
         assert extra["npu_dit_conv_mlp_graph"] is True
-        assert extra["npu_dit_prompt_conv_mlp_graph"] is True
 
     def test_minicpmo_4_5_910c_prompt_graph_buckets_are_explicit(self):
         deploy_path = Path(
@@ -2348,6 +2347,20 @@ class TestPlatformOverrides:
         assert extra["npu_dit_graph_buckets"] == [20, 302]
         assert extra["npu_dit_preamble_graph"] is True
         assert extra["npu_dit_conv_mlp_graph"] is True
+        assert extra["npu_dit_prompt_conv_mlp_graph"] is True
+
+    def test_minicpmo_4_5_910c_cache_major_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_cache_major_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_fused_conv_pack"] is True
+        assert extra["npu_dit_cache_major"] is True
 
     def test_minicpmo_4_5_910c_full_block_cache_buckets_are_explicit(self):
         deploy_path = Path(

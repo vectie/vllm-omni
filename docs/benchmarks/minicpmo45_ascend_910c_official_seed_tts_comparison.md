@@ -2848,3 +2848,85 @@ Artifact checksums:
 c200cee3144ec4312eaf8c9116ccb7e103b86992b0db47debcce08ff1c13f016  candidate-run1.json
 6bfb71ade93dfb06bb75d201d7be7d1fd1d2b084d938814d6073825f9d207705  candidate-run2.json
 ```
+
+### Fixed-size HiFT ISTFT graph and layout screens
+
+The next lower-level screen targeted HiFT's final inverse transform. MiniCPM-o
+fixes this operation at `n_fft=16` and `hop_len=4`, while the steady 58-frame
+mel chunk reaches `[1,9,6961]` magnitude and phase tensors. The candidate
+replaced complex-tensor construction and the general `torch.istft` path with
+two real 16-by-9 linear transforms and an exact four-way Hann overlap-add.
+The centered edge envelope is precomputed from the checkpoint window rather
+than assuming an interior constant.
+
+The graph is guarded by shape, dtype, device, and checkpoint ISTFT parameters.
+Its startup gate compares the compiled waveform with upstream, and every
+unsupported input or graph exception fails closed to the original bound
+method. The focused suite passed 44/44. On NPU 1, 30 warmups and 200 measured
+steady-width iterations produced:
+
+| Steady HiFT ISTFT | Latency | Relative |
+| --- | ---: | ---: |
+| Generic complex `torch.istft` | 429.646 us | 1.000x |
+| Specialized eager real path | 319.710 us | 1.344x faster |
+| Specialized TorchAir graph | 178.029 us | 2.413x faster |
+
+The specialized output had maximum absolute error `8.38e-9`, mean absolute
+error `1.43e-9`, and cosine similarity `1.0`. The live service compiled and
+replayed the graph at `[1,9,6961]` without fallback.
+
+That isolated 58.57% graph win did not survive the serving gate. A fresh
+same-source control used the accepted three stage-0 residual graphs; the
+candidate inherited that profile and added only the fixed ISTFT graph. Both
+services ran the same 32 English Seed-TTS rows three times after three
+warmups. Every run completed 32/32 with zero failures, 100% streaming
+continuity, 4,801 input tokens, 480 output tokens, 3,362,880 frames, and
+140.12 seconds of audio. The table uses the median of the three per-run
+metrics; lower is better except for throughput.
+
+| Metric | Fresh control | Fixed ISTFT graph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.751 s | 46.070 s | +2.95% |
+| Request throughput | 0.7151 req/s | 0.6946 req/s | -2.86% |
+| Mean / median / P99 E2E | 1,397.99 / 1,420.43 / 1,874.67 ms | 1,439.20 / 1,472.16 / 1,942.34 ms | +2.95% / +3.64% / +3.61% |
+| Mean / median / P99 TTFT | 321.18 / 321.28 / 471.20 ms | 316.36 / 314.83 / 449.43 ms | -1.50% / -2.01% / -4.62% |
+| Mean / median / P99 audio TTFP | 799.67 / 796.31 / 962.61 ms | 794.57 / 793.96 / 935.50 ms | -0.64% / -0.30% / -2.82% |
+| Mean / median / P99 chunk RTF | 0.342507 / 0.185401 / 1.089012 | 0.350319 / 0.194845 / 1.065672 | +2.28% / +5.09% / -2.14% |
+
+The graph improves TTFT and TTFP, but it regresses the primary serving,
+throughput, E2E, and central chunk-RTF metrics. As with the rejected aggregate
+residual graph, the extra opaque replay boundary prevents more valuable
+whole-pipeline scheduling than its local kernel saving recovers. The profile
+therefore remains diagnostic-only, and the full Seed-TTS WER/SIM,
+Daily-Omni, and Video-MME gates were not spent on a candidate that already
+failed the speed gate:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_fixed_istft_graph_experimental.yaml
+```
+
+Two adjacent layout screens were also closed before service promotion.
+Enabling CANN internal formats after NPU initialization retained bit-exact
+residual outputs, but paired long-run graph totals were effectively tied at
+about 1,705 us candidate versus 1,707 us control. Re-expressing all 18
+stage-0 Conv1d operations as singleton-height Conv2d was bit-exact, but each
+kernel was neutral to slightly slower; CANN selected the same effective path.
+Direct packed Conv3d was rejected by the installed CANN rewrite because its
+`Conv3dv2` fusion accepts static shapes only.
+
+Raw serving artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-fixed-istft-20260817
+```
+
+Artifact checksums:
+
+```text
+28fb51a87f9c91ccb805cae19706a894a8dfc0a130474e7fa51741cecb6dfec3  candidate-run1.json
+69bc48c0bbef830f3dee185ad1b267b1b886de0f12b0b55258a2b1fe911f1ad0  candidate-run2.json
+218fb9dca59c1db0f11ffb41a8410a3eb3364aa134db691a476327badcbf0e90  candidate-run3.json
+12558f29afdd2295055c30b08a52b6380188e50ec4b7f00698c3669a6bd1b9a8  control-run1.json
+c518d4ad1b6904656c34595f995960b4106ba468fe55a4e12db8ae122ca2ebfc  control-run2.json
+c9608777664cd5923391949af8bf17636cb33948528dc20bbc5a8196e2f965fc  control-run3.json
+```

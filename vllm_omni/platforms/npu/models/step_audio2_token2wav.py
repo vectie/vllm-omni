@@ -52,7 +52,6 @@ _HIFT_RESBLOCK_GRAPH_STAGE_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_S
 _HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_MEL_WIDTH"
 _HIFT_FIXED_ISTFT_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH"
 _HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH"
-_HIFT_RESIDENT_STFT_WINDOW_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESIDENT_STFT_WINDOW"
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -719,11 +718,10 @@ def _patched_ensure_models_loaded(self) -> None:
     if was_loaded or self.device.type != "npu" or self._hift is None:
         return
     patch_step_audio2_hift_for_npu(self._hift)
-    if _env_flag_enabled(_HIFT_RESIDENT_STFT_WINDOW_ENV):
-        try:
-            _place_hift_stft_window(self._hift, self.device)
-        except Exception:
-            logger.warning("Unable to keep HiFT STFT window on NPU; using per-call copies", exc_info=True)
+    try:
+        _place_hift_stft_window(self._hift, self.device)
+    except Exception:
+        logger.warning("Unable to keep HiFT STFT window on NPU; using per-call copies", exc_info=True)
     if _env_flag_enabled(_HIFT_MATERIALIZE_WEIGHT_NORM_ENV):
         materialize_hift_weight_norm_for_npu(self._hift)
     if _env_flag_enabled(_HIFT_F0_GRAPH_ENV):

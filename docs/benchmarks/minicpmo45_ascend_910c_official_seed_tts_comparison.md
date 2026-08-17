@@ -2930,3 +2930,67 @@ Artifact checksums:
 c518d4ad1b6904656c34595f995960b4106ba468fe55a4e12db8ae122ca2ebfc  control-run2.json
 c9608777664cd5923391949af8bf17636cb33948528dc20bbc5a8196e2f965fc  control-run3.json
 ```
+
+### Promoted HiFT STFT-window residency
+
+The fixed-ISTFT rejection exposed a smaller transparent optimization.
+`flashcosyvoice.HiFTGenerator` assigns its 16-value Hann window as an ordinary
+CPU tensor rather than a registered module buffer. Both `_stft` and `_istft`
+therefore evaluate `self.stft_window.to(input.device)` on every streamed
+chunk. The promoted patch moves that immutable tensor to the Stage-2 device
+once after checkpoint loading. The upstream STFT, ISTFT, complex arithmetic,
+window values, and accumulation order remain unchanged; their existing
+`.to(npu)` calls become no-ops.
+
+A real-width NPU-1 microbenchmark used 50 warmups and 500 iterations. All
+outputs were bit-exact:
+
+| Operation at 6,961 spectral frames | CPU window | Resident NPU window | Change |
+| --- | ---: | ---: | ---: |
+| HiFT ISTFT | 457.194 us | 397.764 us | -13.00% |
+| HiFT STFT | 291.760 us | 159.465 us | -45.35% |
+
+The placement is idempotent and fails closed: a missing or incompatible
+window logs a warning and leaves the existing per-call copies in place. The
+focused NPU patch suite passed 46/46.
+
+The serving candidate added window residency to the selected three stage-0
+residual graphs. It was compared with the fresh three-run residual-graph
+control collected immediately before this candidate on the same host and
+source stack. Both sides used 32 fixed English Seed-TTS rows, three warmups,
+concurrency one, seed zero, temperature zero, and CFM6. Every run completed
+32/32 with zero failures, 100% continuity, 4,801 input tokens, 480 output
+tokens, 3,362,880 frames, and 140.12 seconds of audio. The table reports the
+three-run median; lower is better except for throughput.
+
+| Metric | Fresh control | Resident window | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.751 s | 42.720 s | -4.54% |
+| Request throughput | 0.7151 req/s | 0.7491 req/s | +4.75% |
+| Mean / median / P99 E2E | 1,397.99 / 1,420.43 / 1,874.67 ms | 1,334.69 / 1,358.89 / 1,809.03 ms | -4.53% / -4.33% / -3.50% |
+| Mean / median / P99 TTFT | 321.18 / 321.28 / 471.20 ms | 308.79 / 308.87 / 441.33 ms | -3.86% / -3.86% / -6.34% |
+| Mean / median / P99 audio TTFP | 799.67 / 796.31 / 962.61 ms | 761.79 / 765.78 / 907.33 ms | -4.74% / -3.83% / -5.74% |
+| Mean / median / P99 chunk RTF | 0.342507 / 0.185401 / 1.089012 | 0.326712 / 0.180163 / 1.026645 | -4.61% / -2.83% / -5.73% |
+
+Every measured performance gate improves. Since the patch changes no model
+operation or value and the isolated STFT/ISTFT outputs are bit-exact, the
+existing Seed-TTS, Daily-Omni, and Video-MME qualifications carry forward.
+Window residency is therefore promoted as an always-on Ascend HiFT behavior;
+it has no deployment flag or separate production profile.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-window-resident-20260818
+```
+
+Artifact checksums:
+
+```text
+12558f29afdd2295055c30b08a52b6380188e50ec4b7f00698c3669a6bd1b9a8  control-run1.json
+c518d4ad1b6904656c34595f995960b4106ba468fe55a4e12db8ae122ca2ebfc  control-run2.json
+c9608777664cd5923391949af8bf17636cb33948528dc20bbc5a8196e2f965fc  control-run3.json
+9282e7c6c88b515999eff419db4bdf25e6192aab9c14f522ae11112af5f7dd7d  candidate-run1.json
+c7579ea11df3dca4ecfdd0d9ec88f563e191c47061ca24a188bfe923e029e046  candidate-run2.json
+00345f32a473ffa628013ac4455160ab5c625d7221685cc26b04a32cd95fdd35  candidate-run3.json
+```

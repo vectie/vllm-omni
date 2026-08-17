@@ -2583,3 +2583,76 @@ c021eca41c2e99afe8b3b0c5650542e14ae322d7d9f2ba95072e24103843eb07  candidate-run2
 0cc6dc6f17b104de35ea2139b433519da3c5d68176a0c49732a9ee29d0033f5e  control-run2.json
 96251e1a84d9f6bee266f67e48578ed46c9da051e11190b532158323e74b4fae  control-run3.json
 ```
+
+## Post-attention graph and native QKV layout screening
+
+Two follow-up candidates tested narrower lower-level boundaries against the
+cache-major path. Neither is promoted.
+
+The first moved the attention residual, `norm3`, modulation, native causal
+pack, convolution, and MLP into one post-attention graph. It compiled and
+replayed, but a fail-fast 32-request run took 47.460 seconds, 8.47% longer
+than the 43.754-second cache-major median. Mean E2E rose to 1,482.69 ms and
+mean chunk RTF to 0.36418. The opaque wider graph therefore prevents more
+valuable GE scheduling than it saves in Python/launch overhead. It remains an
+explicit diagnostic only:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_post_attention_experimental.yaml
+```
+
+The second candidate kept the successful preamble boundary but replaced the
+three fixed `[2,50,512]` BSH-to-BNSD materializations with one AscendC
+`MinicpmoQkvPack` launch. Q/K normalization and SDPA remain visible to GE;
+widths 20 and 302 continue to use the ordinary preamble graph. The custom
+operator passed exact FP16, FP32, and BF16 checks. Alternating-order NPU
+microbenchmarks measured the following (lower is better):
+
+| Width-50 QKV layout path | Median | Minimum |
+| --- | ---: | ---: |
+| Three transpose/materialize operations | 67.618 us | 62.530 us |
+| Native QKV pack | 40.267 us | 40.136 us |
+
+The native kernel is 1.68x faster by median, and TorchAir successfully
+compiled and replayed it inside the preamble graph. The complete Seed-TTS
+fail-fast run nevertheless took 44.642 seconds: 2.03% slower than the
+cache-major candidate median and effectively equal to the recent
+44.619-second restored control. It completed 32/32 requests with zero
+failures and exact aggregate parity: 4,801 input tokens, 480 output tokens,
+3,362,880 frames, and 140.12 seconds of audio.
+
+| QKV candidate metric | Result |
+| --- | ---: |
+| Request throughput | 0.7168 req/s |
+| Audio throughput | 3.1388x realtime |
+| Mean / median E2E | 1,394.68 / 1,449.75 ms |
+| Mean / median TTFT | 319.63 / 328.86 ms |
+| Mean / median audio TTFP | 787.90 / 796.39 ms |
+| Mean / median chunk RTF | 0.34324 / 0.18816 |
+
+This is a useful kernel but not a serving optimization on the current
+CANN/TorchAir stack, so it also remains opt-in:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_qkv_pack_experimental.yaml
+```
+
+The selected three-op package (`AddRmsNormBias`, causal pack, and QKV pack)
+has SHA-256 `47230e94d72cc8c61070126597c3c095eaf1143fc652c0c7b1056fb983a00ab7`.
+The Ascend build now supports an explicit selected-op override and an
+extension-only rebuild against an already installed ACLNN package, avoiding
+accidental recompilation of the full custom-op matrix during kernel iteration.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-post-attention-20260817
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-qkv-pack-20260817
+```
+
+Result checksums:
+
+```text
+78739916d99822fb74624ecb6046ba380b212d96f262cba576899bce4dfdffd9  post-attention candidate-run1.json
+e5b4729f87abfd99c47fd6c29683cc14fb0be8d8719b173be82e182221628ed5  qkv-pack candidate-run1
+```

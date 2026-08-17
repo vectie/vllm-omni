@@ -2656,3 +2656,90 @@ Result checksums:
 78739916d99822fb74624ecb6046ba380b212d96f262cba576899bce4dfdffd9  post-attention candidate-run1.json
 e5b4729f87abfd99c47fd6c29683cc14fb0be8d8719b173be82e182221628ed5  qkv-pack candidate-run1
 ```
+
+## HiFT stage-0 residual-block graphs
+
+The next Stage-2 boundary targets the vocoder rather than widening the DiT
+graphs. For the steady 58-frame mel chunk, HiFT's first transposed-convolution
+stage produces `[1, 256, 464]`. It then evaluates three parallel residual
+blocks, each containing three `Snake -> Conv1d -> Snake -> Conv1d -> add`
+sequences. The new opt-in path compiles each complete residual block as one
+static TorchAir graph. Upsampling, source injection, and ISTFT remain visible
+to the existing eager pipeline, and every non-matching shape uses the original
+bound method.
+
+Startup derives the graph shape from the checkpoint's transposed-convolution
+parameters, materializes immutable inference weight norm, compiles all three
+siblings, and requires bit-exact output from every graph before installing any
+of them. A runtime graph exception disables only that block and fails closed
+to eager execution. The focused patch suite passed 40/40 both locally and in
+the 910C environment.
+
+The saved standalone NPU-1 microbenchmark used 20 warmups and 100 iterations
+per block. Lower is better:
+
+| Three stage-0 residual blocks | Total latency | Relative |
+| --- | ---: | ---: |
+| Eager | 3,608.739 us | 1.000x |
+| TorchAir graphs | 1,671.924 us | 2.158x faster |
+
+All three block outputs had maximum absolute error `0.0`. The live candidate
+service subsequently logged all three replay markers on real Stage-2 inputs,
+with no graph failure or eager fallback.
+
+The end-to-end A/B used the existing widened prompt-graph profile as control.
+The candidate added only:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_resblock_graph_experimental.yaml
+```
+
+Both variants ran three times over the same 32 English Seed-TTS rows with
+three warmups, concurrency one, seed zero, temperature zero, and the same CFM6
+request body. Every run completed 32/32 with zero failures and 100% streaming
+continuity. Every run also produced exactly 4,801 input tokens, 480 output
+tokens, 3,362,880 frames, and 140.12 seconds of audio.
+
+| Metric (three-run median) | Prompt-graph control | HiFT residual graphs | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.136 s | 41.632 s | -5.67% |
+| Request throughput | 0.7250 req/s | 0.7686 req/s | +6.02% |
+| Mean E2E | 1,378.87 ms | 1,300.67 ms | -5.67% |
+| Median E2E | 1,420.05 ms | 1,314.86 ms | -7.41% |
+| P99 E2E | 1,886.40 ms | 1,767.13 ms | -6.32% |
+| Mean TTFT | 314.96 ms | 310.72 ms | -1.35% |
+| Median TTFT | 321.22 ms | 311.90 ms | -2.90% |
+| P99 TTFT | 453.78 ms | 451.33 ms | -0.54% |
+| Mean audio TTFP | 777.75 ms | 760.16 ms | -2.26% |
+| Median audio TTFP | 783.08 ms | 763.25 ms | -2.53% |
+| P99 audio TTFP | 913.11 ms | 919.56 ms | +0.71% |
+| Mean per-chunk RTF | 0.339188 | 0.319996 | -5.66% |
+| Median per-chunk RTF | 0.187670 | 0.160253 | -14.61% |
+| P99 per-chunk RTF | 1.043074 | 1.025924 | -1.64% |
+
+Lower is better except for throughput. The candidate improves every median
+and every reported speed metric except P99 TTFP, whose 0.71% regression is
+small but explicit. Exact residual-block output and aggregate serving parity
+provide strong semantic evidence, but they are not substitutes for the full
+1,088-row Seed-TTS WER/SIM, Daily-Omni, and Video-MME accuracy gates. The
+profile therefore remains opt-in until those gates and a longer tail-latency
+run are complete. The accepted prompt-graph control was restored after the
+experiment.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-resblock-20260817
+```
+
+Artifact checksums:
+
+```text
+a7a92998e8b6018e144848451114df0c0eaba0e0eacb0266891c14c0a907fb46  micro-stage0.log
+943e0bd3b773adf02664dbeb665487e6921bfc97a0383baab0b0607647d9c57b  candidate-run1.json
+35650e00f497ddd7b830265f33f43420b80fc750f01aa495e3b6ce8fe09a2242  candidate-run2.json
+670b22a8f1e191e57d10e814a19a58e9d35ecc2640e4f1ade2b9e4e9948b2377  candidate-run3.json
+8680484e28ecd65c81d16d819d70409cc0bdc775eb9939243864bb790cc698c5  control-run1.json
+d17d90c7ca78ad195a85462157cd06a636884839b72f194cc86b52f6e57abd67  control-run2.json
+085bb5a82d07c5227d5654fa22b123b3f34b0036c6512b0b34755e71720ac08f  control-run3.json
+```

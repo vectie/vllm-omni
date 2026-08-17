@@ -10,7 +10,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
     _dit_attention_cache_length,
     _dit_attention_preamble,
+    _dit_attention_preamble_qkv_pack,
     _dit_cache_major_conv_mlp_residual,
+    _dit_cache_major_post_attention_conv_mlp_residual,
     _dit_conv_mlp_residual,
     _dit_explicit_attention,
     _dit_fused_conv_block_mlp_residual,
@@ -29,8 +31,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_graph_buckets,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
+    _npu_dit_post_attn_graph_enabled,
     _npu_dit_preamble_graph_enabled,
     _npu_dit_prompt_conv_mlp_graph_enabled,
+    _npu_dit_qkv_pack_enabled,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -436,6 +440,50 @@ def test_dit_attention_preamble_matches_eager_block_math(width: int):
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+def test_dit_attention_preamble_qkv_pack_matches_standard_partition(monkeypatch):
+    torch.manual_seed(17)
+
+    def qkv_pack(q, k, v):
+        return tuple(value.reshape(2, 50, 8, 64).transpose(1, 2) for value in (q, k, v))
+
+    monkeypatch.setattr(
+        torch.ops._C_ascend,
+        "npu_minicpmo_qkv_pack",
+        qkv_pack,
+        raising=False,
+    )
+    x = torch.randn(2, 50, 512)
+    time_embedding = torch.randn(2, 1, 512)
+    adaln = nn.Linear(512, 9 * 512)
+    to_q = nn.Linear(512, 512)
+    to_k = nn.Linear(512, 512)
+    to_v = nn.Linear(512, 512)
+    q_norm = nn.LayerNorm(64)
+    k_norm = nn.LayerNorm(64)
+    arguments = (
+        x,
+        time_embedding,
+        adaln.weight,
+        adaln.bias,
+        to_q.weight,
+        to_q.bias,
+        to_k.weight,
+        to_k.bias,
+        to_v.weight,
+        to_v.bias,
+        q_norm.weight,
+        q_norm.bias,
+        k_norm.weight,
+        k_norm.bias,
+    )
+
+    actual = _dit_attention_preamble_qkv_pack(*arguments)
+    expected = _dit_attention_preamble(*arguments)
+
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
 def test_attention_from_projected_qkv_matches_cached_sdpa_math():
     torch.manual_seed(12)
     attention = SimpleNamespace(proj=nn.Linear(512, 512), proj_drop=nn.Identity())
@@ -636,6 +684,68 @@ def test_dit_cache_major_conv_mlp_residual_matches_partition_math(monkeypatch):
     )
     torch.testing.assert_close(fused[0], standard[0], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(fused[1].transpose(1, 2), standard[1], rtol=0, atol=0)
+
+
+def test_dit_cache_major_post_attention_conv_mlp_matches_split_math(monkeypatch):
+    torch.manual_seed(16)
+
+    def causal_pack(x, cache):
+        channel_major = cache.transpose(1, 2)
+        history = torch.cat((channel_major, x.transpose(1, 2)), dim=2)
+        packed = torch.stack(
+            [history[:, :, offset : offset + 3].transpose(1, 2).reshape(2, -1) for offset in range(50)],
+            dim=1,
+        ).reshape(100, 1536)
+        return packed, x[:, -2:, :].contiguous()
+
+    monkeypatch.setattr(
+        torch.ops._C_ascend,
+        "npu_minicpmo_causal_conv_pack",
+        causal_pack,
+        raising=False,
+    )
+    hidden = torch.randn(2, 50, 512)
+    attention = torch.randn(2, 50, 512)
+    cache_major = torch.randn(2, 2, 1024)
+    modulations = [torch.randn(2, 1, 512) for _ in range(7)]
+    conv1 = nn.Conv1d(512, 512, 3)
+    conv_norm = nn.LayerNorm(512)
+    conv2 = nn.Conv1d(512, 512, 3)
+    fc1 = nn.Linear(512, 2048)
+    fc2 = nn.Linear(2048, 512)
+    gate_msa, shift_conv, scale_conv, gate_conv, shift_mlp, scale_mlp, gate_mlp = modulations
+    residual = hidden + gate_msa * attention
+    conv_input = F.layer_norm(residual, (512,), eps=1e-6)
+    conv_input = conv_input * (1 + scale_conv) + shift_conv
+    common = (
+        cache_major,
+        gate_conv,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+        conv1.weight.permute(0, 2, 1).reshape(512, 1536),
+        conv1.bias,
+        conv_norm.weight,
+        conv_norm.bias,
+        conv2.weight.permute(0, 2, 1).reshape(512, 1536),
+        conv2.bias,
+        fc1.weight,
+        fc1.bias,
+        fc2.weight,
+        fc2.bias,
+    )
+    split = _dit_cache_major_conv_mlp_residual(residual, conv_input, *common)
+    fused = _dit_cache_major_post_attention_conv_mlp_residual(
+        hidden,
+        attention,
+        cache_major,
+        gate_msa,
+        shift_conv,
+        scale_conv,
+        *common[1:],
+    )
+    torch.testing.assert_close(fused[0], split[0], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(fused[1], split[1], rtol=0, atol=0)
 
 
 def test_dit_fused_conv_block_mlp_residual_matches_partition_math(monkeypatch):
@@ -997,6 +1107,30 @@ def test_npu_dit_cache_major_config_and_environment(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_CACHE_MAJOR", "sometimes")
     with pytest.raises(ValueError, match="NPU_DIT_CACHE_MAJOR"):
         _npu_dit_cache_major_enabled()
+
+
+def test_npu_dit_post_attn_graph_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_POST_ATTN_GRAPH", raising=False)
+    assert _npu_dit_post_attn_graph_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_POST_ATTN_GRAPH", "off")
+    assert _npu_dit_post_attn_graph_enabled(True) is False
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_POST_ATTN_GRAPH", "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_POST_ATTN_GRAPH"):
+        _npu_dit_post_attn_graph_enabled()
+
+
+def test_npu_dit_qkv_pack_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_QKV_PACK", raising=False)
+    assert _npu_dit_qkv_pack_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_QKV_PACK", "off")
+    assert _npu_dit_qkv_pack_enabled(True) is False
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_QKV_PACK", "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_QKV_PACK"):
+        _npu_dit_qkv_pack_enabled()
 
 
 def test_npu_dit_fused_conv_block_config_and_environment(monkeypatch):

@@ -2362,6 +2362,32 @@ class TestPlatformOverrides:
         assert extra["npu_dit_fused_conv_pack"] is True
         assert extra["npu_dit_cache_major"] is True
 
+    def test_minicpmo_4_5_910c_post_attention_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_post_attention_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_cache_major"] is True
+        assert extra["npu_dit_post_attn_graph"] is True
+
+    def test_minicpmo_4_5_910c_qkv_pack_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_qkv_pack_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_cache_major"] is True
+        assert extra["npu_dit_qkv_pack"] is True
+
     def test_minicpmo_4_5_910c_full_block_cache_buckets_are_explicit(self):
         deploy_path = Path(
             get_deploy_config_path(

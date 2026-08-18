@@ -8,6 +8,9 @@
 
 base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
 
-stage2:
-  env:
-    VLLM_OMNI_MINICPMO45_NPU_HIFT_SOURCE_NOISE_SCRATCH: "1"
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_SOURCE_NOISE_SCRATCH: "1"

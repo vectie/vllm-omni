@@ -3061,3 +3061,67 @@ a61765e0d150c6ba976a4cb57dbe22cf2421190dab6988dfd609aa7edeb93ee8  candidate-1.js
 f71855129c223c285c63894954f4687c88c68101409437d6b051e829ed50d75b  candidate-2.json
 0a5a79b6f888c8c27cda3383573b2d2ef8c7420edb660d104ae07aaa6ba9b8e4  candidate-3.json
 ```
+
+### Direct DiT attention-cache output screen
+
+The next allocation screen targeted the prompt-width DiT attention path.
+Each block already receives a correctly sized final attention-cache buffer,
+but the existing implementation allocates full K, full V, and packed KV
+temporaries before copying the packed result into that buffer. The candidate
+uses Ascend's supported `torch.cat(..., out=view)` form to concatenate K and V
+directly into the caller-owned packed-cache views. It retains the original
+cache order, SDPA inputs, projection, and fallback path.
+
+At the real steady shape (CFG batch 2, 8 heads, 50 new positions, 352 cached
+positions, head dimension 64), a 100-warmup, 1,000-iteration NPU-1 screen
+measured complete cache assembly plus SDPA. The normal path took 95.387 us;
+direct output took 87.076 us, an 8.71% isolated improvement. Attention and
+packed-cache outputs were bit-exact. A four-slice `copy_` workspace variant
+was rejected earlier because it took 118.311 us. The focused Code2Wav suite
+passed 78/78, the complete inherited profile passed its configuration gate,
+and the live service logged direct-output activation without graph fallback.
+
+The real serving screen compared the accepted prompt-width DiT graph profile
+with an otherwise identical profile adding only direct cache output. Both
+sides used the same 32 fixed English Seed-TTS rows, three warmups, concurrency
+one, seed zero, temperature zero, and CFM6. Every run completed 32/32 with
+zero failures, 100% continuity, 4,801 input tokens, 480 output tokens,
+3,362,880 frames, and 140.12 seconds of audio. The table reports the median of
+three runs; lower is better except for throughput.
+
+| Metric | Fresh control | Direct cache output | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 46.515 s | 47.664 s | +2.47% |
+| Request throughput | 0.6880 req/s | 0.6714 req/s | -2.41% |
+| Mean / median / P99 E2E | 1,453.18 / 1,442.89 / 2,140.12 ms | 1,489.15 / 1,501.44 / 2,264.97 ms | +2.47% / +4.06% / +5.83% |
+| Mean / median / P99 TTFT | 330.57 / 327.46 / 554.18 ms | 329.55 / 326.25 / 477.57 ms | -0.31% / -0.37% / -13.82% |
+| Mean / median / P99 audio TTFP | 796.32 / 797.72 / 1,013.64 ms | 800.24 / 794.39 / 962.98 ms | +0.49% / -0.42% / -5.00% |
+| Mean / median / P99 chunk RTF | 0.366797 / 0.177978 / 1.231375 | 0.385161 / 0.184624 / 1.141904 | +5.01% / +3.73% / -7.27% |
+
+The direct-output views improve TTFT and several tails, but regress primary
+duration, throughput, E2E, mean TTFP, and central chunk RTF. The noncontiguous
+packed-cache views save local allocations while producing a less favorable
+layout/scheduling boundary for the surrounding DiT execution. The candidate
+therefore remains diagnostic-only, and the full WER/SIM, Daily-Omni, and
+Video-MME gates were not spent after the speed gate failed:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_attn_cache_out_experimental.yaml
+```
+
+Raw serving artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dit-attn-cache-out-20260818
+```
+
+Artifact checksums:
+
+```text
+f928525c3637048d2db62bfdc3af4b94096068c6d1f833613f43de6e04a1bd49  control-1.json
+cce1b87205cc54a16fdbf7c5a69083b1290eefa0b32583a09f6275200e73a6a9  control-2.json
+cad990be05ac634ee17ff089036b664503d7f264aa0afcc8c328ee9374441e3e  control-3.json
+617c422f43f7b04f19de6a1782b0236398b80203021f5e3867f09a644a0ef02d  candidate-1.json
+948355dc40d6469139d3eed3d277d1f7893808745f3de7b5ecdaada704140343  candidate-2.json
+f6900409b6b6b0514daae46d9e6eeaddede18b120476647f30e078fcdf635f6e  candidate-3.json
+```

@@ -3312,3 +3312,70 @@ Artifact checksums:
 b8f34a5d07f1f81e3466cad0605faa6d60170f2d52503eb202b40e7d111d5abb  candidate-run-2.json
 408c5857170eae2ed619e184cb26e344808543c5a929c99611d2f0dd70e3a8fc  candidate-run-3.json
 ```
+
+## Rejected HiFT source-noise scratch reuse
+
+`SourceModuleHnNSF2` returns a full-waveform auxiliary noise tensor on every
+HiFT invocation, but MiniCPM-o immediately discards that second return value.
+The opt-in candidate preserves the exact `randn`, multiply, divide, return
+shape, dtype, physical stride, and RNG advancement while reusing one buffer
+per waveform shape:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_source_noise_scratch_experimental.yaml
+```
+
+CPU tests proved bit-exact outputs and next-RNG state, idempotent installation,
+shape-isolated storage, and pointer reuse. On NPU 1 at the steady
+`[1,27840,1]` source shape, 30 warmups and 200 iterations reduced the complete
+source-module invocation from 796.460 us to 793.205 us, only 0.41%. The
+discarded noise and next RNG draw had maximum absolute error `0.0`, and the
+scratch pointer was reused. The unchanged sine path varied by `7.12e-5` across
+seed-reset NPU replays, consistent with the existing phase-kernel
+nondeterminism; the candidate does not alter that path.
+
+The final service experiment used fresh services on both sides and the fork's
+local benchmark client, avoiding both service-age skew and an older installed
+client that omitted Omni timing arrays. Each side ran the same 32 fixed English
+Seed-TTS rows three times after three warmups, at concurrency one, seed zero,
+temperature zero, and CFM6. Every run completed 32/32 with zero failures, 100%
+continuity, 4,801 input tokens, 480 output tokens, 3,362,880 frames, and 140.12
+seconds of audio. The table reports the median of three runs; lower is better
+except for throughput.
+
+| Metric | Accepted control | Noise scratch | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.774 s | 44.729 s | +7.07% |
+| Request throughput | 0.7660 req/s | 0.7154 req/s | -6.61% |
+| Mean / median / P99 E2E | 1,304.97 / 1,310.02 / 1,889.46 ms | 1,397.34 / 1,420.56 / 1,902.58 ms | +7.08% / +8.44% / +0.69% |
+| Mean / median / P99 TTFT | 318.76 / 319.63 / 460.08 ms | 316.52 / 319.56 / 452.54 ms | -0.70% / -0.02% / -1.64% |
+| Mean / median / P99 audio TTFP | 780.61 / 764.30 / 947.08 ms | 787.72 / 785.88 / 938.05 ms | +0.91% / +2.82% / -0.95% |
+| Mean / median / P99 chunk RTF | 0.321152 / 0.148051 / 1.059848 | 0.341226 / 0.187301 / 1.063686 | +6.25% / +26.51% / +0.36% |
+
+The candidate slightly improves TTFT and tail TTFP, but regresses the primary
+duration, throughput, E2E, central TTFP, and every chunk-RTF gate. Runtime logs
+also show many waveform widths, so persistent shape-specific buffers perturb
+the allocator for a local saving too small to compose with the full pipeline.
+The candidate therefore remains diagnostic-only and is not enabled in the
+accepted profile. Full Seed-TTS WER/SIM, Daily-Omni, and Video-MME gates were
+not spent after the speed gate failed.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-source-noise-scratch-20260818
+```
+
+Only the `final-*` files below belong to the clean promotion decision; earlier
+files in that directory record harness-validation and warm-state diagnostics.
+
+```text
+c95e4f020d624f33ca9c3461ff50e3231a7822de971ddacde10962eb29f896a4  control/final-control-run-1.json
+8e79420487fe1bad8c7ca1e855f27993160852b2ebf8f6b63da9815ca386a2f3  control/final-control-run-2.json
+25844744dd7954af7b80a7afecc64a7887317a57faffaae2d47275f7ecc18dfa  control/final-control-run-3.json
+266597c0e6941f6f0f53db9fa614702e4301ab5094d272d2320cf1a067560918  candidate/final-candidate-run-1.json
+1135b27104b593d0c00790d7d55ce9ca3f01ba84833dd6a0e97508a774bbdd85  candidate/final-candidate-run-2.json
+ea351aea893d9ae3146999e5e32661acf57dbe5073349547e7db79fd07474fab  candidate/final-candidate-run-3.json
+b15f0ef53546918d78b021034b02ecea65286a0d43ae85698b5bb666faa2e565  final-candidate-service.log
+f36d65fb21edf6612d90dd6076a7e98f6f9bbabcb9002f07291070170d81b660  final-accepted-service.log
+```

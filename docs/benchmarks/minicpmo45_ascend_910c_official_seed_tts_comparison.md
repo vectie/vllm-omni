@@ -2849,6 +2849,70 @@ c200cee3144ec4312eaf8c9116ccb7e103b86992b0db47debcce08ff1c13f016  candidate-run1
 6bfb71ade93dfb06bb75d201d7be7d1fd1d2b084d938814d6073825f9d207705  candidate-run2.json
 ```
 
+### Requalification against the current accepted stack
+
+The stage-0 residual boundary was requalified on 2026-08-18 after the accepted
+profile gained single-request cache ownership. This matters because the older
+5.67% serving win above used an earlier control. The fresh control, the
+original three-block graph implementation, and a second aggregate design each
+ran three times over the identical 32 English rows, after three warmups, at
+concurrency one. All nine runs completed 32/32 requests with zero failures,
+100% streaming continuity, 4,801 input tokens, 480 output tokens, 3,362,880
+audio frames, and 140.12 seconds of audio.
+
+The new aggregate design compiled the three parallel residual siblings as one
+TorchAir graph returning three exact outputs. A thread-local dispatcher let the
+unchanged flashcosyvoice reduction consume those outputs in order, avoiding
+the earlier neutral-tensor implementation and leaving the sibling sum outside
+the graph. Its isolated stage result was again attractive: 3,407.161 us eager
+versus 1,345.148 us graph, a 2.533x speedup, with maximum absolute error `0.0`.
+The service logged exactly one real-input replay marker and no fallback.
+
+End-to-end results rejected both graph boundaries on the current stack. Lower
+is better except for throughput:
+
+| Metric (three-run median) | Current accepted control | Three block graphs | Change | One sibling graph | Change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Serving duration | 40.214 s | 41.654 s | +3.58% | 43.524 s | +8.23% |
+| Request throughput | 0.7957 req/s | 0.7682 req/s | -3.46% | 0.7352 req/s | -7.61% |
+| Mean E2E | 1,256.29 ms | 1,301.26 ms | +3.58% | 1,359.70 ms | +8.23% |
+| Median E2E | 1,281.78 ms | 1,328.67 ms | +3.66% | 1,388.77 ms | +8.35% |
+| P99 E2E | 1,696.85 ms | 1,763.51 ms | +3.93% | 1,858.12 ms | +9.50% |
+| Mean TTFT | 314.07 ms | 310.29 ms | -1.20% | 316.94 ms | +0.92% |
+| Mean audio TTFP | 745.37 ms | 757.09 ms | +1.57% | 776.67 ms | +4.20% |
+| Mean chunk RTF | 0.310126 | 0.319916 | +3.16% | 0.332815 | +7.32% |
+| Median chunk RTF | 0.144614 | 0.167456 | +15.80% | 0.181294 | +25.36% |
+| P99 chunk RTF | 1.007790 | 1.022899 | +1.50% | 1.035547 | +2.75% |
+
+The isolated kernel savings therefore do not compose with the complete HiFT
+pipeline. Even one tuple-output graph creates a synchronization/layout boundary
+that costs more than its removed launches. Neither candidate advances to the
+1,088-row WER/SIM run: accuracy work cannot rescue a failed speed gate. The
+accepted profile remains graph-free at this boundary, and future HiFT work must
+fuse transparently inside CANN's convolution/layout path rather than add a
+TorchAir boundary around sibling blocks.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-resblock-qualification-20260818
+```
+
+Artifact checksums:
+
+```text
+abe951f9989445761862f3bca81ebc30996d0ac16ee7aeb4ebfbfe7a7aa2fbda  control/control-run-1.json
+7d9dd9e2bc4114e75932142ff1b410fe12898490b8de9cb1153f4172c0b43c8f  control/control-run-2.json
+02cff3619ceb333b513ea2e92c0b082ceab57a8a7aebf882c286320a7c5a0fd3  control/control-run-3.json
+e35136f57b15fd792577769dec05870900478f0a2580c15b3ec5fc6d57bca627  candidate/candidate-run-1.json
+7ed4a92cbbde0d468b7204dd7e4471e298cb08ed85c71b9aea51501af65943ba  candidate/candidate-run-2.json
+d827e5e53970ee88c3e8e73baf90eac5b22ea6c16758173a881821962cc81dfb  candidate/candidate-run-3.json
+3189e51ed4fd9545e9058d2be276986131dc0726e7736cc492c41dc9a800bf70  sibling/sibling-run-1.json
+0e846e98dc229937b357bd69dc9f9b4b75ab893cdff800b103877eb6b4474828  sibling/sibling-run-2.json
+ca91c08c3859567fb08a6703f27400a2071cf3c3994be770fabb4ae20d6bf1eb  sibling/sibling-run-3.json
+2b71d975ebb39a1a0cbfde9b36e08d293cb2895671c8bd53f223f57ab1ce5038  sibling-service-v2.log
+```
+
 ### Fixed-size HiFT ISTFT graph and layout screens
 
 The next lower-level screen targeted HiFT's final inverse transform. MiniCPM-o

@@ -31,6 +31,7 @@ _NPU_DIT_CACHE_MAJOR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CACHE_MAJOR"
 _NPU_DIT_POST_ATTN_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_POST_ATTN_GRAPH"
 _NPU_DIT_QKV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_QKV_PACK"
 _NPU_DIT_ATTN_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT"
+_NPU_CFM_STACKED_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT"
 _NPU_DIT_FUSED_CONV_BLOCK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_BLOCK"
 _NPU_DIT_FUSED_CONV_LINEAR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR"
 logger = logging.getLogger(__name__)
@@ -217,6 +218,21 @@ def _npu_dit_attn_cache_out_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_DIT_ATTN_CACHE_OUT_ENV}={raw!r}")
+
+
+def _npu_cfm_stacked_cache_out_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_CFM_STACKED_CACHE_OUT_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_CFM_STACKED_CACHE_OUT_ENV}={raw!r}")
 
 
 def _npu_dit_fused_conv_block_enabled(config_value: Any = None) -> bool:
@@ -907,6 +923,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_post_attn_graph: Any = None,
         npu_dit_qkv_pack: Any = None,
         npu_dit_attn_cache_out: Any = None,
+        npu_cfm_stacked_cache_out: Any = None,
         npu_dit_fused_conv_block: Any = None,
         npu_dit_fused_conv_linear: Any = None,
     ):
@@ -1011,6 +1028,10 @@ class BatchedToken2Wav(nn.Module):
             npu_dit_attn_cache_out
         )
         self._npu_dit_attn_cache_out_used = False
+        self._npu_cfm_stacked_cache_out_enabled = _npu_cfm_stacked_cache_out_enabled(
+            npu_cfm_stacked_cache_out
+        )
+        self._npu_cfm_stacked_cache_out_used = False
         self._npu_dit_fused_conv_block_enabled = _npu_dit_fused_conv_block_enabled(npu_dit_fused_conv_block)
         self._npu_dit_fused_conv_block_used = False
         self._npu_dit_fused_conv_linear_enabled = _npu_dit_fused_conv_linear_enabled(npu_dit_fused_conv_linear)
@@ -1892,13 +1913,13 @@ class BatchedToken2Wav(nn.Module):
         return self.flow.encoder_proj(hidden), new_cnn, new_att
 
     @staticmethod
-    def _estimator_buffers(
+    def _estimator_buffer_shapes(
         estimator: nn.Module,
         x: torch.Tensor,
         old_att: torch.Tensor | None,
         *,
         cache_major: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         blocks = estimator.blocks
         depth = len(blocks)
         batch_size = int(x.shape[0])
@@ -1914,9 +1935,25 @@ class BatchedToken2Wav(nn.Module):
             if cache_major
             else (depth, batch_size, cnn_channels, cnn_width)
         )
-        cnn = x.new_empty(cnn_shape)
-        att = x.new_empty((depth, batch_size, heads, old_att_len + chunk_size, att_width))
-        return cnn, att
+        att_shape = (depth, batch_size, heads, old_att_len + chunk_size, att_width)
+        return cnn_shape, att_shape
+
+    @classmethod
+    def _estimator_buffers(
+        cls,
+        estimator: nn.Module,
+        x: torch.Tensor,
+        old_att: torch.Tensor | None,
+        *,
+        cache_major: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cnn_shape, att_shape = cls._estimator_buffer_shapes(
+            estimator,
+            x,
+            old_att,
+            cache_major=cache_major,
+        )
+        return x.new_empty(cnn_shape), x.new_empty(att_shape)
 
     def _estimator_step(
         self,
@@ -1929,17 +1966,22 @@ class BatchedToken2Wav(nn.Module):
         cond: torch.Tensor,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
+        cnn_out: torch.Tensor | None = None,
+        att_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         cache_major = self._is_cache_major_cnn(cnn_cache)
-        cnn_out, att_out = self._estimator_buffers(
-            estimator,
-            estimator_input,
-            att_cache,
-            cache_major=cache_major,
-        )
+        if cnn_out is None or att_out is None:
+            if cnn_out is not None or att_out is not None:
+                raise ValueError("cnn_out and att_out must be provided together")
+            cnn_out, att_out = self._estimator_buffers(
+                estimator,
+                estimator_input,
+                att_cache,
+                cache_major=cache_major,
+            )
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
         graph_width = int(estimator_input.shape[2])
@@ -2465,6 +2507,20 @@ class BatchedToken2Wav(nn.Module):
         cond_cfg = self._cfg_pair("cond", cond, zero_unconditional=True)
         time_embeddings = self._estimator_time_embeddings(estimator, timeline, batch_size * 2)
         deltas = self._cfm_deltas_for(timeline)
+        direct_cache_output = self._npu_cfm_stacked_cache_out_enabled and mu.device.type == "npu"
+        stacked_cnn_out: torch.Tensor | None = None
+        stacked_att_out: torch.Tensor | None = None
+        if direct_cache_output:
+            first_old_cnn = working_cnn_cache[0] if working_cnn_cache is not None else None
+            first_old_att = att_cache[0] if att_cache is not None else None
+            cnn_shape, att_shape = self._estimator_buffer_shapes(
+                estimator,
+                mu_cfg,
+                first_old_att,
+                cache_major=self._is_cache_major_cnn(first_old_cnn),
+            )
+            stacked_cnn_out = mu.new_empty((self.n_timesteps, *cnn_shape))
+            stacked_att_out = mu.new_empty((self.n_timesteps, *att_shape))
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
         for step in range(self.n_timesteps):
@@ -2479,20 +2535,27 @@ class BatchedToken2Wav(nn.Module):
                 cond=cond_cfg,
                 cnn_cache=old_cnn,
                 att_cache=old_att,
+                cnn_out=stacked_cnn_out[step] if stacked_cnn_out is not None else None,
+                att_out=stacked_att_out[step] if stacked_att_out is not None else None,
             )
             conditional, unconditional = estimate.split(batch_size, dim=0)
             velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
             x = x + deltas[step] * velocity
-            next_cnn.append(step_cnn)
-            next_att.append(step_att)
-        stacked_cnn = torch.stack(next_cnn)
+            if stacked_cnn_out is None:
+                next_cnn.append(step_cnn)
+                next_att.append(step_att)
+        stacked_cnn = stacked_cnn_out if stacked_cnn_out is not None else torch.stack(next_cnn)
+        stacked_att = stacked_att_out if stacked_att_out is not None else torch.stack(next_att)
+        if direct_cache_output and not self._npu_cfm_stacked_cache_out_used:
+            logger.info("MiniCPM-o NPU direct stacked CFM cache output active")
+            self._npu_cfm_stacked_cache_out_used = True
         # A compile or replay failure disables the graph inside
         # ``_estimator_step``. Return to the canonical layout in that case so
         # subsequent chunks do not pay two compatibility transposes.
         retain_cache_major = use_cache_major and not self._npu_dit_conv_mlp_graph_disabled
         if retain_cache_major != self._is_cache_major_cnn(stacked_cnn):
             stacked_cnn = stacked_cnn.transpose(-2, -1).contiguous()
-        return x, stacked_cnn, torch.stack(next_att)
+        return x, stacked_cnn, stacked_att
 
     @staticmethod
     def _optional_tensor_signature(value: torch.Tensor | None) -> Any:

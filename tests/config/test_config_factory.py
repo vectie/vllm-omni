@@ -2401,6 +2401,19 @@ class TestPlatformOverrides:
         assert extra["npu_dit_preamble_graph"] is True
         assert extra["npu_dit_attn_cache_out"] is True
 
+    def test_minicpmo_4_5_910c_stacked_cache_output_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_stacked_cache_out_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_cfm_stacked_cache_out"] is True
+
     def test_minicpmo_4_5_910c_full_block_cache_buckets_are_explicit(self):
         deploy_path = Path(
             get_deploy_config_path(

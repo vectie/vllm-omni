@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_fused_conv_mlp_residual,
     _dit_fused_full_block,
     _dit_mlp_residual,
+    _npu_cfm_stacked_cache_out_enabled,
     _npu_dit_attn_cache_out_enabled,
     _npu_dit_cache_major_enabled,
     _npu_dit_conv_mlp_graph_enabled,
@@ -1171,6 +1172,18 @@ def test_npu_dit_attn_cache_out_config_and_environment(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT", "sometimes")
     with pytest.raises(ValueError, match="NPU_DIT_ATTN_CACHE_OUT"):
         _npu_dit_attn_cache_out_enabled()
+
+
+def test_npu_cfm_stacked_cache_out_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT", raising=False)
+    assert _npu_cfm_stacked_cache_out_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT", "off")
+    assert _npu_cfm_stacked_cache_out_enabled(True) is False
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT", "sometimes")
+    with pytest.raises(ValueError, match="NPU_CFM_STACKED_CACHE_OUT"):
+        _npu_cfm_stacked_cache_out_enabled()
 
 
 def test_npu_dit_fused_conv_block_config_and_environment(monkeypatch):

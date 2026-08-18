@@ -804,6 +804,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             npu_dit_post_attn_graph=extra.get("npu_dit_post_attn_graph"),
             npu_dit_qkv_pack=extra.get("npu_dit_qkv_pack"),
             npu_dit_attn_cache_out=extra.get("npu_dit_attn_cache_out"),
+            npu_cfm_stacked_cache_out=extra.get("npu_cfm_stacked_cache_out"),
             npu_dit_fused_conv_block=extra.get("npu_dit_fused_conv_block"),
             npu_dit_fused_conv_linear=extra.get("npu_dit_fused_conv_linear"),
         )

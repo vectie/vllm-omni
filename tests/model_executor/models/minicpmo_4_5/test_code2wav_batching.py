@@ -1315,6 +1315,43 @@ def test_single_request_cache_passthrough_preserves_storage():
         assert split[0][name].data_ptr() == value.data_ptr()
 
 
+def test_single_request_cache_passthrough_is_exact_across_chunks():
+    control = BatchedToken2Wav(_FakeToken2Wav())
+    candidate = BatchedToken2Wav(
+        _FakeToken2Wav(),
+        npu_single_request_cache_passthrough=True,
+    )
+    control_prompt = control.prepare_prompt("shared", "/fake/prompt.wav")
+    candidate_prompt = candidate.prepare_prompt("shared", "/fake/prompt.wav")
+    control_states = control.setup_batch(control_prompt, 1)
+    candidate_states = candidate.setup_batch(candidate_prompt, 1)
+
+    for tokens, last_chunk in (
+        (torch.tensor([[10, 11]]), False),
+        (torch.tensor([[12, 13]]), False),
+        (torch.tensor([[14]]), True),
+    ):
+        control_audio, control_states = control.decode_batch(
+            tokens,
+            control_prompt,
+            control_states,
+            last_chunk=last_chunk,
+        )
+        candidate_audio, candidate_states = candidate.decode_batch(
+            tokens,
+            candidate_prompt,
+            candidate_states,
+            last_chunk=last_chunk,
+        )
+        assert torch.equal(control_audio[0], candidate_audio[0])
+        for cache_name in ("flow_cache", "hift_cache"):
+            control_cache = getattr(control_states[0], cache_name)
+            candidate_cache = getattr(candidate_states[0], cache_name)
+            assert control_cache.keys() == candidate_cache.keys()
+            for name in control_cache:
+                assert torch.equal(control_cache[name], candidate_cache[name])
+
+
 def test_model_preserves_output_slots_and_prefers_runtime_codes():
     model, token2wav = _model()
     output = _forward(

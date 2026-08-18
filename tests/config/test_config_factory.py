@@ -2348,6 +2348,7 @@ class TestPlatformOverrides:
         assert extra["npu_dit_preamble_graph"] is True
         assert extra["npu_dit_conv_mlp_graph"] is True
         assert extra["npu_dit_prompt_conv_mlp_graph"] is True
+        assert extra["npu_single_request_cache_passthrough"] is True
 
     def test_minicpmo_4_5_910c_cache_major_candidate_is_explicit(self):
         deploy_path = Path(

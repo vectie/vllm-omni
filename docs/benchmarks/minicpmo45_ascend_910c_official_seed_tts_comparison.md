@@ -3189,3 +3189,62 @@ Artifact checksums:
 209671bf5a2a1ab7df6dd8d1d16400bf9d533799195e8d784dcf8d08642be7b3  candidate-run-2.json
 00944ff240f0c0d6a2dde9240e16334323f5ecc278ba77205ac6d6bf1466989f  candidate-run-3.json
 ```
+
+### Promoted single-request cache ownership
+
+The rejected direct stacked-output screen exposed a larger copy outside the
+DiT kernels. Competition latency runs use concurrency one, but after every
+chunk `_split_flow_cache` copied the entire six-step CFG estimator state into
+the request, and before the next chunk `_stack_flow_cache` copied it back into
+an identical one-request batch. The old state is read-only during decoding, so
+the promoted path transfers tensor ownership directly when the batch contains
+exactly one request. Multi-request batches keep the established CFG reorder
+and copy behavior.
+
+At the real cache shapes, a 20-warmup, 100-iteration NPU-1 screen reduced a
+complete split-plus-restack round trip from 682.480 us to 15.665 us, a 97.70%
+reduction. CNN and attention values were bit-exact, and the original NCDHW and
+ND formats were preserved. The 421-test focused Code2Wav/config suite passed
+before promotion; an additional three-chunk state-and-audio comparison was
+bit-exact, and the promoted deployment gate passed.
+
+The live candidate was compared with a fresh accepted-profile control on the
+same host and source stack. Both sides used the same 32 fixed English Seed-TTS
+rows, three warmups, concurrency one, seed zero, temperature zero, and CFM6.
+Every run completed 32/32 with zero failures, 100% continuity, 4,801 input
+tokens, 480 output tokens, 3,362,880 frames, and 140.12 seconds of audio. The
+table reports the median of three runs; lower is better except for throughput.
+
+| Metric | Fresh control | Cache passthrough | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 43.167 s | 42.684 s | -1.12% |
+| Request throughput | 0.7413 req/s | 0.7497 req/s | +1.13% |
+| Mean / median / P99 E2E | 1,348.63 / 1,381.66 / 1,823.12 ms | 1,333.55 / 1,360.32 / 1,806.22 ms | -1.12% / -1.54% / -0.93% |
+| Mean / median / P99 TTFT | 310.60 / 311.44 / 445.09 ms | 309.55 / 311.00 / 453.84 ms | -0.34% / -0.14% / +1.97% |
+| Mean / median / P99 audio TTFP | 774.48 / 773.15 / 912.98 ms | 763.16 / 765.01 / 909.76 ms | -1.46% / -1.05% / -0.35% |
+| Mean / median / P99 chunk RTF | 0.331659 / 0.179186 / 1.042957 | 0.328043 / 0.177109 / 1.030444 | -1.09% / -1.16% / -1.20% |
+
+The candidate improves every primary serving, E2E, TTFP, and chunk-RTF gate.
+TTFT P99 is the only regression (+1.97%), while its mean and median improve.
+Because the fast path changes no model operation or tensor value and the
+multi-chunk comparison is bit-exact, the existing Seed-TTS, Daily-Omni, and
+Video-MME accuracy qualifications carry forward. Single-request passthrough
+is therefore enabled in the accepted prompt-width profile; higher-concurrency
+serving continues to use the original state path.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-single-request-cache-passthrough-20260818
+```
+
+Artifact checksums:
+
+```text
+1f4689d0d7701d26c640b780428fb993ea7e07a4039450a923d69d32c11e3251  control-run-1.json
+9cdde0d4883cb94f1043fd80336824dbd3667753b14f0bde52983737d930d729  control-run-2.json
+1dbeb38953f199fb01fcad4397a9f74ebeede0716f1bdf07987c39bd07c26ea1  control-run-3.json
+446d2f54f6fcedc01747a608425b7ad8ccfd761a6f49a375cd569a0b71197fce  candidate-run-1.json
+b8f34a5d07f1f81e3466cad0605faa6d60170f2d52503eb202b40e7d111d5abb  candidate-run-2.json
+408c5857170eae2ed619e184cb26e344808543c5a929c99611d2f0dd70e3a8fc  candidate-run-3.json
+```

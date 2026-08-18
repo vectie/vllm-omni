@@ -28,3 +28,4 @@ connectors:
       npu_dit_conv_mlp_graph: true
       npu_dit_prompt_conv_mlp_graph: true
       npu_dit_fused_conv_pack: true
+      npu_single_request_cache_passthrough: true

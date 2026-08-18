@@ -60,28 +60,23 @@ def main() -> None:
     last = first + hift.num_kernels
     blocks = list(hift.resblocks[first:last])
 
-    eager_us = [
-        _measure(block.forward, value, warmups=args.warmups, iterations=args.iterations)
-        for block in blocks
-    ]
+    def eager_stage(_value: torch.Tensor) -> torch.Tensor:
+        return sum(block.forward(_value) for block in blocks) / len(blocks)
+
+    eager_us = _measure(eager_stage, value, warmups=args.warmups, iterations=args.iterations)
     compiled = prepare_hift_resblock_graph_for_npu(
         hift,
         stage=args.stage,
         mel_width=args.mel_width,
     )
 
-    graph_us: list[float] = []
-    max_abs_error: list[float] = []
-    for block in blocks:
-        expected = block._step_audio2_original_forward(value)
-        actual = block(value)
-        max_abs_error.append(float((actual - expected).abs().max().item()))
-        graph_us.append(
-            _measure(block, value, warmups=args.warmups, iterations=args.iterations)
-        )
+    def graph_stage(_value: torch.Tensor) -> torch.Tensor:
+        return sum(block(_value) for block in blocks) / len(blocks)
 
-    eager_total = sum(eager_us)
-    graph_total = sum(graph_us)
+    expected = sum(block._step_audio2_original_forward(value) for block in blocks) / len(blocks)
+    actual = graph_stage(value)
+    max_abs_error = float((actual - expected).abs().max().item())
+    graph_us = _measure(graph_stage, value, warmups=args.warmups, iterations=args.iterations)
     print(
         json.dumps(
             {
@@ -89,13 +84,12 @@ def main() -> None:
                 "stage": args.stage,
                 "mel_width": args.mel_width,
                 "shape": shape,
-                "compiled_blocks": compiled,
-                "eager_us_per_block": eager_us,
-                "graph_us_per_block": graph_us,
-                "eager_us_total": eager_total,
-                "graph_us_total": graph_total,
-                "speedup": eager_total / graph_total,
-                "max_abs_error_per_block": max_abs_error,
+                "compiled_graphs": compiled,
+                "branches": len(blocks),
+                "eager_us": eager_us,
+                "graph_us": graph_us,
+                "speedup": eager_us / graph_us,
+                "max_abs_error": max_abs_error,
             },
             indent=2,
         )

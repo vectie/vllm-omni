@@ -385,26 +385,31 @@ def test_hift_fixed_istft_uses_original_off_npu(monkeypatch: pytest.MonkeyPatch)
     torch.testing.assert_close(actual, magnitude[:, 0])
 
 
-def test_hift_resblock_graph_uses_eager_fallback_off_npu(
+def test_hift_resblock_sibling_graph_uses_eager_fallback_off_npu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_patch_module(monkeypatch)
     calls: list[str] = []
 
-    block = SimpleNamespace(
+    state = SimpleNamespace(outputs=(torch.ones(1),))
+    owner = SimpleNamespace(
         _step_audio2_npu_resblock_graph_shape=(1, 4, 8),
         _step_audio2_npu_resblock_graph_disabled=False,
         _step_audio2_npu_resblock_graph_replayed=False,
+        _step_audio2_npu_resblock_graph_thread_state=state,
+        num_kernels=3,
+    )
+    block = SimpleNamespace(
+        _step_audio2_npu_resblock_graph_owner=owner,
+        _step_audio2_npu_resblock_graph_index=0,
         _step_audio2_original_forward=lambda value: calls.append("eager") or value + 1,
-        _step_audio2_npu_resblock_graph=lambda _value: (_ for _ in ()).throw(
-            AssertionError("CPU must not enter the NPU graph")
-        ),
     )
     value = torch.zeros(1, 4, 8)
 
-    output = module._resblock_with_npu_graph(block, value)
+    output = module._resblock_with_npu_sibling_graph(block, value)
 
     assert calls == ["eager"]
+    assert not hasattr(state, "outputs")
     torch.testing.assert_close(output, value + 1)
 
 

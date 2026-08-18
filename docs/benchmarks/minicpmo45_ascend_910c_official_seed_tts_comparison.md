@@ -2994,3 +2994,70 @@ c9608777664cd5923391949af8bf17636cb33948528dc20bbc5a8196e2f965fc  control-run3.j
 c7579ea11df3dca4ecfdd0d9ec88f563e191c47061ca24a188bfe923e029e046  candidate-run2.json
 00345f32a473ffa628013ac4455160ab5c625d7221685cc26b04a32cd95fdd35  candidate-run3.json
 ```
+
+### HiFT harmonic-residency screen
+
+The next transparent allocation screen targeted `flashcosyvoice.SineGen2`.
+Its upstream `forward` constructs the immutable harmonic multiplier with
+`torch.FloatTensor` on CPU and copies it to the input device for every audio
+chunk. The candidate preserves that exact constructor, values, shape, and
+subsequent operations, but creates the tensor once after checkpoint loading
+and keeps it on Stage 2's NPU. Device or dtype mismatches delegate to the
+original method.
+
+At the real steady waveform width `[1,27840,1]`, 100 warmups and 500 measured
+iterations on NPU 1 reduced complete SineGen2 latency from 719.709 us to
+560.056 us, a 22.18% isolated improvement. The cached multiplier and the
+resulting `f0 * harmonics` tensor were bit-exact (`max_abs_error=0`). Full
+sine tensors differed by about `2.93e-4`, but two unmodified baseline calls
+with the same CPU and NPU seeds differed by the same amount; this is the
+existing randomized NPU phase behavior, not a changed deterministic input.
+UV and noise tensors were exact. The focused patch suite passed 48/48, and
+the candidate service logged resident-window and resident-harmonic placement
+without fallback.
+
+The serving screen measured the new cache incrementally on top of the
+promoted resident Hann window and the selected three Stage-0 residual graphs.
+Both sides used the same 32 fixed English Seed-TTS rows, three warmups,
+concurrency one, seed zero, temperature zero, and CFM6. Every run completed
+32/32 with zero failures, 100% continuity, 4,801 input tokens, 480 output
+tokens, 3,362,880 frames, and 140.12 seconds of audio. The table reports the
+median of three runs; lower is better except for throughput.
+
+| Metric | Fresh control | Resident harmonics | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 43.860 s | 44.688 s | +1.89% |
+| Request throughput | 0.7296 req/s | 0.7161 req/s | -1.85% |
+| Mean / median / P99 E2E | 1,370.25 / 1,368.05 / 1,915.25 ms | 1,396.02 / 1,405.37 / 1,808.26 ms | +1.88% / +2.73% / -5.59% |
+| Mean / median / P99 TTFT | 321.80 / 317.79 / 490.74 ms | 332.88 / 333.73 / 468.17 ms | +3.44% / +5.02% / -4.60% |
+| Mean / median / P99 audio TTFP | 764.01 / 760.94 / 939.70 ms | 774.66 / 778.04 / 919.50 ms | +1.39% / +2.25% / -2.15% |
+| Mean / median / P99 chunk RTF | 0.340351 / 0.144086 / 1.101073 | 0.343077 / 0.146450 / 1.082056 | +0.80% / +1.64% / -1.73% |
+
+The candidate improves tail metrics but regresses every primary duration,
+throughput, mean, and median gate. The saved host-to-device copy is too small
+to dominate full-pipeline scheduling variance, and its local microbenchmark
+win does not qualify it for the default path. The implementation therefore
+remains opt-in for diagnostic work, and the more expensive Seed-TTS WER/SIM,
+Daily-Omni, and Video-MME accuracy gates were not spent on a candidate that
+already failed the speed gate:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_harmonics_resident_experimental.yaml
+```
+
+Raw serving artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-harmonics-resident-20260818
+```
+
+Artifact checksums:
+
+```text
+bf204c7e79b3d42b80b957ceb2452b1418a2028613d608b205aa15615e4cf75e  control-1.json
+47f6525988b7654611b7ed53c58b971e81670ccef3548cefd4f90e299f2ab8ca  control-2.json
+ad200c8809ef1264b97a0818b227aec946a16c1ce815252c505d21366811d4ff  control-3.json
+a61765e0d150c6ba976a4cb57dbe22cf2421190dab6988dfd609aa7edeb93ee8  candidate-1.json
+f71855129c223c285c63894954f4687c88c68101409437d6b051e829ed50d75b  candidate-2.json
+0a5a79b6f888c8c27cda3383573b2d2ef8c7420edb660d104ae07aaa6ba9b8e4  candidate-3.json
+```

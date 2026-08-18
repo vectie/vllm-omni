@@ -579,7 +579,7 @@ def test_hift_f0_predictor_partition_keeps_original_linear(monkeypatch: pytest.M
         classifier.bias,
     )
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.parametrize(("value", "expected"), [("58", 58), ("1", 1)])

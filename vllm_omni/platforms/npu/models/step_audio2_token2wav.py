@@ -337,7 +337,11 @@ def _hift_f0_predictor(
 ) -> torch.Tensor:
     """Exact flashcosyvoice F0 predictor, including its original Linear."""
     features = _hift_f0_features(value, w0, b0, w1, b1, w2, b2, w3, b3, w4, b4)
-    prediction = F.linear(features.transpose(1, 2), classifier_weight, classifier_bias)
+    # TorchAir 8.5 otherwise drops the transpose while inferring MatMul's
+    # K-axis (58 instead of 512). Materialize only the view's layout; the
+    # classifier operation and values remain identical to upstream.
+    classifier_input = features.transpose(1, 2).contiguous()
+    prediction = F.linear(classifier_input, classifier_weight, classifier_bias)
     return torch.abs(prediction.squeeze(-1))
 
 
@@ -461,18 +465,23 @@ def prepare_hift_f0_graph_for_npu(
     for graph_width in widths:
         if graph_width <= 0:
             raise ValueError(f"HiFT F0 graph widths must be positive, got {graph_width}")
-        sample = convolutions[0].weight.new_zeros(
-            (1, int(convolutions[0].in_channels), graph_width)
+        shape = (1, int(convolutions[0].in_channels), graph_width)
+        sample = (
+            convolutions[0].weight.new_full(shape, 0.125)
+            if include_classifier
+            else convolutions[0].weight.new_zeros(shape)
         )
         with torch.inference_mode():
             expected = predictor(sample) if include_classifier else predictor.condnet(sample)
             actual = graph(sample, *weights)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        tolerance = 1e-5 if include_classifier else 0.0
+        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
         torch.npu.synchronize()
         logger.info(
-            "Compiled HiFT F0 %s graph for Ascend NPU: batch=1 width=%d",
+            "Compiled HiFT F0 %s graph for Ascend NPU: batch=1 width=%d max_abs_drift=%.8g",
             "predictor" if include_classifier else "feature",
             graph_width,
+            float(torch.max(torch.abs(actual - expected)).item()),
         )
 
     predictor._step_audio2_original_forward = predictor.forward

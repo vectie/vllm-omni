@@ -3125,3 +3125,67 @@ cad990be05ac634ee17ff089036b664503d7f264aa0afcc8c328ee9374441e3e  control-3.json
 948355dc40d6469139d3eed3d277d1f7893808745f3de7b5ecdaada704140343  candidate-2.json
 f6900409b6b6b0514daae46d9e6eeaddede18b120476647f30e078fcdf635f6e  candidate-3.json
 ```
+
+### Direct stacked CFM cache-output screen
+
+The CFM loop runs six estimator steps. Each step allocated separate CNN and
+attention-cache outputs, retained all twelve tensors, and finally allocated
+and copied them again with two `torch.stack` calls. The candidate instead
+allocates the two final stacked states once and passes each step a view to
+write directly. It preserves the original DiT operations, cache values, and
+step order.
+
+At the real six-step cache shapes, `[6,6,2,1024,2]` for CNN state and
+`[6,6,2,8,402,128]` for attention state, a 20-warmup, 100-iteration NPU-1
+screen measured the old allocation-plus-stack path at 277.230 us and the two
+direct stacked allocations at 31.235 us. That is an 88.73% isolated reduction
+and removes a terminal stack measured independently at 223.170 us. Stacked
+values were bit-exact, the focused Code2Wav and deployment-configuration
+suites passed, and the live service logged direct stacked-output activation.
+
+The real serving result went in the opposite direction. Both sides used the
+same 32 fixed English Seed-TTS rows, three warmups, concurrency one, seed zero,
+temperature zero, and CFM6. Every run completed 32/32 with zero failures,
+100% continuity, 4,801 input tokens, 480 output tokens, 3,362,880 frames, and
+140.12 seconds of audio. The table reports the median of three runs; lower is
+better except for throughput.
+
+| Metric | Fresh control | Direct stacked output | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.529 s | 44.809 s | +7.90% |
+| Request throughput | 0.7705 req/s | 0.7141 req/s | -7.32% |
+| Mean / median / P99 E2E | 1,297.42 / 1,326.18 / 1,745.27 ms | 1,399.92 / 1,436.63 / 1,846.78 ms | +7.90% / +8.33% / +5.82% |
+| Mean / median / P99 TTFT | 306.19 / 305.41 / 441.22 ms | 315.03 / 316.11 / 452.67 ms | +2.89% / +3.50% / +2.60% |
+| Mean / median / P99 audio TTFP | 743.92 / 745.58 / 887.04 ms | 776.33 / 779.57 / 905.73 ms | +4.36% / +4.56% / +2.11% |
+| Mean / median / P99 chunk RTF | 0.318128 / 0.171573 / 1.012530 | 0.343567 / 0.181579 / 1.041428 | +8.00% / +5.83% / +2.85% |
+
+An Ascend format probe explains why the allocation-only screen did not
+transfer. A normal per-step CNN output is NCHW, while its view inside the
+five-dimensional stacked allocation inherits NCDHW. A normal per-step
+attention output is NCDHW, while its view inside the six-dimensional stacked
+allocation inherits generic ND. The logical shapes and strides are identical,
+but the less favorable physical formats slow the much larger DiT writes and
+reads by more than the removed copies save. This candidate is therefore kept
+opt-in for layout research, and the WER/SIM, Daily-Omni, and Video-MME gates
+were not spent after the speed gate failed:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_stacked_cache_out_experimental.yaml
+```
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-cfm-stacked-cache-out-20260818
+```
+
+Artifact checksums:
+
+```text
+89417ddf61b7cce1a38acb978a1ebd7c7987092cbc4137f5b4b500fdea07290f  control-run-1.json
+109d13a7a9ed04d0fdd5acd38a5f6743d6257aea98f625d5be0d17a9d793b5fc  control-run-2.json
+91aebfa15b1559575a4cf2d174d065f450e71cf9c6888768cca534aa61ccd569  control-run-3.json
+5c016e3947e647c1d7948f43bc441d61bf4ea83dee4bec904d344f8d9e931138  candidate-run-1.json
+209671bf5a2a1ab7df6dd8d1d16400bf9d533799195e8d784dcf8d08642be7b3  candidate-run-2.json
+00944ff240f0c0d6a2dde9240e16334323f5ecc278ba77205ac6d6bf1466989f  candidate-run-3.json
+```

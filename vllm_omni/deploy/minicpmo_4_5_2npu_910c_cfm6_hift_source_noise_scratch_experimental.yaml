@@ -1,0 +1,13 @@
+# Atlas 800I A3 / Ascend 910C HiFT source-noise scratch candidate.
+#
+# flashcosyvoice's SourceModuleHnNSF2 creates and returns a full-waveform
+# auxiliary noise tensor for every chunk. MiniCPM-o discards that return value.
+# Preserve the exact random draw and arithmetic while reusing shape-specific
+# storage. Keep this profile opt-in until paired Seed-TTS service measurements
+# qualify both latency and accuracy.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
+
+stage2:
+  env:
+    VLLM_OMNI_MINICPMO45_NPU_HIFT_SOURCE_NOISE_SCRATCH: "1"

@@ -21,6 +21,8 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
    copying it from CPU in every STFT and ISTFT call.
 8. HiFT harmonic residency — keep SineGen2's immutable harmonic multiplier on
    NPU instead of constructing it on CPU and copying it for every audio chunk.
+9. HiFT source-noise scratch — preserve SourceModuleHnNSF2's auxiliary random
+   draw while reusing its storage when MiniCPM-o discards that return value.
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ _HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRA
 _HIFT_FIXED_ISTFT_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH"
 _HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH"
 _HIFT_RESIDENT_HARMONICS_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESIDENT_HARMONICS"
+_HIFT_SOURCE_NOISE_SCRATCH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_SOURCE_NOISE_SCRATCH"
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -123,6 +126,80 @@ def prepare_hift_resident_harmonics_for_npu(
     sine_gen.forward = MethodType(_sinegen_with_resident_harmonics, sine_gen)
     sine_gen._step_audio2_npu_harmonics_patched = True
     logger.info("Placed HiFT SineGen2 harmonics on %s", device)
+    return True
+
+
+def _source_module_with_noise_scratch(
+    self,
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run SourceModuleHnNSF2 while reusing its discarded noise storage.
+
+    MiniCPM-o consumes only the first return value from ``m_source``. Keep the
+    exact upstream random draw and arithmetic for compatibility, but place the
+    auxiliary result in a shape-specific scratch tensor instead of allocating
+    a new full-waveform tensor for every audio chunk.
+    """
+    with torch.no_grad():
+        sine_wavs, uv, _ = self.l_sin_gen(value)
+    sine_merge = self.l_tanh(self.l_linear(sine_wavs))
+
+    key = (
+        tuple(uv.shape),
+        uv.dtype,
+        uv.device,
+        tuple(uv.stride()),
+    )
+    noise = self._step_audio2_npu_source_noise_scratch.get(key)
+    if noise is None:
+        noise = torch.empty_like(uv)
+        self._step_audio2_npu_source_noise_scratch[key] = noise
+    torch.randn(uv.shape, out=noise)
+    # Retain upstream's two scalar operations and their rounding order.
+    noise.mul_(self.sine_amp)
+    noise.div_(3)
+
+    replayed_shapes = self._step_audio2_npu_source_noise_scratch_replayed_shapes
+    if key not in replayed_shapes:
+        logger.info(
+            "HiFT source-noise scratch active for shape=%s dtype=%s device=%s",
+            tuple(uv.shape),
+            uv.dtype,
+            uv.device,
+        )
+        replayed_shapes.add(key)
+    return sine_merge, noise, uv
+
+
+def prepare_hift_source_noise_scratch_for_npu(hift: torch.nn.Module) -> bool:
+    """Reuse MiniCPM-o's discarded HiFT source-noise result storage.
+
+    This is intentionally installed on ``m_source`` rather than the upstream
+    class: other flashcosyvoice callers may retain the auxiliary noise tensor,
+    whereas MiniCPM-o immediately discards it. The random operation and scalar
+    multiplication remain unchanged, so output values and RNG advancement are
+    identical to upstream for each invocation.
+    """
+    source = getattr(hift, "m_source", None)
+    if source is None:
+        raise TypeError("expected a Step-Audio2 flashcosyvoice HiFT m_source")
+    if getattr(source, "_step_audio2_npu_source_noise_scratch_patched", False):
+        return False
+    try:
+        original_forward = source.forward
+        source.l_sin_gen
+        source.l_linear
+        source.l_tanh
+        float(source.sine_amp)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TypeError("expected a flashcosyvoice SourceModuleHnNSF2 layout") from exc
+
+    source._step_audio2_original_forward = original_forward
+    source._step_audio2_npu_source_noise_scratch = {}
+    source._step_audio2_npu_source_noise_scratch_replayed_shapes = set()
+    source.forward = MethodType(_source_module_with_noise_scratch, source)
+    source._step_audio2_npu_source_noise_scratch_patched = True
+    logger.info("Enabled MiniCPM-o HiFT source-noise scratch reuse")
     return True
 
 
@@ -784,6 +861,14 @@ def _patched_ensure_models_loaded(self) -> None:
         except Exception:
             logger.warning(
                 "Unable to keep HiFT harmonics on NPU; using per-call copies",
+                exc_info=True,
+            )
+    if _env_flag_enabled(_HIFT_SOURCE_NOISE_SCRATCH_ENV):
+        try:
+            prepare_hift_source_noise_scratch_for_npu(self._hift)
+        except Exception:
+            logger.warning(
+                "Unable to enable HiFT source-noise scratch; using per-call allocation",
                 exc_info=True,
             )
     if _env_flag_enabled(_HIFT_MATERIALIZE_WEIGHT_NORM_ENV):

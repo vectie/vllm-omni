@@ -353,6 +353,85 @@ def test_hift_resident_harmonics_falls_back_for_other_dtype(
     assert all(actual_tensor is f0 for actual_tensor in actual)
 
 
+def test_hift_source_noise_scratch_is_exact_reuses_storage_and_preserves_rng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+
+    class FakeSineGen(torch.nn.Module):
+        def forward(self, value):
+            uv = (value > 0).to(value.dtype)
+            return torch.sin(value), uv, torch.zeros_like(value)
+
+    class FakeSource(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l_sin_gen = FakeSineGen()
+            self.l_linear = torch.nn.Linear(1, 1)
+            self.l_tanh = torch.nn.Tanh()
+            self.sine_amp = 0.1
+
+        def forward(self, value):
+            with torch.no_grad():
+                sine_wavs, uv, _ = self.l_sin_gen(value)
+            sine_merge = self.l_tanh(self.l_linear(sine_wavs))
+            noise = torch.randn_like(uv) * self.sine_amp / 3
+            return sine_merge, noise, uv
+
+    source = FakeSource().eval()
+    hift = SimpleNamespace(m_source=source)
+    value = torch.linspace(-1, 1, steps=24).reshape(1, 24, 1)
+
+    torch.manual_seed(17)
+    expected = source(value)
+    expected_next = torch.randn(7)
+
+    assert module.prepare_hift_source_noise_scratch_for_npu(hift)
+    patched_forward = source.forward
+    assert not module.prepare_hift_source_noise_scratch_for_npu(hift)
+    assert source.forward is patched_forward
+
+    torch.manual_seed(17)
+    actual = source(value)
+    actual_next = torch.randn(7)
+    first_pointer = actual[1].data_ptr()
+    actual_noise = actual[1].clone()
+    second = source(value)
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual_noise, expected[1], rtol=0, atol=0)
+    torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+    torch.testing.assert_close(actual_next, expected_next, rtol=0, atol=0)
+    assert second[1].data_ptr() == first_pointer
+    assert len(source._step_audio2_npu_source_noise_scratch) == 1
+
+
+def test_hift_source_noise_scratch_keeps_separate_shape_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+
+    class FakeSource:
+        sine_amp = 0.1
+        l_sin_gen = staticmethod(lambda value: (value, torch.ones_like(value), value))
+        l_linear = staticmethod(lambda value: value)
+        l_tanh = staticmethod(torch.tanh)
+
+        def forward(self, value):
+            return value, torch.randn_like(value) * self.sine_amp / 3, value
+
+    source = FakeSource()
+    module.prepare_hift_source_noise_scratch_for_npu(SimpleNamespace(m_source=source))
+
+    first = source.forward(torch.ones(1, 8, 1))[1]
+    second = source.forward(torch.ones(1, 12, 1))[1]
+    third = source.forward(torch.ones(1, 8, 1))[1]
+
+    assert first.data_ptr() != second.data_ptr()
+    assert first.data_ptr() == third.data_ptr()
+    assert len(source._step_audio2_npu_source_noise_scratch) == 2
+
+
 @pytest.mark.parametrize(("width", "window_size"), [(1, 16), (17, 15)])
 def test_hift_fixed_istft_constants_reject_invalid_layout(
     monkeypatch: pytest.MonkeyPatch,

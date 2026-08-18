@@ -11,7 +11,7 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
 3. HiFT weight norm — optionally freeze inference-only normalized convolution
    weights after checkpoint loading instead of recomputing them per chunk.
 4. HiFT F0 graph — replay the fixed steady-state five-convolution feature
-   stack as one TorchAir graph while retaining the original eager classifier.
+   stack as one TorchAir graph, with an opt-in exact-Linear classifier graph.
 5. HiFT residual graphs — replay one selected fixed-shape vocoder stage as
    three fused residual-block graphs while keeping upsampling, source fusion,
    and ISTFT visible to the surrounding eager execution.
@@ -49,6 +49,7 @@ _original_stream_chunk_for = None
 
 _HIFT_MATERIALIZE_WEIGHT_NORM_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM"
 _HIFT_F0_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"
+_HIFT_F0_CLASSIFIER_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_CLASSIFIER_GRAPH"
 _HIFT_F0_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"
 _HIFT_F0_GRAPH_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_BUCKETS"
 _HIFT_RESBLOCK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH"
@@ -319,6 +320,27 @@ def _hift_f0_features(
     return F.elu(F.conv1d(value, w4, b4, padding=1))
 
 
+def _hift_f0_predictor(
+    value: torch.Tensor,
+    w0: torch.Tensor,
+    b0: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor,
+    w2: torch.Tensor,
+    b2: torch.Tensor,
+    w3: torch.Tensor,
+    b3: torch.Tensor,
+    w4: torch.Tensor,
+    b4: torch.Tensor,
+    classifier_weight: torch.Tensor,
+    classifier_bias: torch.Tensor,
+) -> torch.Tensor:
+    """Exact flashcosyvoice F0 predictor, including its original Linear."""
+    features = _hift_f0_features(value, w0, b0, w1, b1, w2, b2, w3, b3, w4, b4)
+    prediction = F.linear(features.transpose(1, 2), classifier_weight, classifier_bias)
+    return torch.abs(prediction.squeeze(-1))
+
+
 def _f0_predictor_with_npu_graph(self, value: torch.Tensor) -> torch.Tensor:
     shape = tuple(value.shape)
     expected_prefix = (1, int(self._step_audio2_npu_f0_input_channels))
@@ -337,11 +359,13 @@ def _f0_predictor_with_npu_graph(self, value: torch.Tensor) -> torch.Tensor:
     if shape[2] not in replayed_widths:
         logger.info("HiFT F0 feature graph replay active for runtime shape %s", shape)
         replayed_widths.add(shape[2])
-    features = self._step_audio2_npu_f0_graph(value, *self._step_audio2_npu_f0_graph_weights)
+    output = self._step_audio2_npu_f0_graph(value, *self._step_audio2_npu_f0_graph_weights)
+    if self._step_audio2_npu_f0_classifier_in_graph:
+        return output
     # Keep the checkpoint's original per-timestep Linear outside the graph.
     # TorchAir 8.5 lowers an equivalent 1x1 Conv faster, but its accumulation
     # order moves F0 by up to 0.36 Hz. This form stays bit-exact to upstream.
-    return torch.abs(self.classifier(features.transpose(1, 2)).squeeze(-1))
+    return torch.abs(self.classifier(output.transpose(1, 2)).squeeze(-1))
 
 
 def materialize_hift_weight_norm_for_npu(hift: torch.nn.Module) -> int:
@@ -378,13 +402,15 @@ def prepare_hift_f0_graph_for_npu(
     *,
     width: int,
     extra_widths: tuple[int, ...] = (),
+    include_classifier: bool = False,
 ) -> bool:
     """Compile fixed-width HiFT F0 feature stacks for Ascend inference.
 
-    Only the five Conv+ELU feature layers enter GE. The classifier remains the
-    upstream eager Linear so the optimization changes neither its operation
-    nor its accumulation order. Non-steady widths and batches use the original
-    bound method.
+    The default boundary contains the five Conv+ELU feature layers. The
+    experimental full boundary also contains the checkpoint's original
+    per-timestep Linear and absolute value; unlike the rejected 1x1-Conv
+    substitution, this preserves the source operation. Non-steady widths and
+    batches use the original bound method.
     """
     predictor = getattr(hift, "f0_predictor", None)
     if predictor is None:
@@ -408,17 +434,25 @@ def prepare_hift_f0_graph_for_npu(
     # Graph parameters must be immutable. This removes only the five standard
     # weight-norm parametrizations owned by the F0 feature stack.
     materialize_hift_weight_norm_for_npu(predictor)
-    weights: tuple[torch.Tensor, ...] = tuple(
+    feature_weights: tuple[torch.Tensor, ...] = tuple(
         tensor
         for layer in convolutions
         for tensor in (layer.weight, layer.bias)
     )
+    if include_classifier:
+        if classifier.bias is None:
+            raise TypeError("expected the biased flashcosyvoice F0 classifier")
+        graph_function = _hift_f0_predictor
+        weights = (*feature_weights, classifier.weight, classifier.bias)
+    else:
+        graph_function = _hift_f0_features
+        weights = feature_weights
 
     from torch_npu.dynamo import torchair
 
     _ensure_torchair_broadcast_alias()
     graph = torch.compile(
-        _hift_f0_features,
+        graph_function,
         backend=torchair.get_npu_backend(compiler_config=torchair.CompilerConfig()),
         fullgraph=True,
         dynamic=False,
@@ -431,18 +465,20 @@ def prepare_hift_f0_graph_for_npu(
             (1, int(convolutions[0].in_channels), graph_width)
         )
         with torch.inference_mode():
-            expected_features = predictor.condnet(sample)
-            actual_features = graph(sample, *weights)
-        torch.testing.assert_close(actual_features, expected_features, rtol=0, atol=0)
+            expected = predictor(sample) if include_classifier else predictor.condnet(sample)
+            actual = graph(sample, *weights)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.npu.synchronize()
         logger.info(
-            "Compiled HiFT F0 feature graph for Ascend NPU: batch=1 width=%d",
+            "Compiled HiFT F0 %s graph for Ascend NPU: batch=1 width=%d",
+            "predictor" if include_classifier else "feature",
             graph_width,
         )
 
     predictor._step_audio2_original_forward = predictor.forward
     predictor._step_audio2_npu_f0_graph = graph
     predictor._step_audio2_npu_f0_graph_weights = weights
+    predictor._step_audio2_npu_f0_classifier_in_graph = include_classifier
     predictor._step_audio2_npu_f0_graph_widths = widths
     predictor._step_audio2_npu_f0_graph_replayed_widths = set()
     predictor._step_audio2_npu_f0_input_channels = int(convolutions[0].in_channels)
@@ -879,6 +915,7 @@ def _patched_ensure_models_loaded(self) -> None:
                 self._hift,
                 width=_hift_f0_graph_width(),
                 extra_widths=_hift_f0_graph_buckets(),
+                include_classifier=_env_flag_enabled(_HIFT_F0_CLASSIFIER_GRAPH_ENV),
             )
         except Exception:
             logger.warning("HiFT F0 graph compilation failed; using eager predictor", exc_info=True)

@@ -2363,6 +2363,19 @@ class TestPlatformOverrides:
         assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"] == "1"
         assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM"] == "1"
 
+    def test_minicpmo_4_5_910c_hift_f0_classifier_graph_is_stage2_env(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_hift_f0_classifier_graph_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_CLASSIFIER_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"] == "58"
+
     def test_minicpmo_4_5_910c_cache_major_candidate_is_explicit(self):
         deploy_path = Path(
             get_deploy_config_path(

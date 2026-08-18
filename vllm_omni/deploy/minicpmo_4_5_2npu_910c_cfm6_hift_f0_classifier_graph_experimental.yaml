@@ -1,0 +1,14 @@
+# Atlas 800I A3 / Ascend 910C full HiFT F0 graph candidate.
+#
+# Extend the accepted steady-width F0 feature graph through the checkpoint's
+# original Linear classifier and absolute value. Startup requires bit-exact
+# output from the real NPU checkpoint before this larger boundary is installed.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_CLASSIFIER_GRAPH: "1"

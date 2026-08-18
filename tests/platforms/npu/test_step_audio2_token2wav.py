@@ -555,6 +555,33 @@ def test_hift_f0_feature_partition_matches_sequential_stack(monkeypatch: pytest.
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_hift_f0_predictor_partition_keeps_original_linear(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    layers: list[torch.nn.Module] = []
+    channels = (3, 4, 4, 4, 4, 4)
+    for in_channels, out_channels in zip(channels, channels[1:]):
+        layers.extend(
+            (
+                torch.nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1),
+                torch.nn.ELU(),
+            )
+        )
+    condnet = torch.nn.Sequential(*layers).eval()
+    classifier = torch.nn.Linear(4, 1).eval()
+    convolutions = [layer for layer in condnet if isinstance(layer, torch.nn.Conv1d)]
+    value = torch.randn(1, 3, 11)
+
+    expected = torch.abs(classifier(condnet(value).transpose(1, 2)).squeeze(-1))
+    actual = module._hift_f0_predictor(
+        value,
+        *(tensor for layer in convolutions for tensor in (layer.weight, layer.bias)),
+        classifier.weight,
+        classifier.bias,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(("value", "expected"), [("58", 58), ("1", 1)])
 def test_hift_f0_graph_width_env(
     monkeypatch: pytest.MonkeyPatch,

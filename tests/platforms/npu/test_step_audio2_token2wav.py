@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -400,7 +401,7 @@ def test_hift_resblock_sibling_graph_uses_eager_fallback_off_npu(
         num_kernels=3,
     )
     block = SimpleNamespace(
-        _step_audio2_npu_resblock_graph_owner=owner,
+        _step_audio2_npu_resblock_graph_owner_ref=lambda: owner,
         _step_audio2_npu_resblock_graph_index=0,
         _step_audio2_original_forward=lambda value: calls.append("eager") or value + 1,
     )
@@ -411,6 +412,18 @@ def test_hift_resblock_sibling_graph_uses_eager_fallback_off_npu(
     assert calls == ["eager"]
     assert not hasattr(state, "outputs")
     torch.testing.assert_close(output, value + 1)
+
+
+def test_hift_resblock_owner_reference_does_not_register_module_cycle() -> None:
+    hift = torch.nn.Module()
+    block = torch.nn.Module()
+    hift.add_module("block", block)
+
+    block._step_audio2_npu_resblock_graph_owner_ref = weakref.ref(hift)
+    hift.eval()
+
+    assert list(block.children()) == []
+    assert block._step_audio2_npu_resblock_graph_owner_ref() is hift
 
 
 @pytest.mark.parametrize(("value", "expected"), [("0", 0), ("2", 2)])

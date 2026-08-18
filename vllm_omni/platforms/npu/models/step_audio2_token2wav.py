@@ -29,6 +29,7 @@ import importlib
 import math
 import os
 import threading
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import MethodType
@@ -384,7 +385,9 @@ def _resblock_with_npu_sibling_graph(self, value: torch.Tensor) -> torch.Tensor:
     launching another graph. Thread-local state preserves this contract when
     multiple serving threads enter the same model instance.
     """
-    owner = self._step_audio2_npu_resblock_graph_owner
+    owner = self._step_audio2_npu_resblock_graph_owner_ref()
+    if owner is None:
+        return self._step_audio2_original_forward(value)
     index = self._step_audio2_npu_resblock_graph_index
     state = owner._step_audio2_npu_resblock_graph_thread_state
     if (
@@ -508,7 +511,7 @@ def prepare_hift_resblock_graph_for_npu(
     hift._step_audio2_npu_resblock_graph_thread_state = threading.local()
     for index, (block, original_forward) in enumerate(zip(blocks, original_forwards)):
         block._step_audio2_original_forward = original_forward
-        block._step_audio2_npu_resblock_graph_owner = hift
+        block._step_audio2_npu_resblock_graph_owner_ref = weakref.ref(hift)
         block._step_audio2_npu_resblock_graph_index = index
         block.forward = MethodType(_resblock_with_npu_sibling_graph, block)
 

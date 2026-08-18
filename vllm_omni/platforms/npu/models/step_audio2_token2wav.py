@@ -361,7 +361,11 @@ def _f0_predictor_with_npu_graph(self, value: torch.Tensor) -> torch.Tensor:
 
     replayed_widths = self._step_audio2_npu_f0_graph_replayed_widths
     if shape[2] not in replayed_widths:
-        logger.info("HiFT F0 feature graph replay active for runtime shape %s", shape)
+        logger.info(
+            "HiFT F0 %s graph replay active for runtime shape %s",
+            "predictor" if self._step_audio2_npu_f0_classifier_in_graph else "feature",
+            shape,
+        )
         replayed_widths.add(shape[2])
     output = self._step_audio2_npu_f0_graph(value, *self._step_audio2_npu_f0_graph_weights)
     if self._step_audio2_npu_f0_classifier_in_graph:

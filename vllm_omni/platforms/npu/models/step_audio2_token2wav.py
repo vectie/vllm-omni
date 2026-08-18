@@ -12,9 +12,9 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
    weights after checkpoint loading instead of recomputing them per chunk.
 4. HiFT F0 graph — replay the fixed steady-state five-convolution feature
    stack as one TorchAir graph while retaining the original eager classifier.
-5. HiFT residual graph — replay all three sibling residual branches in one
-   fixed-shape stage megagraph while keeping upsampling, source fusion, and
-   ISTFT visible to the surrounding eager execution.
+5. HiFT residual graphs — replay one selected fixed-shape vocoder stage as
+   three fused residual-block graphs while keeping upsampling, source fusion,
+   and ISTFT visible to the surrounding eager execution.
 6. HiFT fixed ISTFT — replace the steady 16-point complex ISTFT with a static
    real inverse transform and four-way overlap-add graph.
 7. HiFT window residency — keep the immutable Hann window on NPU instead of
@@ -28,8 +28,6 @@ from __future__ import annotations
 import importlib
 import math
 import os
-import threading
-import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import MethodType
@@ -376,58 +374,30 @@ def prepare_hift_f0_graph_for_npu(
     return True
 
 
-def _resblock_with_npu_sibling_graph(self, value: torch.Tensor) -> torch.Tensor:
-    """Dispatch one sibling from a single exact-shape HiFT stage graph.
-
-    flashcosyvoice invokes the three stage siblings synchronously and in order.
-    The first block replays the graph and places its tuple of outputs in
-    thread-local storage; the next two blocks consume that tuple without
-    launching another graph. Thread-local state preserves this contract when
-    multiple serving threads enter the same model instance.
-    """
-    owner = self._step_audio2_npu_resblock_graph_owner_ref()
-    if owner is None:
-        return self._step_audio2_original_forward(value)
-    index = self._step_audio2_npu_resblock_graph_index
-    state = owner._step_audio2_npu_resblock_graph_thread_state
+def _resblock_with_npu_graph(self, value: torch.Tensor) -> torch.Tensor:
+    """Replay one exact-shape HiFT residual graph with an eager fallback."""
     if (
         value.device.type != "npu"
-        or tuple(value.shape) != owner._step_audio2_npu_resblock_graph_shape
-        or owner._step_audio2_npu_resblock_graph_disabled
+        or tuple(value.shape) != self._step_audio2_npu_resblock_graph_shape
+        or self._step_audio2_npu_resblock_graph_disabled
     ):
-        if hasattr(state, "outputs"):
-            del state.outputs
         return self._step_audio2_original_forward(value)
-
-    if index == 0:
-        try:
-            state.outputs = owner._step_audio2_npu_resblock_graph(value)
-        except Exception:
-            owner._step_audio2_npu_resblock_graph_disabled = True
-            if hasattr(state, "outputs"):
-                del state.outputs
-            logger.warning(
-                "HiFT residual sibling graph failed for shape %s; using eager execution",
-                tuple(value.shape),
-                exc_info=True,
-            )
-            return self._step_audio2_original_forward(value)
-        if not owner._step_audio2_npu_resblock_graph_replayed:
-            logger.info(
-                "HiFT residual sibling graph replay active for shape %s",
-                tuple(value.shape),
-            )
-            owner._step_audio2_npu_resblock_graph_replayed = True
-
-    outputs = getattr(state, "outputs", None)
-    if not isinstance(outputs, (tuple, list)) or len(outputs) != owner.num_kernels:
-        if hasattr(state, "outputs"):
-            del state.outputs
+    try:
+        output = self._step_audio2_npu_resblock_graph(value)
+    except Exception:
+        self._step_audio2_npu_resblock_graph_disabled = True
+        logger.warning(
+            "HiFT residual-block graph failed for shape %s; using eager execution",
+            tuple(value.shape),
+            exc_info=True,
+        )
         return self._step_audio2_original_forward(value)
-
-    output = outputs[index]
-    if index == owner.num_kernels - 1:
-        del state.outputs
+    if not self._step_audio2_npu_resblock_graph_replayed:
+        logger.info(
+            "HiFT residual-block graph replay active for shape %s",
+            tuple(value.shape),
+        )
+        self._step_audio2_npu_resblock_graph_replayed = True
     return output
 
 
@@ -437,15 +407,13 @@ def prepare_hift_resblock_graph_for_npu(
     stage: int,
     mel_width: int,
 ) -> int:
-    """Compile the three residual siblings as one fixed HiFT stage graph.
+    """Compile the three residual blocks in one fixed HiFT upsample stage.
 
     Each flashcosyvoice residual block contains three
-    ``Snake -> Conv1d -> Snake -> Conv1d -> add`` sequences. The stage graph
-    receives the shared input once and returns all three branch results. This
-    removes both the internal operator chain and the three separate opaque
-    graph boundaries while leaving ConvTranspose1d, source injection, sibling
-    reduction, and ISTFT visible to eager execution. Unsupported shapes retain
-    the package's original bound methods.
+    ``Snake -> Conv1d -> Snake -> Conv1d -> add`` sequences. Compiling at the
+    block boundary removes the intervening Python/operator launch chain while
+    leaving ConvTranspose1d, source injection, and ISTFT outside the graph.
+    Unsupported shapes retain the package's original bound method.
     """
     if getattr(hift, "_step_audio2_npu_resblock_graph_patched", False):
         return 0
@@ -479,52 +447,47 @@ def prepare_hift_resblock_graph_for_npu(
     from torch_npu.dynamo import torchair
 
     _ensure_torchair_broadcast_alias()
-    blocks = tuple(residuals[stage * num_kernels : (stage + 1) * num_kernels])
-    original_forwards = tuple(block.forward for block in blocks)
+    prepared: list[tuple[torch.nn.Module, object, object]] = []
+    for block_index in range(stage * num_kernels, (stage + 1) * num_kernels):
+        block = residuals[block_index]
+        original_forward = block.forward
+        graph = torch.compile(
+            original_forward,
+            backend=torchair.get_npu_backend(compiler_config=torchair.CompilerConfig()),
+            fullgraph=True,
+            dynamic=False,
+        )
+        # Exercise the periodic Snake path as well as convolution bias during
+        # the exactness gate; an all-zero sample would under-test the graph.
+        sample = parameter.new_full(shape, 0.125)
+        with torch.inference_mode():
+            expected = original_forward(sample)
+            actual = graph(sample)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.npu.synchronize()
 
-    def sibling_stage(value: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return tuple(forward(value) for forward in original_forwards)
+        prepared.append((block, original_forward, graph))
 
-    graph = torch.compile(
-        sibling_stage,
-        backend=torchair.get_npu_backend(compiler_config=torchair.CompilerConfig()),
-        fullgraph=True,
-        dynamic=False,
-    )
-    # Exercise the periodic Snake path as well as convolution bias during the
-    # exactness gate; an all-zero sample would under-test the graph.
-    sample = parameter.new_full(shape, 0.125)
-    with torch.inference_mode():
-        expected = sibling_stage(sample)
-        actual = graph(sample)
-    if not isinstance(actual, (tuple, list)) or len(actual) != num_kernels:
-        raise RuntimeError(f"HiFT residual sibling graph returned {type(actual).__name__}")
-    for actual_output, expected_output in zip(actual, expected):
-        torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
-    torch.npu.synchronize()
-
-    # Install only after the combined graph passes every sibling's exactness
-    # gate. A compilation failure must leave the entire stage eager.
-    hift._step_audio2_npu_resblock_graph = graph
-    hift._step_audio2_npu_resblock_graph_disabled = False
-    hift._step_audio2_npu_resblock_graph_replayed = False
-    hift._step_audio2_npu_resblock_graph_thread_state = threading.local()
-    for index, (block, original_forward) in enumerate(zip(blocks, original_forwards)):
+    # Install only after every sibling compiled and passed the exactness gate.
+    # A failure in one block must leave the whole stage on its original path.
+    for block, original_forward, graph in prepared:
         block._step_audio2_original_forward = original_forward
-        block._step_audio2_npu_resblock_graph_owner_ref = weakref.ref(hift)
-        block._step_audio2_npu_resblock_graph_index = index
-        block.forward = MethodType(_resblock_with_npu_sibling_graph, block)
+        block._step_audio2_npu_resblock_graph = graph
+        block._step_audio2_npu_resblock_graph_shape = shape
+        block._step_audio2_npu_resblock_graph_disabled = False
+        block._step_audio2_npu_resblock_graph_replayed = False
+        block.forward = MethodType(_resblock_with_npu_graph, block)
 
     hift._step_audio2_npu_resblock_graph_patched = True
     hift._step_audio2_npu_resblock_graph_stage = stage
     hift._step_audio2_npu_resblock_graph_shape = shape
     logger.info(
-        "Compiled one HiFT residual sibling graph with %d branches for stage=%d shape=%s",
-        len(blocks),
+        "Compiled %d HiFT residual-block graphs for stage=%d shape=%s",
+        len(prepared),
         stage,
         shape,
     )
-    return 1
+    return len(prepared)
 
 
 def _hift_fixed_istft(

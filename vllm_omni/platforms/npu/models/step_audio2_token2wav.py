@@ -19,6 +19,8 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
    real inverse transform and four-way overlap-add graph.
 7. HiFT window residency — keep the immutable Hann window on NPU instead of
    copying it from CPU in every STFT and ISTFT call.
+8. HiFT harmonic residency — keep SineGen2's immutable harmonic multiplier on
+   NPU instead of constructing it on CPU and copying it for every audio chunk.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ _HIFT_RESBLOCK_GRAPH_STAGE_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_S
 _HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH_MEL_WIDTH"
 _HIFT_FIXED_ISTFT_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH"
 _HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH"
+_HIFT_RESIDENT_HARMONICS_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESIDENT_HARMONICS"
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -67,6 +70,59 @@ def _place_hift_stft_window(hift: torch.nn.Module, device: torch.device) -> bool
         return False
     hift.stft_window = window.to(device=device)
     logger.info("Placed HiFT STFT window on %s", device)
+    return True
+
+
+def _sinegen_forward_with_harmonics(
+    sine_gen: torch.nn.Module,
+    f0: torch.Tensor,
+    harmonics: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run flashcosyvoice SineGen2 with a supplied harmonic multiplier."""
+    fn = torch.multiply(f0, harmonics)
+    sine_waves = sine_gen._f02sine(fn) * sine_gen.sine_amp
+    uv = sine_gen._f02uv(f0)
+    noise_amp = uv * sine_gen.noise_std + (1 - uv) * sine_gen.sine_amp / 3
+    noise = noise_amp * torch.randn_like(sine_waves)
+    sine_waves = sine_waves * uv + noise
+    return sine_waves, uv, noise
+
+
+def _sinegen_with_resident_harmonics(
+    self,
+    f0: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    harmonics = self._step_audio2_npu_harmonics
+    if f0.device != harmonics.device or f0.dtype != harmonics.dtype:
+        return self._step_audio2_original_forward(f0)
+    return _sinegen_forward_with_harmonics(self, f0, harmonics)
+
+
+def prepare_hift_resident_harmonics_for_npu(
+    hift: torch.nn.Module,
+    device: torch.device,
+) -> bool:
+    """Cache SineGen2's immutable harmonic multiplier on its NPU device."""
+    try:
+        sine_gen = hift.m_source.l_sin_gen
+        harmonic_num = sine_gen.harmonic_num
+        original_forward = sine_gen.forward
+    except AttributeError as exc:
+        raise TypeError("expected a Step-Audio2 flashcosyvoice HiFT with m_source.l_sin_gen.forward") from exc
+
+    if getattr(sine_gen, "_step_audio2_npu_harmonics_patched", False):
+        return False
+    if not isinstance(harmonic_num, int) or harmonic_num < 0:
+        raise ValueError(f"invalid SineGen2 harmonic_num={harmonic_num!r}")
+
+    # Preserve flashcosyvoice's exact FloatTensor construction and shape while
+    # paying for the host allocation and device transfer only once.
+    harmonics = torch.FloatTensor([[range(1, harmonic_num + 2)]]).to(device)
+    sine_gen._step_audio2_original_forward = original_forward
+    sine_gen._step_audio2_npu_harmonics = harmonics
+    sine_gen.forward = MethodType(_sinegen_with_resident_harmonics, sine_gen)
+    sine_gen._step_audio2_npu_harmonics_patched = True
+    logger.info("Placed HiFT SineGen2 harmonics on %s", device)
     return True
 
 
@@ -722,6 +778,14 @@ def _patched_ensure_models_loaded(self) -> None:
         _place_hift_stft_window(self._hift, self.device)
     except Exception:
         logger.warning("Unable to keep HiFT STFT window on NPU; using per-call copies", exc_info=True)
+    if _env_flag_enabled(_HIFT_RESIDENT_HARMONICS_ENV):
+        try:
+            prepare_hift_resident_harmonics_for_npu(self._hift, self.device)
+        except Exception:
+            logger.warning(
+                "Unable to keep HiFT harmonics on NPU; using per-call copies",
+                exc_info=True,
+            )
     if _env_flag_enabled(_HIFT_MATERIALIZE_WEIGHT_NORM_ENV):
         materialize_hift_weight_norm_for_npu(self._hift)
     if _env_flag_enabled(_HIFT_F0_GRAPH_ENV):

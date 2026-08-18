@@ -291,6 +291,68 @@ def test_hift_stft_window_placement_rejects_missing_tensor(
         module._place_hift_stft_window(SimpleNamespace(stft_window=None), torch.device("cpu"))
 
 
+def test_hift_resident_harmonics_is_exact_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+
+    class FakeSineGen:
+        harmonic_num = 3
+        sine_amp = 0.1
+        noise_std = 0.003
+
+        def _f02sine(self, value):
+            return torch.sin(value)
+
+        def _f02uv(self, value):
+            return (value > 0).to(torch.float32)
+
+        def forward(self, f0):
+            harmonics = torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device)
+            return module._sinegen_forward_with_harmonics(self, f0, harmonics)
+
+    sine_gen = FakeSineGen()
+    hift = SimpleNamespace(m_source=SimpleNamespace(l_sin_gen=sine_gen))
+    f0 = torch.linspace(0, 440, steps=48).reshape(1, 12, 4)[:, :, :1]
+
+    torch.manual_seed(7)
+    expected = sine_gen.forward(f0)
+    assert module.prepare_hift_resident_harmonics_for_npu(hift, torch.device("cpu"))
+    patched_forward = sine_gen.forward
+    assert not module.prepare_hift_resident_harmonics_for_npu(hift, torch.device("cpu"))
+    assert sine_gen.forward is patched_forward
+    torch.manual_seed(7)
+    actual = sine_gen.forward(f0)
+
+    assert sine_gen._step_audio2_npu_harmonics.shape == (1, 1, 4)
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+
+
+def test_hift_resident_harmonics_falls_back_for_other_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    calls: list[torch.dtype] = []
+
+    class FakeSineGen:
+        harmonic_num = 1
+
+        def forward(self, f0):
+            calls.append(f0.dtype)
+            return (f0, f0, f0)
+
+    sine_gen = FakeSineGen()
+    hift = SimpleNamespace(m_source=SimpleNamespace(l_sin_gen=sine_gen))
+    module.prepare_hift_resident_harmonics_for_npu(hift, torch.device("cpu"))
+    f0 = torch.ones(1, 8, 1, dtype=torch.float64)
+
+    actual = sine_gen.forward(f0)
+
+    assert calls == [torch.float64]
+    assert all(actual_tensor is f0 for actual_tensor in actual)
+
+
 @pytest.mark.parametrize(("width", "window_size"), [(1, 16), (17, 15)])
 def test_hift_fixed_istft_constants_reject_invalid_layout(
     monkeypatch: pytest.MonkeyPatch,

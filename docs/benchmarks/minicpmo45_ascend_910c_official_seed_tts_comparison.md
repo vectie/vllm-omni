@@ -3379,3 +3379,65 @@ ea351aea893d9ae3146999e5e32661acf57dbe5073349547e7db79fd07474fab  candidate/fina
 b15f0ef53546918d78b021034b02ecea65286a0d43ae85698b5bb666faa2e565  final-candidate-service.log
 f36d65fb21edf6612d90dd6076a7e98f6f9bbabcb9002f07291070170d81b660  final-accepted-service.log
 ```
+
+## Neutral HiFT F0 classifier-graph experiment
+
+The accepted HiFT F0 graph ends after five Conv1d+ELU layers and runs the
+checkpoint's per-timestep Linear classifier and absolute value eagerly. A
+larger opt-in boundary now keeps those original operations inside the same
+TorchAir graph:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_f0_classifier_graph_experimental.yaml
+```
+
+This differs from the previously rejected complete graph, which substituted a
+1x1 Conv and moved F0 by as much as 0.36 Hz. The new graph uses `F.linear`
+with the original classifier weight and bias. TorchAir 8.5 initially inferred
+the transposed input as K=58 instead of K=512; materializing that transpose
+with `contiguous()` repaired GE shape inference without replacing the model
+operation. The real 910C checkpoint compiled at `[1,80,58]` and reported
+`max_abs_drift=0` on the nonzero startup gate. Incompatible widths retain the
+upstream eager fallback.
+
+Two service restarts and one warmed repetition used the same 32 fixed English
+Seed-TTS rows, three warmups, concurrency one, seed zero, temperature zero,
+and CFM6. Every measured run completed 32/32 with zero failures and 100%
+continuity, while preserving 4,801 input tokens, 480 output tokens, 3,362,880
+frames, 140.12 seconds of audio, and identical generated text. The table uses
+the median run value from two accepted-control runs and three candidate runs;
+lower is better except for throughput.
+
+| Metric | Accepted control | Classifier graph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 42.041 s | 41.915 s | -0.30% |
+| Request throughput | 0.7613 req/s | 0.7634 req/s | +0.28% |
+| Mean E2E | 1,313.39 ms | 1,309.30 ms | -0.31% |
+| Mean TTFT | 314.84 ms | 321.46 ms | +2.10% |
+| Mean audio TTFP | 760.93 ms | 761.65 ms | +0.09% |
+| Mean chunk RTF | 0.324751 | 0.322969 | -0.55% |
+| Median chunk RTF | 0.154067 | 0.162580 | +5.53% |
+
+The restart-level result changed sign: one fresh comparison improved duration
+1.66%, the second regressed it 0.23%, and the warmed comparison improved it
+0.29%. The median gain is below normal service variance, while mean TTFT
+crosses the 2% guard and median chunk RTF regresses materially. The candidate
+therefore remains diagnostic-only and is not inherited by the accepted
+prompt-width profile. Full Seed-TTS WER/SIM, Daily-Omni, and Video-MME gates
+were not spent after the speed gate failed.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-f0-classifier-20260819
+```
+
+Artifact checksums:
+
+```text
+d1af2ebaa84a1e44e4a80701060da0bdd6f57ec2d269ab289a5d795fe6d0eee5  control/results/control-seedtts-32.json
+e7237229d5d9c3302b6024b0abe27c3fcc6ac3df7ec8b15e5833a9098e1befe0  control/results/control2-seedtts-32.json
+1d0d685b90807661532a31d0a401203a4fb05fa67ad1c5bfe83c478f4555169c  candidate/results/candidate-seedtts-32.json
+80f340dbcfff3c29770bd7b04351ee10e95ec7c2a92b5d988e90727d61879f6a  candidate/results/candidate2-seedtts-32.json
+410e1aa859fc00418bd0cd40011b58195d0079acbda0c1b9034de996080e52f4  candidate/results/candidate3-seedtts-32.json
+```

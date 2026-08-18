@@ -12,6 +12,7 @@ import torch
 from flashcosyvoice.modules.hifigan import HiFTGenerator
 
 from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
+    patch_step_audio2_hift_for_npu,
     prepare_hift_source_noise_scratch_for_npu,
 )
 
@@ -55,6 +56,9 @@ def main() -> None:
     torch.npu.set_device(args.device)
     device = torch.device(f"npu:{args.device}")
     hift = _load_hift(args.checkpoint, device)
+    # Match serving initialization and avoid Ascend's unsupported 480x
+    # ``linear1d`` reduction in the upstream non-causal SineGen2 path.
+    patch_step_audio2_hift_for_npu(hift)
     source = hift.m_source
     original_forward = source.forward
     waveform_width = args.mel_width * int(source.l_sin_gen.upsample_scale)

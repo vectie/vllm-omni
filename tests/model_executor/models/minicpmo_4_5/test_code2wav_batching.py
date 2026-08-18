@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_preamble_graph_enabled,
     _npu_dit_prompt_conv_mlp_graph_enabled,
     _npu_dit_qkv_pack_enabled,
+    _npu_single_request_cache_passthrough_enabled,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -1186,6 +1187,27 @@ def test_npu_cfm_stacked_cache_out_config_and_environment(monkeypatch):
         _npu_cfm_stacked_cache_out_enabled()
 
 
+def test_npu_single_request_cache_passthrough_config_and_environment(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH",
+        raising=False,
+    )
+    assert _npu_single_request_cache_passthrough_enabled(True) is True
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH",
+        "off",
+    )
+    assert _npu_single_request_cache_passthrough_enabled(True) is False
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH",
+        "sometimes",
+    )
+    with pytest.raises(ValueError, match="NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH"):
+        _npu_single_request_cache_passthrough_enabled()
+
+
 def test_npu_dit_fused_conv_block_config_and_environment(monkeypatch):
     monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_BLOCK", raising=False)
     assert _npu_dit_fused_conv_block_enabled(True) is True
@@ -1274,6 +1296,23 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
             round_tripped["estimator_att_cache"],
             original.flow_cache["estimator_att_cache"],
         )
+
+
+def test_single_request_cache_passthrough_preserves_storage():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(
+        token2wav,
+        npu_single_request_cache_passthrough=True,
+    )
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+
+    stacked = adapter._stack_flow_cache(states)
+    split = adapter._split_flow_cache(stacked, 1)
+
+    for name, value in states[0].flow_cache.items():
+        assert stacked[name].data_ptr() == value.data_ptr()
+        assert split[0][name].data_ptr() == value.data_ptr()
 
 
 def test_model_preserves_output_slots_and_prefers_runtime_codes():

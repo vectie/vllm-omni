@@ -32,6 +32,9 @@ _NPU_DIT_POST_ATTN_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_POST_ATTN_GRAPH"
 _NPU_DIT_QKV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_QKV_PACK"
 _NPU_DIT_ATTN_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT"
 _NPU_CFM_STACKED_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT"
+_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH"
+)
 _NPU_DIT_FUSED_CONV_BLOCK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_BLOCK"
 _NPU_DIT_FUSED_CONV_LINEAR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR"
 logger = logging.getLogger(__name__)
@@ -233,6 +236,21 @@ def _npu_cfm_stacked_cache_out_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_CFM_STACKED_CACHE_OUT_ENV}={raw!r}")
+
+
+def _npu_single_request_cache_passthrough_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH_ENV}={raw!r}")
 
 
 def _npu_dit_fused_conv_block_enabled(config_value: Any = None) -> bool:
@@ -924,6 +942,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_qkv_pack: Any = None,
         npu_dit_attn_cache_out: Any = None,
         npu_cfm_stacked_cache_out: Any = None,
+        npu_single_request_cache_passthrough: Any = None,
         npu_dit_fused_conv_block: Any = None,
         npu_dit_fused_conv_linear: Any = None,
     ):
@@ -1032,6 +1051,12 @@ class BatchedToken2Wav(nn.Module):
             npu_cfm_stacked_cache_out
         )
         self._npu_cfm_stacked_cache_out_used = False
+        self._npu_single_request_cache_passthrough_enabled = (
+            _npu_single_request_cache_passthrough_enabled(
+                npu_single_request_cache_passthrough
+            )
+        )
+        self._npu_single_request_cache_passthrough_used = False
         self._npu_dit_fused_conv_block_enabled = _npu_dit_fused_conv_block_enabled(npu_dit_fused_conv_block)
         self._npu_dit_fused_conv_block_used = False
         self._npu_dit_fused_conv_linear_enabled = _npu_dit_fused_conv_linear_enabled(npu_dit_fused_conv_linear)
@@ -2649,8 +2674,16 @@ class BatchedToken2Wav(nn.Module):
             self._npu_cfm_graphs.popitem(last=False)
         return tuple(output.clone() for output in outputs)
 
-    @staticmethod
-    def _split_flow_cache(cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
+    def _split_flow_cache(
+        self,
+        cache: dict[str, torch.Tensor],
+        batch_size: int,
+    ) -> list[dict[str, torch.Tensor]]:
+        if self._npu_single_request_cache_passthrough_enabled and batch_size == 1:
+            if not self._npu_single_request_cache_passthrough_used:
+                logger.info("MiniCPM-o NPU single-request cache passthrough active")
+                self._npu_single_request_cache_passthrough_used = True
+            return [{name: value.detach() for name, value in cache.items()}]
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
             result.append(
@@ -2675,8 +2708,9 @@ class BatchedToken2Wav(nn.Module):
             )
         return result
 
-    @staticmethod
-    def _stack_flow_cache(states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
+    def _stack_flow_cache(self, states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
+        if self._npu_single_request_cache_passthrough_enabled and len(states) == 1:
+            return states[0].flow_cache
         flows = [state.flow_cache for state in states]
         conditional_cnn = [flow["estimator_cnn_cache"][:, :, 0:1] for flow in flows]
         unconditional_cnn = [flow["estimator_cnn_cache"][:, :, 1:2] for flow in flows]

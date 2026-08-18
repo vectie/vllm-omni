@@ -20,14 +20,15 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_fused_conv_mlp_residual,
     _dit_fused_full_block,
     _dit_mlp_residual,
+    _npu_dit_attn_cache_out_enabled,
     _npu_dit_cache_major_enabled,
     _npu_dit_conv_mlp_graph_enabled,
-    _npu_dit_fused_conv_block_enabled,
-    _npu_dit_fused_conv_linear_enabled,
-    _npu_dit_fused_conv_pack_enabled,
     _npu_dit_full_block_cache_buckets,
     _npu_dit_full_block_graph_enabled,
     _npu_dit_full_stack_graph_enabled,
+    _npu_dit_fused_conv_block_enabled,
+    _npu_dit_fused_conv_linear_enabled,
+    _npu_dit_fused_conv_pack_enabled,
     _npu_dit_graph_buckets,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
@@ -498,9 +499,36 @@ def test_attention_from_projected_qkv_matches_cached_sdpa_math():
     expected = attention.proj(expected.transpose(1, 2).reshape(2, 50, 512))
 
     actual, new_cache = BatchedToken2Wav._attention_from_projected_qkv(attention, q, k, v, cache)
+    output_cache = torch.empty_like(new_cache)
+    direct, direct_cache = BatchedToken2Wav._attention_from_projected_qkv(
+        attention,
+        q,
+        k,
+        v,
+        cache,
+        output_cache=output_cache,
+    )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(new_cache, torch.cat((full_k, full_v), dim=3), rtol=0, atol=0)
+    torch.testing.assert_close(direct, expected, rtol=0, atol=0)
+    torch.testing.assert_close(direct_cache, new_cache, rtol=0, atol=0)
+    assert direct_cache is output_cache
+
+
+def test_attention_from_projected_qkv_rejects_bad_output_cache_shape():
+    attention = SimpleNamespace(proj=nn.Linear(512, 512), proj_drop=nn.Identity())
+    q = torch.randn(2, 8, 50, 64)
+
+    with pytest.raises(ValueError, match="output cache shape mismatch"):
+        BatchedToken2Wav._attention_from_projected_qkv(
+            attention,
+            q,
+            q,
+            q,
+            None,
+            output_cache=torch.empty(2, 8, 49, 128),
+        )
 
 
 @pytest.mark.parametrize("width", [20, 50, 302])
@@ -1131,6 +1159,18 @@ def test_npu_dit_qkv_pack_config_and_environment(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_QKV_PACK", "sometimes")
     with pytest.raises(ValueError, match="NPU_DIT_QKV_PACK"):
         _npu_dit_qkv_pack_enabled()
+
+
+def test_npu_dit_attn_cache_out_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT", raising=False)
+    assert _npu_dit_attn_cache_out_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT", "off")
+    assert _npu_dit_attn_cache_out_enabled(True) is False
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT", "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_ATTN_CACHE_OUT"):
+        _npu_dit_attn_cache_out_enabled()
 
 
 def test_npu_dit_fused_conv_block_config_and_environment(monkeypatch):

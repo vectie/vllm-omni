@@ -30,6 +30,7 @@ _NPU_DIT_FUSED_CONV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_PACK"
 _NPU_DIT_CACHE_MAJOR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CACHE_MAJOR"
 _NPU_DIT_POST_ATTN_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_POST_ATTN_GRAPH"
 _NPU_DIT_QKV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_QKV_PACK"
+_NPU_DIT_ATTN_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT"
 _NPU_DIT_FUSED_CONV_BLOCK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_BLOCK"
 _NPU_DIT_FUSED_CONV_LINEAR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR"
 logger = logging.getLogger(__name__)
@@ -201,6 +202,21 @@ def _npu_dit_qkv_pack_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_DIT_QKV_PACK_ENV}={raw!r}")
+
+
+def _npu_dit_attn_cache_out_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_ATTN_CACHE_OUT_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_ATTN_CACHE_OUT_ENV}={raw!r}")
 
 
 def _npu_dit_fused_conv_block_enabled(config_value: Any = None) -> bool:
@@ -890,6 +906,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_cache_major: Any = None,
         npu_dit_post_attn_graph: Any = None,
         npu_dit_qkv_pack: Any = None,
+        npu_dit_attn_cache_out: Any = None,
         npu_dit_fused_conv_block: Any = None,
         npu_dit_fused_conv_linear: Any = None,
     ):
@@ -990,6 +1007,10 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_post_attn_graph_used = False
         self._npu_dit_qkv_pack_enabled = _npu_dit_qkv_pack_enabled(npu_dit_qkv_pack)
         self._npu_dit_qkv_pack_used = False
+        self._npu_dit_attn_cache_out_enabled = _npu_dit_attn_cache_out_enabled(
+            npu_dit_attn_cache_out
+        )
+        self._npu_dit_attn_cache_out_used = False
         self._npu_dit_fused_conv_block_enabled = _npu_dit_fused_conv_block_enabled(npu_dit_fused_conv_block)
         self._npu_dit_fused_conv_block_used = False
         self._npu_dit_fused_conv_linear_enabled = _npu_dit_fused_conv_linear_enabled(npu_dit_fused_conv_linear)
@@ -2175,15 +2196,32 @@ class BatchedToken2Wav(nn.Module):
             ) = modulation.chunk(9, dim=-1)
 
             if q is None or k is None or v is None:
+                attention_cache_written = False
                 attention, new_att = block.attn.forward_chunk(
                     block.norm1(hidden) * (1 + scale_msa) + shift_msa,
                     old_att[block_idx],
                     None,
                 )
             else:
-                attention, new_att = BatchedToken2Wav._attention_from_projected_qkv(
-                    block.attn, q, k, v, old_att[block_idx]
+                output_cache = (
+                    att_out[block_idx]
+                    if self._npu_dit_attn_cache_out_enabled
+                    else None
                 )
+                attention, new_att = BatchedToken2Wav._attention_from_projected_qkv(
+                    block.attn,
+                    q,
+                    k,
+                    v,
+                    old_att[block_idx],
+                    output_cache=output_cache,
+                )
+                attention_cache_written = output_cache is not None
+                if attention_cache_written and not self._npu_dit_attn_cache_out_used:
+                    logger.info(
+                        "MiniCPM-o NPU DiT attention cache direct-output active"
+                    )
+                    self._npu_dit_attn_cache_out_used = True
             post_attention_graph = (
                 self._npu_dit_post_attn_graph_enabled
                 and conv_mlp_graph_fn is not None
@@ -2276,7 +2314,8 @@ class BatchedToken2Wav(nn.Module):
                         block.mlp.fc2.bias,
                     )
             cnn_out[block_idx].copy_(new_cnn)
-            att_out[block_idx, :, :, : new_att.shape[2], :].copy_(new_att)
+            if not attention_cache_written:
+                att_out[block_idx, :, :, : new_att.shape[2], :].copy_(new_att)
 
         hidden = estimator.final_layer(hidden, time_embedding)
         return hidden.transpose(1, 2)
@@ -2288,12 +2327,39 @@ class BatchedToken2Wav(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         att_cache: torch.Tensor | None,
+        *,
+        output_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if att_cache is not None:
+        if output_cache is not None:
+            old_width = int(att_cache.shape[2]) if att_cache is not None else 0
+            expected_shape = (
+                *k.shape[:2],
+                int(k.shape[2]) + old_width,
+                int(k.shape[3]) * 2,
+            )
+            if tuple(output_cache.shape) != expected_shape:
+                raise ValueError(
+                    "DiT attention output cache shape mismatch: "
+                    f"expected {expected_shape}, got {tuple(output_cache.shape)}"
+                )
+            full_k, full_v = output_cache.chunk(2, dim=3)
+            if att_cache is None:
+                full_k.copy_(k)
+                full_v.copy_(v)
+            else:
+                k_cache, v_cache = att_cache.chunk(2, dim=3)
+                torch.cat((k, k_cache), dim=2, out=full_k)
+                torch.cat((v, v_cache), dim=2, out=full_v)
+            k = full_k
+            v = full_v
+            new_att_cache = output_cache
+        elif att_cache is not None:
             k_cache, v_cache = att_cache.chunk(2, dim=3)
             k = torch.cat((k, k_cache), dim=2)
             v = torch.cat((v, v_cache), dim=2)
-        new_att_cache = torch.cat((k, v), dim=3)
+            new_att_cache = torch.cat((k, v), dim=3)
+        else:
+            new_att_cache = torch.cat((k, v), dim=3)
         hidden = F.scaled_dot_product_attention(q, k, v)
         batch_size, _, width, _ = hidden.shape
         hidden = hidden.transpose(1, 2).reshape(batch_size, width, -1)

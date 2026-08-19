@@ -2,8 +2,8 @@
 #
 # Compute all 16 DiT block modulation projections with one 73728-wide Cube
 # GEMM for each CFM step, then consume each block's row through the accepted
-# shape-bucketed preamble graphs. This does not retain modulation values across
-# timesteps or audio chunks.
+# shape-bucketed preamble graphs. Startup fails closed above 1e-6 maximum
+# absolute drift. This does not retain values across timesteps or audio chunks.
 
 base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
 

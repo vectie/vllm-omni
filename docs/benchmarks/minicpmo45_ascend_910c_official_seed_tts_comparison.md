@@ -3483,3 +3483,28 @@ linearization as F0 optimization directions on the current CANN/TorchAir
 stack. A future retry must either change GE's native Conv1d weight-packing
 policy or fuse the whole five-layer stack below the framework boundary while
 preserving the original accumulation behavior.
+
+## Rejected contiguous-window causal-pack kernel
+
+The same retained Stage-2 profile attributed 38.321 ms to 576 invocations of
+the two native `MinicpmoCausalConvPack` nodes. A lower-layer candidate enlarged
+the AscendC UB row buffer and replaced three 512-element DMA round trips with
+one contiguous 1536-element transfer for the 96 rows that do not cross the
+two-frame cache boundary. The first two rows used two-source specialized
+copies and narrower MTE2-to-MTE3 event synchronization.
+
+The candidate compiled for Ascend 910C and passed all six exact operator
+cases: FP16, FP32, and BF16, each with channel-major and cache-major state.
+Fresh 100-warmup, 500-iteration, 15-trial measurements were:
+
+| Layout | Installed kernel | Contiguous-window candidate | Change |
+| --- | ---: | ---: | ---: |
+| Channel-major | 63.552 us | 63.775 us | +0.35% |
+| Cache-major (serving path) | 18.995 us | 18.849 us | -0.77% |
+
+Lower is better. The production-layout gain is below the promotion threshold
+and the compatibility layout regressed. Kernel launch and the mandatory
+packed-output write dominate after the earlier cache-major optimization, so
+reducing internal DMA command count does not produce a material serving win.
+The candidate was removed rather than adding a second implementation for a
+noise-level result; no end-to-end or accuracy-suite budget was spent.

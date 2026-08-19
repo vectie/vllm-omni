@@ -23,6 +23,8 @@ connectors:
       npu_dit_mlp_graph_width: 50
       npu_dit_graph_buckets: [20, 302]
       npu_dit_preamble_graph: true
+      # Cache-major plus wide AdaLN regressed the composed serving gate.
+      npu_dit_wide_adaln: false
       npu_dit_conv_mlp_graph: true
       npu_dit_prompt_conv_mlp_graph: true
       npu_dit_fused_conv_pack: true

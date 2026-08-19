@@ -3717,3 +3717,75 @@ spending an end-to-end service cycle:
 The reproducible screens are
 `bench_minicpmo_dit_frozen_weights.py`, `bench_minicpmo_dit_tap_matmul.py`,
 and `bench_minicpmo_dit_nz_weights.py` under `benchmarks/scripts/`.
+
+## Width-64 causal-pack kernel and rejected 32-frame schedule
+
+The next systems experiment preserved the accepted 25-frame first audio
+packet, then increased steady packets to 32 codec frames. This changes the
+steady DiT width from 50 to 64 and the HiFT F0 width from 58 to 72. The first
+unfused screen was decisively slower because the native causal Conv packing
+operator and Omni graph compatibility gate accepted only width 50: serving
+duration was 66.611 seconds and mean chunk RTF was 0.530646.
+
+The Ascend operator is now genuinely shape-aware at both competition widths.
+Its host tiler accepts `[2,50,512]` and `[2,64,512]`, the Torch binding sizes
+the packed output from the input shape, and the Omni graph reshapes projected
+values back to the traced input shape. Startup now compiles the fused causal
+Conv+MLP megagraph at the configured width. Exact device tests passed all 12
+combinations of width 50/64, FP16/FP32/BF16, and channel-major/cache-major
+state. The live width-64 graph compiled and replayed; HiFT widths 50 and 72
+both passed with maximum absolute drift `0`.
+
+The official TTS wrapper also now registers MiniCPM-o 4.5's Omni chat request,
+separates the registry model ID from the name advertised by a local server,
+and removes argparse's literal `--` separator before forwarding benchmark
+options. This prevents a local checkpoint name mismatch from silently turning
+an intended run into HTTP 404 failures.
+
+Fresh accepted-control and fused width-64 processes ran the same 32 fixed
+English Seed-TTS rows three times with three warmups, concurrency one, seed
+zero, temperature zero, and CFM6. Every measured run completed 32/32 with zero
+failures and 100% continuity, preserving 4,801 input tokens, 480 output tokens,
+3,362,880 audio frames, and 140.12 seconds of audio. The table reports the
+median run value; lower is better except for throughput.
+
+| Metric | Accepted 25-frame control | Fused 25/32-frame schedule | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.238 s | 41.228 s | -0.02% |
+| Request throughput | 0.7760 req/s | 0.7762 req/s | +0.02% |
+| Mean / median / P99 E2E | 1,287.79 / 1,305.49 / 1,708.94 ms | 1,287.67 / 1,283.26 / 1,801.70 ms | -0.01% / -1.70% / +5.43% |
+| Mean / median / P99 TTFT | 313.59 / 314.18 / 453.42 ms | 314.64 / 319.61 / 449.42 ms | +0.33% / +1.73% / -0.88% |
+| Mean / median / P99 audio TTFP | 752.02 / 753.13 / 904.65 ms | 777.73 / 782.77 / 942.91 ms | +3.42% / +3.94% / +4.23% |
+| Mean / median / P99 chunk RTF | 0.317468 / 0.146430 / 1.017063 | 0.348741 / 0.152492 / 1.047937 | +9.85% / +4.14% / +3.04% |
+
+The new kernel removes the catastrophic fallback cost: relative to the
+unfused 32-frame screen, fused median duration improves 38.11%, throughput
+improves 61.57%, TTFP improves 22.61%, and mean chunk RTF improves 34.28%.
+Against the accepted 25-frame profile, however, aggregate duration is flat
+while every TTFP and chunk-RTF gate regresses by more than two percent. The
+kernel capability remains available for future shapes, but the 32-frame
+schedule is rejected and is not inherited by the accepted profile.
+
+A separate composition screen showed that cache-major causal state must not
+be combined with the accepted all-step AdaLN profile. One fail-fast 32-row run
+completed without structural drift but took 67.567 seconds with mean audio
+TTFP 1,042.43 ms and mean chunk RTF 0.494745. Its experimental profile now
+explicitly disables wide AdaLN rather than accidentally replacing inherited
+connector options.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-all-step-cache-major-20260820
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-chunk32-20260820
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-chunk32-width64-20260820
+```
+
+Artifact checksums:
+
+```text
+c6a8cdf8fc059530fb132f40e533941b63d7778e8e683f853aed67ba700dc3c0  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260819-182758.json
+4252e5a5b1a4837940089043d352a1de7baaae4e2ab791315070a10bb41de112  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260819-183053.json
+45f35a3a611df007a169c92c841fa50078bd5f980ccd76a26d7bf19056fdad93  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260819-183155.json
+87018b83e590fb2449a81d8e81e31466608dcc4c937c57dc8f9586cced568a1d  /tmp/lunanexa-chunk32-width64-service-7.log
+```

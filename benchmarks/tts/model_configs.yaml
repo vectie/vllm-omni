@@ -7,6 +7,21 @@
 # is tracked here.
 
 models:
+  # MiniCPM-o 4.5 emits interleaved text and audio from the Omni chat
+  # endpoint. Its TTS template controls belong in the request body rather
+  # than the benchmark client's top-level chat-template arguments.
+  openbmb/MiniCPM-o-4_5:
+    supported_tasks: [voice_clone]
+    backend: openai-chat-omni
+    endpoint: /v1/chat/completions
+    trust_remote_code: true
+    task_extra_body:
+      voice_clone:
+        modalities: [text, audio]
+        chat_template_kwargs:
+          use_tts_template: true
+          enable_thinking: false
+
   # -CustomVoice checkpoints lack speaker_encoder weights, so voice_clone is
   # NOT supported (an attempt raises ValueError from _extract_speaker_embedding
   # at model runtime).  Use -Base for voice_clone.

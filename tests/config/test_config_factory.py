@@ -2402,6 +2402,26 @@ class TestPlatformOverrides:
         extra = deploy.connectors["connector_of_shared_memory"]["extra"]
         assert extra["npu_dit_fused_conv_pack"] is True
         assert extra["npu_dit_cache_major"] is True
+        assert extra["npu_dit_wide_adaln"] is False
+
+    def test_minicpmo_4_5_910c_chunk32_candidate_preserves_graph_buckets(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_chunk32_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["codec_chunk_frames"] == 32
+        assert extra["initial_codec_chunk_frames"] == 25
+        assert extra["npu_dit_mlp_graph_width"] == 64
+        assert extra["npu_dit_graph_buckets"] == [20, 50, 302]
+        assert extra["npu_dit_wide_adaln"] is True
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"] == "72"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_BUCKETS"] == "50"
 
     def test_minicpmo_4_5_910c_wide_adaln_candidate_is_explicit(self):
         deploy_path = Path(

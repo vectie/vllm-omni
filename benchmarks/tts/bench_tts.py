@@ -61,6 +61,11 @@ _TASK_TO_DATASET: dict[str, str] = {
 _DEFAULT_DESIGN_DATASET_PATH = str(_REPO_ROOT / "benchmarks" / "build_dataset" / "seed_tts_design")
 
 
+def _normalize_extra_cli_args(arguments: list[str]) -> list[str]:
+    """Drop argparse's separator before forwarding benchmark options."""
+    return arguments[1:] if arguments[:1] == ["--"] else arguments
+
+
 def load_model_configs(path: Path) -> dict[str, Any]:
     """Load model registry from YAML file."""
     with open(path, encoding="utf-8") as f:
@@ -73,6 +78,7 @@ def build_bench_args(
     host: str,
     port: int,
     model: str,
+    served_model_name: str | None,
     task: str,
     model_cfg: dict[str, Any],
     locale: str,
@@ -109,7 +115,7 @@ def build_bench_args(
         "--port",
         str(port),
         "--model",
-        model,
+        served_model_name or model,
         "--backend",
         backend,
         "--endpoint",
@@ -225,6 +231,11 @@ def main() -> None:
     parser.add_argument(
         "--model", required=True, help="HuggingFace model ID (e.g. Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)"
     )
+    parser.add_argument(
+        "--served-model-name",
+        default=None,
+        help="Model name advertised by an already-running server; defaults to --model.",
+    )
     parser.add_argument("--task", default="all", help="Task type: voice_clone | default_voice | voice_design | all")
     parser.add_argument("--locale", default="en", choices=["en", "zh"])
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4], metavar="N")
@@ -255,6 +266,7 @@ def main() -> None:
     )
     parser.add_argument("extra", nargs=argparse.REMAINDER, help="Extra args passed directly to vllm bench serve")
     args = parser.parse_args()
+    extra_cli_args = _normalize_extra_cli_args(args.extra)
 
     model_configs = load_model_configs(Path(args.model_configs))
     if args.model not in model_configs:
@@ -297,6 +309,7 @@ def main() -> None:
                 host=args.host,
                 port=args.port,
                 model=args.model,
+                served_model_name=args.served_model_name,
                 task=task,
                 model_cfg=model_cfg,
                 locale=args.locale,
@@ -306,7 +319,7 @@ def main() -> None:
                 wer_eval=args.wer_eval,
                 output_dir=args.output_dir,
                 result_filename=result_filename,
-                extra_cli_args=args.extra or [],
+                extra_cli_args=extra_cli_args,
                 output_len=args.output_len,
             )
             result = run_one_benchmark(cmd)

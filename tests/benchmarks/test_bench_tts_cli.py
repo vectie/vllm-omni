@@ -51,12 +51,21 @@ def test_load_model_configs(model_configs_path: Path) -> None:
     assert configs["test/ModelA"]["supported_tasks"] == ["voice_clone", "default_voice"]
 
 
+def test_extra_cli_separator_is_not_forwarded() -> None:
+    assert bench_tts._normalize_extra_cli_args(["--", "--num-warmups", "3"]) == [
+        "--num-warmups",
+        "3",
+    ]
+    assert bench_tts._normalize_extra_cli_args(["--seed", "0"]) == ["--seed", "0"]
+
+
 def test_build_bench_args_voice_clone(model_configs_path: Path) -> None:
     configs = bench_tts.load_model_configs(model_configs_path)
     cmd = bench_tts.build_bench_args(
         host="localhost",
         port=8000,
         model="test/ModelA",
+        served_model_name=None,
         task="voice_clone",
         model_cfg=configs["test/ModelA"],
         locale="en",
@@ -83,6 +92,7 @@ def test_build_bench_args_default_voice_has_voice_param(model_configs_path: Path
         host="localhost",
         port=8000,
         model="test/ModelA",
+        served_model_name="local/checkpoint",
         task="default_voice",
         model_cfg=configs["test/ModelA"],
         locale="en",
@@ -96,6 +106,7 @@ def test_build_bench_args_default_voice_has_voice_param(model_configs_path: Path
     )
     idx = cmd.index("--dataset-name")
     assert cmd[idx + 1] == "seed-tts-text"
+    assert cmd[cmd.index("--model") + 1] == "local/checkpoint"
     extra_body = json.loads(cmd[cmd.index("--extra-body") + 1])
     assert extra_body.get("voice") == "Vivian"
 
@@ -106,6 +117,7 @@ def test_build_bench_args_wer_eval_adds_flag(model_configs_path: Path) -> None:
         host="localhost",
         port=8000,
         model="test/ModelA",
+        served_model_name=None,
         task="voice_clone",
         model_cfg=configs["test/ModelA"],
         locale="en",

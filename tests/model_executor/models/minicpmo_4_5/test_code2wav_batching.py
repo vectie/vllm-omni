@@ -612,15 +612,19 @@ def test_dit_conv_mlp_residual_matches_partition_math(width: int):
     torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
 
 
-def test_dit_fused_conv_mlp_residual_matches_partition_math(monkeypatch):
+@pytest.mark.parametrize("frames", [50, 64])
+def test_dit_fused_conv_mlp_residual_matches_partition_math(monkeypatch, frames: int):
     torch.manual_seed(14)
 
     def causal_pack(x, cache):
         history = torch.cat((cache, x.transpose(1, 2)), dim=2)
         packed = torch.stack(
-            [history[:, :, offset : offset + 3].transpose(1, 2).reshape(2, -1) for offset in range(50)],
+            [
+                history[:, :, offset : offset + 3].transpose(1, 2).reshape(2, -1)
+                for offset in range(frames)
+            ],
             dim=1,
-        ).reshape(100, 1536)
+        ).reshape(2 * frames, 1536)
         return packed, x[:, -2:, :].transpose(1, 2).contiguous()
 
     monkeypatch.setattr(
@@ -629,8 +633,8 @@ def test_dit_fused_conv_mlp_residual_matches_partition_math(monkeypatch):
         causal_pack,
         raising=False,
     )
-    hidden = torch.randn(2, 50, 512)
-    conv_input = torch.randn(2, 50, 512)
+    hidden = torch.randn(2, frames, 512)
+    conv_input = torch.randn(2, frames, 512)
     cache = torch.randn(2, 1024, 2)
     modulations = [torch.randn(2, 1, 512) for _ in range(4)]
     conv1 = nn.Conv1d(512, 512, 3)

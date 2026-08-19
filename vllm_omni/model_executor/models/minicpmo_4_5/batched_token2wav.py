@@ -616,7 +616,7 @@ def _dit_fused_conv_mlp_residual(
     """910C Conv/cache + MLP graph using the native causal-pack boundary."""
     cache1, cache2 = cnn_cache.split((512, 512), dim=1)
     packed, new_cache1 = torch.ops._C_ascend.npu_minicpmo_causal_conv_pack(conv_input, cache1)
-    convolution = F.linear(packed, conv1_flat_weight, conv1_bias).reshape(2, 50, 512)
+    convolution = F.linear(packed, conv1_flat_weight, conv1_bias).reshape(conv_input.shape)
     convolution = F.layer_norm(
         convolution,
         (512,),
@@ -626,7 +626,7 @@ def _dit_fused_conv_mlp_residual(
     )
     convolution = F.mish(convolution)
     packed, new_cache2 = torch.ops._C_ascend.npu_minicpmo_causal_conv_pack(convolution, cache2)
-    convolution = F.linear(packed, conv2_flat_weight, conv2_bias).reshape(2, 50, 512)
+    convolution = F.linear(packed, conv2_flat_weight, conv2_bias).reshape(conv_input.shape)
     hidden = hidden + gate_conv * convolution
     hidden = _dit_mlp_residual(
         hidden,
@@ -663,7 +663,7 @@ def _dit_cache_major_conv_mlp_residual(
     """910C Conv/cache graph retaining contiguous ``[batch, taps, channels]`` state."""
     cache1, cache2 = cnn_cache.split((512, 512), dim=2)
     packed, new_cache1 = torch.ops._C_ascend.npu_minicpmo_causal_conv_pack(conv_input, cache1)
-    convolution = F.linear(packed, conv1_flat_weight, conv1_bias).reshape(2, 50, 512)
+    convolution = F.linear(packed, conv1_flat_weight, conv1_bias).reshape(conv_input.shape)
     convolution = F.layer_norm(
         convolution,
         (512,),
@@ -673,7 +673,7 @@ def _dit_cache_major_conv_mlp_residual(
     )
     convolution = F.mish(convolution)
     packed, new_cache2 = torch.ops._C_ascend.npu_minicpmo_causal_conv_pack(convolution, cache2)
-    convolution = F.linear(packed, conv2_flat_weight, conv2_bias).reshape(2, 50, 512)
+    convolution = F.linear(packed, conv2_flat_weight, conv2_bias).reshape(conv_input.shape)
     hidden = hidden + gate_conv * convolution
     hidden = _dit_mlp_residual(
         hidden,
@@ -1612,7 +1612,7 @@ class BatchedToken2Wav(nn.Module):
 
     @staticmethod
     def _dit_conv_mlp_compatible(block: nn.Module, width: int) -> bool:
-        return width == 50 and BatchedToken2Wav._dit_conv_mlp_layout_compatible(block)
+        return width in (50, 64) and BatchedToken2Wav._dit_conv_mlp_layout_compatible(block)
 
     @staticmethod
     def _dit_post_attention_compatible(block: nn.Module, width: int) -> bool:
@@ -1646,7 +1646,8 @@ class BatchedToken2Wav(nn.Module):
             self._npu_dit_conv_mlp_graph_disabled = True
             logger.warning("MiniCPM-o NPU DiT Conv+MLP graph disabled: block layout is incompatible")
             return
-        hidden = weight.new_zeros((2, 50, 512))
+        width = self._npu_dit_mlp_graph_width
+        hidden = weight.new_zeros((2, width, 512))
         modulation = weight.new_zeros((2, 1, 512))
         cnn_cache = weight.new_zeros(
             (2, 2, 1024) if self._npu_dit_cache_major_enabled else (2, 1024, 2)
@@ -1747,10 +1748,14 @@ class BatchedToken2Wav(nn.Module):
             torch.npu.synchronize()
             if self._npu_dit_post_attn_graph_enabled:
                 logger.info(
-                    "Compiled MiniCPM-o NPU DiT post-attention Conv+MLP megagraph for 2x50x512"
+                    "Compiled MiniCPM-o NPU DiT post-attention Conv+MLP megagraph for 2x%dx512",
+                    width,
                 )
             else:
-                logger.info("Compiled MiniCPM-o NPU DiT Conv+MLP megagraph for 2x50x512")
+                logger.info(
+                    "Compiled MiniCPM-o NPU DiT Conv+MLP megagraph for 2x%dx512",
+                    width,
+                )
         except Exception:
             self._npu_dit_conv_mlp_graph = None
             self._npu_dit_conv_mlp_graph_disabled = True

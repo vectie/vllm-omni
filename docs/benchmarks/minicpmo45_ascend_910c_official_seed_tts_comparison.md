@@ -3508,3 +3508,75 @@ packed-output write dominate after the earlier cache-major optimization, so
 reducing internal DMA command count does not produce a material serving win.
 The candidate was removed rather than adding a second implementation for a
 noise-level result; no end-to-end or accuracy-suite budget was spent.
+
+## Opt-in wide AdaLN projection candidate
+
+The retained Stage-2 profile showed 480 FP32 AdaLN projections with shape
+`[2,512] x [4608,512]` in one 32-request trace. MiniCPM-o 4.5 has 16 DiT
+blocks, and every block projects the same current CFM timestep independently.
+The candidate packs those immutable block weights and biases once, computes
+the current timestep's full modulation bank with one
+`[2,512] x [73728,512]` Cube GEMM, and passes one exact row to each accepted
+shape-bucketed attention-preamble graph. It does not retain modulation values
+across timesteps or chunks.
+
+The opt-in profile and real-checkpoint screening harness are:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_wide_adaln_experimental.yaml
+benchmarks/scripts/bench_minicpmo_dit_wide_adaln.py
+```
+
+On NPU 1, nine alternating trials with 20 warmups and 100 iterations reduced
+the 16-projection group from 1,853.374 us to 104.907 us, a 17.667x
+microbenchmark speedup. The real `flow.pt` weights and a nonzero FP32 timestep
+produced maximum and mean absolute errors of `0.0`. Serving startup also has a
+fail-closed nonzero parity gate; incompatible block counts, shapes, devices,
+or results retain the per-block path. Four focused model tests and four deploy
+configuration tests passed in the server environment.
+
+Fresh candidate and accepted-profile services then ran the same 32 fixed
+English Seed-TTS rows three times, with three warmups, concurrency one, seed
+zero, temperature zero, and CFM6. Every run completed 32/32 with zero failures
+and 100% continuity while preserving 4,801 input tokens, 480 output tokens,
+3,362,880 audio frames, and 140.12 seconds of audio. The table reports the
+median run value from each side; lower is better except for throughput.
+
+| Metric | Accepted control | Wide AdaLN | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 45.296 s | 43.400 s | -4.19% |
+| Request throughput | 0.7065 req/s | 0.7373 req/s | +4.37% |
+| Mean / median / P99 E2E | 1,415.07 / 1,453.16 / 1,921.83 ms | 1,355.80 / 1,378.16 / 1,802.60 ms | -4.19% / -5.16% / -6.20% |
+| Mean / median / P99 TTFT | 313.98 / 314.00 / 446.27 ms | 319.54 / 326.50 / 464.45 ms | +1.77% / +3.98% / +4.07% |
+| Mean / median / P99 audio TTFP | 789.17 / 790.29 / 929.78 ms | 787.94 / 785.92 / 942.90 ms | -0.16% / -0.55% / +1.41% |
+| Mean / median / P99 chunk RTF | 0.344823 / 0.195124 / 1.061778 | 0.335521 / 0.151692 / 1.055121 | -2.70% / -22.26% / -0.63% |
+
+The candidate materially improves serving duration, throughput, every E2E
+gate, and central chunk RTF. It also slightly improves central audio TTFP, but
+text TTFT median and P99 regress by about 4%, beyond the accepted profile's 2%
+guard, and audio TTFP P99 regresses 1.41%. The wide graph therefore remains an
+implemented opt-in candidate and is not inherited by the accepted profile.
+Because the latency gate is mixed, full Seed-TTS WER/SIM, Daily-Omni, and
+Video-MME qualification was not spent. The exact operator parity and unchanged
+output structure are evidence against accuracy drift, not a substitute for
+those competition gates.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-wide-adaln-20260819
+```
+
+Artifact checksums:
+
+```text
+79db65d94a68f62806d7d763f43c78e357b2521818c12ad3a4f31dcc8c12774c  control/results/control-1.json
+f114c2712108f7278ff55dbca95d08254731eafeaadffa55e9e3306b5d23ab19  control/results/control-2.json
+a9f45e910500ab5e0b11c0dab74598c72b30931a00146981b0b73448e1b8f80c  control/results/control-3.json
+9a40a5e22295bd89e757413aa4435f49ee1692c74db778dd8ce2c6cf979959f6  candidate/results/candidate-1.json
+5bded166874bee05af9f111c036a781ec6fbbc25fc1cf29f509138e788658f0c  candidate/results/candidate-2.json
+7744f74dd7924832a208dab8908d2d1e3b97620c4b65d792944a43674de48a2d  candidate/results/candidate-3.json
+7a34d5e35fe9eacb0b46360742991cb0024f7127c2cefd4c491bd2cef9f73991  candidate-service.log
+a11ecefb9df800dc08f92dd4eb5e9a4b9f844483fd971ffe001e669677777bf0  control/control-service.log
+a94a26cc30a63e6e5757afae3ef88dc61d0a052f9db07648934445a249cd07c3  candidate/candidate-service-2.log
+```

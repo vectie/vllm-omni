@@ -21,6 +21,7 @@ _NPU_DIT_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH"
 _NPU_DIT_MLP_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH"
 _NPU_DIT_GRAPH_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS"
 _NPU_DIT_PREAMBLE_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH"
+_NPU_DIT_WIDE_ADALN_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_ADALN"
 _NPU_DIT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH"
 _NPU_DIT_PROMPT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PROMPT_CONV_MLP_GRAPH"
 _NPU_DIT_FULL_BLOCK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_GRAPH"
@@ -86,6 +87,21 @@ def _npu_dit_preamble_graph_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_DIT_PREAMBLE_GRAPH_ENV}={raw!r}")
+
+
+def _npu_dit_wide_adaln_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_WIDE_ADALN_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_WIDE_ADALN_ENV}={raw!r}")
 
 
 def _npu_dit_conv_mlp_graph_enabled(config_value: Any = None) -> bool:
@@ -378,6 +394,44 @@ def _dit_mlp_residual(
     return x + gate * hidden
 
 
+def _dit_wide_adaln(
+    time_embedding: torch.Tensor,
+    packed_weight: torch.Tensor,
+    packed_bias: torch.Tensor,
+) -> torch.Tensor:
+    """Project all 16 DiT block modulations through one wide Cube GEMM."""
+    modulation = F.linear(F.silu(time_embedding), packed_weight, packed_bias)
+    return modulation.reshape(2, 1, 16, 9 * 512)
+
+
+def _dit_attention_from_modulation(
+    x: torch.Tensor,
+    modulation: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_norm_bias: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build projected Q/K/V from a supplied block modulation."""
+    shift_msa = modulation[:, :, :512]
+    scale_msa = modulation[:, :, 512:1024]
+    hidden = F.layer_norm(x, (512,), eps=1e-6)
+    hidden = hidden * (1 + scale_msa) + shift_msa
+    width = x.shape[1]
+    q = F.linear(hidden, q_weight, q_bias).reshape(2, width, 8, 64).transpose(1, 2)
+    k = F.linear(hidden, k_weight, k_bias).reshape(2, width, 8, 64).transpose(1, 2)
+    v = F.linear(hidden, v_weight, v_bias).reshape(2, width, 8, 64).transpose(1, 2)
+    q = F.layer_norm(q, (64,), q_norm_weight, q_norm_bias, 1e-5)
+    k = F.layer_norm(k, (64,), k_norm_weight, k_norm_bias, 1e-5)
+    return modulation, q, k, v
+
+
 def _dit_attention_preamble(
     x: torch.Tensor,
     time_embedding: torch.Tensor,
@@ -402,17 +456,51 @@ def _dit_attention_preamble(
     the same values without repeating the AdaLN projection.
     """
     modulation = F.linear(F.silu(time_embedding), adaln_weight, adaln_bias)
-    shift_msa = modulation[:, :, :512]
-    scale_msa = modulation[:, :, 512:1024]
-    hidden = F.layer_norm(x, (512,), eps=1e-6)
-    hidden = hidden * (1 + scale_msa) + shift_msa
-    width = x.shape[1]
-    q = F.linear(hidden, q_weight, q_bias).reshape(2, width, 8, 64).transpose(1, 2)
-    k = F.linear(hidden, k_weight, k_bias).reshape(2, width, 8, 64).transpose(1, 2)
-    v = F.linear(hidden, v_weight, v_bias).reshape(2, width, 8, 64).transpose(1, 2)
-    q = F.layer_norm(q, (64,), q_norm_weight, q_norm_bias, 1e-5)
-    k = F.layer_norm(k, (64,), k_norm_weight, k_norm_bias, 1e-5)
-    return modulation, q, k, v
+    return _dit_attention_from_modulation(
+        x,
+        modulation,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        v_weight,
+        v_bias,
+        q_norm_weight,
+        q_norm_bias,
+        k_norm_weight,
+        k_norm_bias,
+    )
+
+
+def _dit_attention_preamble_from_modulation(
+    x: torch.Tensor,
+    modulation: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_norm_bias: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Attention preamble consuming one row from the wide AdaLN bank."""
+    return _dit_attention_from_modulation(
+        x,
+        modulation,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        v_weight,
+        v_bias,
+        q_norm_weight,
+        q_norm_bias,
+        k_norm_weight,
+        k_norm_bias,
+    )
 
 
 def _dit_attention_preamble_qkv_pack(
@@ -931,6 +1019,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_mlp_graph_width: Any = None,
         npu_dit_graph_buckets: Any = None,
         npu_dit_preamble_graph: Any = None,
+        npu_dit_wide_adaln: Any = None,
         npu_dit_conv_mlp_graph: Any = None,
         npu_dit_prompt_conv_mlp_graph: Any = None,
         npu_dit_full_block_graph: Any = None,
@@ -1008,6 +1097,21 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_preamble_graph_disabled = False
         self._npu_dit_preamble_graph_disabled_widths: set[int] = set()
         self._npu_dit_preamble_graph_used = False
+        self._npu_dit_wide_adaln_enabled = _npu_dit_wide_adaln_enabled(
+            npu_dit_wide_adaln
+        )
+        self._npu_dit_wide_adaln_graph: Any | None = None
+        self._npu_dit_wide_adaln_used = False
+        self.register_buffer(
+            "_npu_dit_wide_adaln_weight",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_npu_dit_wide_adaln_bias",
+            None,
+            persistent=False,
+        )
         self._npu_dit_conv_mlp_graph_enabled = _npu_dit_conv_mlp_graph_enabled(npu_dit_conv_mlp_graph)
         self._npu_dit_conv_mlp_graph: Any | None = None
         self._npu_dit_conv_mlp_graph_disabled = False
@@ -1061,6 +1165,16 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_fused_conv_block_used = False
         self._npu_dit_fused_conv_linear_enabled = _npu_dit_fused_conv_linear_enabled(npu_dit_fused_conv_linear)
         self._npu_dit_fused_conv_linear_used = False
+        if self._npu_dit_wide_adaln_enabled and not self._npu_dit_preamble_graph_enabled:
+            self._npu_dit_wide_adaln_enabled = False
+            logger.warning(
+                "MiniCPM-o wide AdaLN requires the DiT preamble graph; disabling it"
+            )
+        if self._npu_dit_wide_adaln_enabled and self._npu_dit_qkv_pack_enabled:
+            self._npu_dit_qkv_pack_enabled = False
+            logger.warning(
+                "MiniCPM-o wide AdaLN currently uses the ordinary QKV preamble; disabling native QKV pack"
+            )
         if self._npu_dit_cache_major_enabled and (
             not self._npu_dit_fused_conv_pack_enabled or self._npu_dit_fused_conv_linear_enabled
         ):
@@ -1074,6 +1188,7 @@ class BatchedToken2Wav(nn.Module):
                 "MiniCPM-o NPU post-attention graph requires cache-major Conv+MLP; disabling it"
             )
         self._warmup_npu_dit_mlp_graph()
+        self._warmup_npu_dit_wide_adaln_graph()
         self._warmup_npu_dit_preamble_graph()
         self._warmup_npu_dit_conv_mlp_graph()
         self._warmup_npu_dit_prompt_conv_mlp_graphs()
@@ -1150,6 +1265,91 @@ class BatchedToken2Wav(nn.Module):
             )
         return self._npu_dit_mlp_graph
 
+    def _warmup_npu_dit_wide_adaln_graph(self) -> None:
+        """Pack and compile the current-step, all-block AdaLN projection."""
+        if not self._npu_dit_wide_adaln_enabled:
+            return
+        estimator = getattr(getattr(self.flow, "decoder", None), "estimator", None)
+        blocks = getattr(estimator, "blocks", None)
+        if not blocks or len(blocks) != 16:
+            self._npu_dit_wide_adaln_enabled = False
+            logger.warning(
+                "MiniCPM-o wide AdaLN disabled: expected 16 estimator blocks"
+            )
+            return
+        try:
+            projections = [block.adaLN_modulation[1] for block in blocks]
+        except (AttributeError, IndexError, TypeError):
+            self._npu_dit_wide_adaln_enabled = False
+            logger.warning(
+                "MiniCPM-o wide AdaLN disabled: block projections are unavailable"
+            )
+            return
+        if not all(
+            isinstance(projection, nn.Linear)
+            and tuple(projection.weight.shape) == (9 * 512, 512)
+            and projection.bias is not None
+            and projection.weight.device.type == "npu"
+            for projection in projections
+        ):
+            self._npu_dit_wide_adaln_enabled = False
+            logger.warning(
+                "MiniCPM-o wide AdaLN disabled: block projections are incompatible"
+            )
+            return
+
+        self._npu_dit_wide_adaln_weight = torch.cat(
+            [projection.weight.detach() for projection in projections],
+            dim=0,
+        ).contiguous()
+        self._npu_dit_wide_adaln_bias = torch.cat(
+            [projection.bias.detach() for projection in projections],
+            dim=0,
+        ).contiguous()
+        graph_fn = self._get_npu_dit_wide_adaln_graph()
+        # Exercise both the packed weights and biases. An all-zero embedding
+        # would reduce this startup parity gate to a bias-only comparison.
+        time_embedding = projections[0].weight.new_full((2, 1, 512), 0.125)
+        try:
+            with torch.inference_mode():
+                actual = graph_fn(
+                    time_embedding,
+                    self._npu_dit_wide_adaln_weight,
+                    self._npu_dit_wide_adaln_bias,
+                )
+                expected = torch.stack(
+                    [block.adaLN_modulation(time_embedding) for block in blocks],
+                    dim=2,
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.npu.synchronize()
+            logger.info(
+                "Compiled exact MiniCPM-o wide AdaLN graph for 16 block projections"
+            )
+        except Exception:
+            self._npu_dit_wide_adaln_enabled = False
+            self._npu_dit_wide_adaln_graph = None
+            self._npu_dit_wide_adaln_weight = None
+            self._npu_dit_wide_adaln_bias = None
+            logger.warning(
+                "MiniCPM-o wide AdaLN compilation/parity gate failed; using per-block projections",
+                exc_info=True,
+            )
+
+    def _get_npu_dit_wide_adaln_graph(self):
+        if self._npu_dit_wide_adaln_graph is None:
+            from torch_npu.dynamo import torchair
+
+            _ensure_torchair_broadcast_alias()
+            compiler_config = torchair.CompilerConfig()
+            self._npu_dit_wide_adaln_graph = torch.compile(
+                _dit_wide_adaln,
+                backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self._npu_dit_wide_adaln_graph
+
     @staticmethod
     def _dit_preamble_compatible(block: nn.Module, width: int) -> bool:
         return (
@@ -1185,6 +1385,13 @@ class BatchedToken2Wav(nn.Module):
             )
             return
         time_embedding = weight.new_zeros((2, 1, 512))
+        wide_modulations = None
+        if self._npu_dit_wide_adaln_enabled:
+            wide_modulations = self._get_npu_dit_wide_adaln_graph()(
+                time_embedding,
+                self._npu_dit_wide_adaln_weight,
+                self._npu_dit_wide_adaln_bias,
+            )
         if self._npu_dit_qkv_pack_enabled:
             try:
                 from vllm_ascend.compilation.minicpmo_causal_conv import (
@@ -1205,21 +1412,12 @@ class BatchedToken2Wav(nn.Module):
                     continue
                 x = weight.new_zeros((2, width, 512))
                 with torch.inference_mode():
-                    graph_fn(
+                    self._call_npu_dit_preamble_graph(
+                        graph_fn,
+                        block,
                         x,
                         time_embedding,
-                        block.adaLN_modulation[1].weight,
-                        block.adaLN_modulation[1].bias,
-                        block.attn.to_q.weight,
-                        block.attn.to_q.bias,
-                        block.attn.to_k.weight,
-                        block.attn.to_k.bias,
-                        block.attn.to_v.weight,
-                        block.attn.to_v.bias,
-                        block.attn.q_norm.weight,
-                        block.attn.q_norm.bias,
-                        block.attn.k_norm.weight,
-                        block.attn.k_norm.bias,
+                        None if wide_modulations is None else wide_modulations[:, :, 0, :],
                     )
                 torch.npu.synchronize()
                 if self._npu_dit_qkv_pack_enabled and width == self._npu_dit_mlp_graph_width:
@@ -1243,21 +1441,11 @@ class BatchedToken2Wav(nn.Module):
                     try:
                         graph_fn = self._get_npu_dit_preamble_graph(width)
                         with torch.inference_mode():
-                            graph_fn(
+                            self._call_npu_dit_preamble_graph(
+                                graph_fn,
+                                block,
                                 x,
                                 time_embedding,
-                                block.adaLN_modulation[1].weight,
-                                block.adaLN_modulation[1].bias,
-                                block.attn.to_q.weight,
-                                block.attn.to_q.bias,
-                                block.attn.to_k.weight,
-                                block.attn.to_k.bias,
-                                block.attn.to_v.weight,
-                                block.attn.to_v.bias,
-                                block.attn.q_norm.weight,
-                                block.attn.q_norm.bias,
-                                block.attn.k_norm.weight,
-                                block.attn.k_norm.bias,
                             )
                         torch.npu.synchronize()
                         logger.info(
@@ -1298,12 +1486,46 @@ class BatchedToken2Wav(nn.Module):
             return self._npu_dit_qkv_preamble_graph
         if self._npu_dit_preamble_graph is None:
             self._npu_dit_preamble_graph = torch.compile(
-                _dit_attention_preamble,
+                (
+                    _dit_attention_preamble_from_modulation
+                    if self._npu_dit_wide_adaln_enabled
+                    else _dit_attention_preamble
+                ),
                 backend=torchair.get_npu_backend(compiler_config=compiler_config),
                 fullgraph=True,
                 dynamic=False,
             )
         return self._npu_dit_preamble_graph
+
+    def _call_npu_dit_preamble_graph(
+        self,
+        graph_fn: Any,
+        block: nn.Module,
+        hidden: torch.Tensor,
+        time_embedding: torch.Tensor,
+        modulation: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        attention_args = (
+            block.attn.to_q.weight,
+            block.attn.to_q.bias,
+            block.attn.to_k.weight,
+            block.attn.to_k.bias,
+            block.attn.to_v.weight,
+            block.attn.to_v.bias,
+            block.attn.q_norm.weight,
+            block.attn.q_norm.bias,
+            block.attn.k_norm.weight,
+            block.attn.k_norm.bias,
+        )
+        if modulation is not None:
+            return graph_fn(hidden, modulation, *attention_args)
+        return graph_fn(
+            hidden,
+            time_embedding,
+            block.adaLN_modulation[1].weight,
+            block.adaLN_modulation[1].bias,
+            *attention_args,
+        )
 
     @staticmethod
     def _dit_conv_mlp_layout_compatible(block: nn.Module) -> bool:
@@ -2209,6 +2431,22 @@ class BatchedToken2Wav(nn.Module):
     ) -> torch.Tensor:
         """Replay enabled shape-bucketed partitions with exact eager fallbacks."""
         hidden = estimator.in_proj(estimator_input.transpose(1, 2))
+        wide_modulations = None
+        if (
+            self._npu_dit_wide_adaln_enabled
+            and preamble_graph_fn is not None
+            and full_block_graph_fn is None
+        ):
+            wide_modulations = self._get_npu_dit_wide_adaln_graph()(
+                time_embedding,
+                self._npu_dit_wide_adaln_weight,
+                self._npu_dit_wide_adaln_bias,
+            )
+            if not self._npu_dit_wide_adaln_used:
+                logger.info(
+                    "MiniCPM-o wide AdaLN graph replay active for 16 block projections"
+                )
+                self._npu_dit_wide_adaln_used = True
         for block_idx, block in enumerate(estimator.blocks):
             if full_block_graph_fn is not None:
                 if not self._dit_full_block_compatible(block):
@@ -2234,21 +2472,16 @@ class BatchedToken2Wav(nn.Module):
             else:
                 if not BatchedToken2Wav._dit_preamble_compatible(block, int(hidden.shape[1])):
                     raise RuntimeError("MiniCPM-o NPU DiT preamble graph encountered an incompatible block")
-                modulation, q, k, v = preamble_graph_fn(
+                modulation, q, k, v = self._call_npu_dit_preamble_graph(
+                    preamble_graph_fn,
+                    block,
                     hidden,
                     time_embedding,
-                    block.adaLN_modulation[1].weight,
-                    block.adaLN_modulation[1].bias,
-                    block.attn.to_q.weight,
-                    block.attn.to_q.bias,
-                    block.attn.to_k.weight,
-                    block.attn.to_k.bias,
-                    block.attn.to_v.weight,
-                    block.attn.to_v.bias,
-                    block.attn.q_norm.weight,
-                    block.attn.q_norm.bias,
-                    block.attn.k_norm.weight,
-                    block.attn.k_norm.bias,
+                    (
+                        None
+                        if wide_modulations is None
+                        else wide_modulations[:, :, block_idx, :]
+                    ),
                 )
             (
                 shift_msa,

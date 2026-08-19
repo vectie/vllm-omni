@@ -10,6 +10,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
     _dit_attention_cache_length,
     _dit_attention_preamble,
+    _dit_attention_preamble_from_modulation,
     _dit_attention_preamble_qkv_pack,
     _dit_cache_major_conv_mlp_residual,
     _dit_cache_major_post_attention_conv_mlp_residual,
@@ -37,6 +38,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_preamble_graph_enabled,
     _npu_dit_prompt_conv_mlp_graph_enabled,
     _npu_dit_qkv_pack_enabled,
+    _npu_dit_wide_adaln_enabled,
     _npu_single_request_cache_passthrough_enabled,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
@@ -440,6 +442,23 @@ def test_dit_attention_preamble_matches_eager_block_math(width: int):
     )
 
     for result, expected in zip(actual, (modulation, q, k, v), strict=True):
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    supplied = _dit_attention_preamble_from_modulation(
+        x,
+        modulation,
+        to_q.weight,
+        to_q.bias,
+        to_k.weight,
+        to_k.bias,
+        to_v.weight,
+        to_v.bias,
+        q_norm.weight,
+        q_norm.bias,
+        k_norm.weight,
+        k_norm.bias,
+    )
+    for result, expected in zip(supplied, actual, strict=True):
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
@@ -1089,6 +1108,18 @@ def test_npu_dit_preamble_graph_config_and_environment(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH", "sometimes")
     with pytest.raises(ValueError, match="NPU_DIT_PREAMBLE_GRAPH"):
         _npu_dit_preamble_graph_enabled()
+
+
+def test_npu_dit_wide_adaln_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_ADALN", raising=False)
+    assert _npu_dit_wide_adaln_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_ADALN", "off")
+    assert _npu_dit_wide_adaln_enabled(True) is False
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_ADALN", "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_WIDE_ADALN"):
+        _npu_dit_wide_adaln_enabled()
 
 
 def test_npu_dit_conv_mlp_graph_config_and_environment(monkeypatch):

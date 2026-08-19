@@ -2402,6 +2402,19 @@ class TestPlatformOverrides:
         assert extra["npu_dit_fused_conv_pack"] is True
         assert extra["npu_dit_cache_major"] is True
 
+    def test_minicpmo_4_5_910c_wide_adaln_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_wide_adaln_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_dit_wide_adaln"] is True
+
     def test_minicpmo_4_5_910c_post_attention_candidate_is_explicit(self):
         deploy_path = Path(
             get_deploy_config_path(

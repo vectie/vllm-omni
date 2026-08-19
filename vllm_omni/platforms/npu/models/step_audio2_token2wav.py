@@ -50,6 +50,7 @@ _original_stream_chunk_for = None
 _HIFT_MATERIALIZE_WEIGHT_NORM_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM"
 _HIFT_F0_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"
 _HIFT_F0_CLASSIFIER_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_CLASSIFIER_GRAPH"
+_HIFT_F0_FROZEN_WEIGHTS_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_FROZEN_WEIGHTS"
 _HIFT_F0_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"
 _HIFT_F0_GRAPH_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_BUCKETS"
 _HIFT_RESBLOCK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESBLOCK_GRAPH"
@@ -345,6 +346,12 @@ def _hift_f0_predictor(
     return torch.abs(prediction.squeeze(-1))
 
 
+def _mark_frozen_graph_weights(weights: tuple[torch.Tensor, ...]) -> None:
+    """Guard immutable graph-weight addresses for TorchAir constant folding."""
+    for weight in weights:
+        torch._dynamo.mark_static_address(weight, guard=True)
+
+
 def _f0_predictor_with_npu_graph(self, value: torch.Tensor) -> torch.Tensor:
     shape = tuple(value.shape)
     expected_prefix = (1, int(self._step_audio2_npu_f0_input_channels))
@@ -411,10 +418,13 @@ def prepare_hift_f0_graph_for_npu(
     width: int,
     extra_widths: tuple[int, ...] = (),
     include_classifier: bool = False,
+    freeze_weights: bool = False,
 ) -> bool:
     """Compile fixed-width HiFT F0 feature stacks for Ascend inference.
 
-    The default boundary contains the five Conv+ELU feature layers. The
+    The default boundary contains the five Conv+ELU feature layers. Frozen
+    weights additionally let GE fold immutable NCHW-to-FRACTAL_Z packing out
+    of every replay. The
     experimental full boundary also contains the checkpoint's original
     per-timestep Linear and absolute value; unlike the rejected 1x1-Conv
     substitution, this preserves the source operation. Non-steady widths and
@@ -459,9 +469,13 @@ def prepare_hift_f0_graph_for_npu(
     from torch_npu.dynamo import torchair
 
     _ensure_torchair_broadcast_alias()
+    compiler_config = torchair.CompilerConfig()
+    if freeze_weights:
+        _mark_frozen_graph_weights(weights)
+        compiler_config.experimental_config.frozen_parameter.value = True
     graph = torch.compile(
         graph_function,
-        backend=torchair.get_npu_backend(compiler_config=torchair.CompilerConfig()),
+        backend=torchair.get_npu_backend(compiler_config=compiler_config),
         fullgraph=True,
         dynamic=False,
     )
@@ -492,6 +506,7 @@ def prepare_hift_f0_graph_for_npu(
     predictor._step_audio2_npu_f0_graph = graph
     predictor._step_audio2_npu_f0_graph_weights = weights
     predictor._step_audio2_npu_f0_classifier_in_graph = include_classifier
+    predictor._step_audio2_npu_f0_weights_frozen = freeze_weights
     predictor._step_audio2_npu_f0_graph_widths = widths
     predictor._step_audio2_npu_f0_graph_replayed_widths = set()
     predictor._step_audio2_npu_f0_input_channels = int(convolutions[0].in_channels)
@@ -929,6 +944,7 @@ def _patched_ensure_models_loaded(self) -> None:
                 width=_hift_f0_graph_width(),
                 extra_widths=_hift_f0_graph_buckets(),
                 include_classifier=_env_flag_enabled(_HIFT_F0_CLASSIFIER_GRAPH_ENV),
+                freeze_weights=_env_flag_enabled(_HIFT_F0_FROZEN_WEIGHTS_ENV),
             )
         except Exception:
             logger.warning("HiFT F0 graph compilation failed; using eager predictor", exc_info=True)

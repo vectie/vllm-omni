@@ -1,0 +1,15 @@
+# Atlas 800I A3 / Ascend 910C frozen HiFT F0 weight candidate.
+#
+# The accepted feature graph receives five immutable Conv1d weights as graph
+# inputs. Mark their addresses static and enable TorchAir frozen-parameter
+# folding so GE can pack them once instead of emitting FRACTAL_Z TransData on
+# every audio chunk. Runtime shapes and model operations remain unchanged.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_FROZEN_WEIGHTS: "1"

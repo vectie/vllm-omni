@@ -582,6 +582,15 @@ def test_hift_f0_predictor_partition_keeps_original_linear(monkeypatch: pytest.M
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
+def test_hift_f0_frozen_weights_guard_static_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    weights = (torch.randn(2, 3), torch.randn(2))
+
+    module._mark_frozen_graph_weights(weights)
+
+    assert all(weight._dynamo_static_input_type == "guarded" for weight in weights)
+
+
 @pytest.mark.parametrize(("value", "expected"), [("58", 58), ("1", 1)])
 def test_hift_f0_graph_width_env(
     monkeypatch: pytest.MonkeyPatch,

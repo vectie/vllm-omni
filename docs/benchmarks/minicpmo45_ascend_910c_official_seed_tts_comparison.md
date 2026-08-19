@@ -3441,3 +3441,45 @@ e7237229d5d9c3302b6024b0abe27c3fcc6ac3df7ec8b15e5833a9098e1befe0  control/result
 80f340dbcfff3c29770bd7b04351ee10e95ec7c2a92b5d988e90727d61879f6a  candidate/results/candidate2-seedtts-32.json
 410e1aa859fc00418bd0cd40011b58195d0079acbda0c1b9034de996080e52f4  candidate/results/candidate3-seedtts-32.json
 ```
+
+## Rejected HiFT F0 weight-layout experiments
+
+The retained Stage-2 profile identified the largest remaining individual
+layout conversion as the HiFT F0 stack's fixed `[512,512,1,3]` Conv1d
+weights. NCHW-to-FRACTAL_Z `TransData` ran 405 times and consumed 15.192 ms
+across the trace. Two exact-width `[1,80,58]` graph variants screened ways to
+remove that repeated packing before spending another end-to-end run.
+
+The first variant marks all ten immutable convolution weight and bias tensors
+with guarded static addresses and enables TorchAir's `frozen_parameter`
+lowering. It is available only through the diagnostic profile:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_f0_frozen_weights_experimental.yaml
+```
+
+Two independent 30-warmup, 200-iteration measurements changed sign. The first
+measured 212.881 us for the control and 213.122 us frozen (0.999x); the second
+measured 213.224 us and 209.324 us respectively (1.019x). Both had zero maximum
+absolute output error. This spread is normal microbenchmark noise and does not
+support promotion. In particular, accepting static tensor addresses did not
+prove that GE eliminated the replay-time Conv1d weight conversions.
+
+The second variant prepacked each kernel-3 weight as a 512-by-1536 matrix and
+replaced Conv1d with explicit three-position window packing plus `F.linear`.
+It measured 229.973 us versus the same run's 213.224 us control: 7.27% slower.
+It also introduced maximum/mean absolute errors of 0.026312/0.000125. The extra
+pad, slice, concatenate, and transpose traffic costs more than the conversions
+it removes, so this form is rejected and is not wired into serving.
+
+The reproducible focused harness is:
+
+```text
+benchmarks/scripts/bench_minicpmo_hift_f0_frozen_weights.py
+```
+
+These results close frozen-parameter annotations and framework-level im2col
+linearization as F0 optimization directions on the current CANN/TorchAir
+stack. A future retry must either change GE's native Conv1d weight-packing
+policy or fuse the whole five-layer stack below the framework boundary while
+preserving the original accumulation behavior.

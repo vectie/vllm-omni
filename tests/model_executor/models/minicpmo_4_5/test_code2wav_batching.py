@@ -21,6 +21,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_fused_conv_mlp_residual,
     _dit_fused_full_block,
     _dit_mlp_residual,
+    _dit_wide_adaln_steps,
     _npu_cfm_stacked_cache_out_enabled,
     _npu_dit_attn_cache_out_enabled,
     _npu_dit_cache_major_enabled,
@@ -1120,6 +1121,20 @@ def test_npu_dit_wide_adaln_config_and_environment(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_ADALN", "sometimes")
     with pytest.raises(ValueError, match="NPU_DIT_WIDE_ADALN"):
         _npu_dit_wide_adaln_enabled()
+
+
+def test_dit_wide_adaln_steps_preserves_step_and_block_axes():
+    time_embeddings = torch.empty(6, 2, 1, 512, device="meta")
+    packed_weight = torch.empty(16 * 9 * 512, 512, device="meta")
+    packed_bias = torch.empty(16 * 9 * 512, device="meta")
+
+    actual = _dit_wide_adaln_steps(
+        time_embeddings,
+        packed_weight,
+        packed_bias,
+    )
+
+    assert actual.shape == (6, 2, 1, 16, 9 * 512)
 
 
 def test_npu_dit_conv_mlp_graph_config_and_environment(monkeypatch):

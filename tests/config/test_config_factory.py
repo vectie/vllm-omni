@@ -2346,6 +2346,7 @@ class TestPlatformOverrides:
         assert extra["npu_dit_mlp_graph_width"] == 50
         assert extra["npu_dit_graph_buckets"] == [20, 302]
         assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_dit_wide_adaln"] is True
         assert extra["npu_dit_conv_mlp_graph"] is True
         assert extra["npu_dit_prompt_conv_mlp_graph"] is True
         assert extra["npu_single_request_cache_passthrough"] is True

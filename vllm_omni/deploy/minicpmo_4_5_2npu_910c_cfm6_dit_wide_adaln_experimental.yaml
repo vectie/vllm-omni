@@ -1,9 +1,8 @@
-# Atlas 800I A3 / Ascend 910C current-step wide AdaLN candidate.
+# Atlas 800I A3 / Ascend 910C wide AdaLN compatibility profile.
 #
-# Compute all 16 DiT block modulation projections with one 73728-wide Cube
-# GEMM for each CFM step, then consume each block's row through the accepted
-# shape-bucketed preamble graphs. Startup fails closed above 1e-6 maximum
-# absolute drift. This does not retain values across timesteps or audio chunks.
+# The accepted base now computes all six fixed CFM timesteps and 16 DiT block
+# modulation banks with one Cube GEMM per audio chunk. Retain this profile name
+# so existing launch automation continues to select the promoted path.
 
 base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
 

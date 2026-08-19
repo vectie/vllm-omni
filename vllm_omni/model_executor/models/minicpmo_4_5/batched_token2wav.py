@@ -405,6 +405,16 @@ def _dit_wide_adaln(
     return modulation.reshape(2, 1, 16, 9 * 512)
 
 
+def _dit_wide_adaln_steps(
+    time_embeddings: torch.Tensor,
+    packed_weight: torch.Tensor,
+    packed_bias: torch.Tensor,
+) -> torch.Tensor:
+    """Project every fixed CFM timestep and DiT block in one Cube GEMM."""
+    modulation = F.linear(F.silu(time_embeddings), packed_weight, packed_bias)
+    return modulation.reshape(time_embeddings.shape[0], 2, 1, 16, 9 * 512)
+
+
 def _dit_attention_from_modulation(
     x: torch.Tensor,
     modulation: torch.Tensor,
@@ -1102,7 +1112,9 @@ class BatchedToken2Wav(nn.Module):
             npu_dit_wide_adaln
         )
         self._npu_dit_wide_adaln_graph: Any | None = None
+        self._npu_dit_wide_adaln_steps_graph: Any | None = None
         self._npu_dit_wide_adaln_used = False
+        self._npu_dit_wide_adaln_steps_used = False
         self.register_buffer(
             "_npu_dit_wide_adaln_weight",
             None,
@@ -1332,15 +1344,40 @@ class BatchedToken2Wav(nn.Module):
                         f"max_abs_drift={max_abs_drift:.9g}, "
                         f"limit={_NPU_DIT_WIDE_ADALN_MAX_ABS_DRIFT:.9g}"
                     )
+                step_embeddings = time_embedding.unsqueeze(0).expand(
+                    self.n_timesteps,
+                    -1,
+                    -1,
+                    -1,
+                ).contiguous()
+                step_actual = self._get_npu_dit_wide_adaln_steps_graph()(
+                    step_embeddings,
+                    self._npu_dit_wide_adaln_weight,
+                    self._npu_dit_wide_adaln_bias,
+                )
+                step_expected = actual.unsqueeze(0).expand_as(step_actual)
+                step_difference = (step_actual - step_expected).abs()
+                step_max_abs_drift = float(step_difference.max().item())
+                if not torch.isfinite(step_actual).all() or (
+                    step_max_abs_drift > _NPU_DIT_WIDE_ADALN_MAX_ABS_DRIFT
+                ):
+                    raise RuntimeError(
+                        "MiniCPM-o all-step wide AdaLN exceeded its startup drift bound: "
+                        f"max_abs_drift={step_max_abs_drift:.9g}, "
+                        f"limit={_NPU_DIT_WIDE_ADALN_MAX_ABS_DRIFT:.9g}"
+                    )
             torch.npu.synchronize()
             logger.info(
-                "Compiled bounded-drift MiniCPM-o wide AdaLN graph for 16 block projections; "
-                "max_abs_drift=%.9g",
+                "Compiled bounded-drift MiniCPM-o wide AdaLN graphs for %d steps x 16 blocks; "
+                "single_max_abs_drift=%.9g, steps_max_abs_drift=%.9g",
+                self.n_timesteps,
                 max_abs_drift,
+                step_max_abs_drift,
             )
         except Exception:
             self._npu_dit_wide_adaln_enabled = False
             self._npu_dit_wide_adaln_graph = None
+            self._npu_dit_wide_adaln_steps_graph = None
             self._npu_dit_wide_adaln_weight = None
             self._npu_dit_wide_adaln_bias = None
             logger.warning(
@@ -1361,6 +1398,20 @@ class BatchedToken2Wav(nn.Module):
                 dynamic=False,
             )
         return self._npu_dit_wide_adaln_graph
+
+    def _get_npu_dit_wide_adaln_steps_graph(self):
+        if self._npu_dit_wide_adaln_steps_graph is None:
+            from torch_npu.dynamo import torchair
+
+            _ensure_torchair_broadcast_alias()
+            compiler_config = torchair.CompilerConfig()
+            self._npu_dit_wide_adaln_steps_graph = torch.compile(
+                _dit_wide_adaln_steps,
+                backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self._npu_dit_wide_adaln_steps_graph
 
     @staticmethod
     def _dit_preamble_compatible(block: nn.Module, width: int) -> bool:
@@ -2227,6 +2278,7 @@ class BatchedToken2Wav(nn.Module):
         att_cache: torch.Tensor | None,
         cnn_out: torch.Tensor | None = None,
         att_out: torch.Tensor | None = None,
+        wide_modulations: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
@@ -2339,6 +2391,7 @@ class BatchedToken2Wav(nn.Module):
                         conv_mlp_graph_fn,
                         conv_mlp_standard_weights,
                         full_block_graph_fn,
+                        wide_modulations,
                     )
                     if not self._npu_dit_mlp_graph_used:
                         logger.info(
@@ -2440,12 +2493,14 @@ class BatchedToken2Wav(nn.Module):
         conv_mlp_graph_fn: Any | None = None,
         conv_mlp_standard_weights: bool = False,
         full_block_graph_fn: Any | None = None,
+        precomputed_wide_modulations: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Replay enabled shape-bucketed partitions with exact eager fallbacks."""
         hidden = estimator.in_proj(estimator_input.transpose(1, 2))
-        wide_modulations = None
+        wide_modulations = precomputed_wide_modulations
         if (
-            self._npu_dit_wide_adaln_enabled
+            wide_modulations is None
+            and self._npu_dit_wide_adaln_enabled
             and preamble_graph_fn is not None
             and full_block_graph_fn is None
         ):
@@ -2776,6 +2831,28 @@ class BatchedToken2Wav(nn.Module):
         speakers_cfg = self._cfg_pair("speakers", speakers, zero_unconditional=True)
         cond_cfg = self._cfg_pair("cond", cond, zero_unconditional=True)
         time_embeddings = self._estimator_time_embeddings(estimator, timeline, batch_size * 2)
+        wide_modulation_steps: torch.Tensor | None = None
+        if self._npu_dit_wide_adaln_enabled:
+            try:
+                wide_modulation_steps = self._get_npu_dit_wide_adaln_steps_graph()(
+                    time_embeddings,
+                    self._npu_dit_wide_adaln_weight,
+                    self._npu_dit_wide_adaln_bias,
+                )
+                if not self._npu_dit_wide_adaln_steps_used:
+                    logger.info(
+                        "MiniCPM-o all-step wide AdaLN replay active for %d CFM steps x 16 blocks",
+                        self.n_timesteps,
+                    )
+                    self._npu_dit_wide_adaln_steps_used = True
+            except Exception:
+                self._npu_dit_wide_adaln_enabled = False
+                self._npu_dit_wide_adaln_steps_graph = None
+                wide_modulation_steps = None
+                logger.warning(
+                    "MiniCPM-o all-step wide AdaLN replay failed; using per-block projections",
+                    exc_info=True,
+                )
         deltas = self._cfm_deltas_for(timeline)
         direct_cache_output = self._npu_cfm_stacked_cache_out_enabled and mu.device.type == "npu"
         stacked_cnn_out: torch.Tensor | None = None
@@ -2807,6 +2884,11 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=old_att,
                 cnn_out=stacked_cnn_out[step] if stacked_cnn_out is not None else None,
                 att_out=stacked_att_out[step] if stacked_att_out is not None else None,
+                wide_modulations=(
+                    wide_modulation_steps[step]
+                    if wide_modulation_steps is not None
+                    else None
+                ),
             )
             conditional, unconditional = estimate.split(batch_size, dim=0)
             velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional

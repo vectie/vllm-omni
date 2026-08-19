@@ -3516,7 +3516,7 @@ The retained Stage-2 profile showed 480 FP32 AdaLN projections with shape
 blocks, and every block projects the same current CFM timestep independently.
 The candidate packs those immutable block weights and biases once, computes
 the current timestep's full modulation bank with one
-`[2,512] x [73728,512]` Cube GEMM, and passes one exact row to each accepted
+`[2,512] x [73728,512]` Cube GEMM, and passes the corresponding row to each accepted
 shape-bucketed attention-preamble graph. It does not retain modulation values
 across timesteps or chunks.
 
@@ -3530,10 +3530,13 @@ benchmarks/scripts/bench_minicpmo_dit_wide_adaln.py
 On NPU 1, nine alternating trials with 20 warmups and 100 iterations reduced
 the 16-projection group from 1,853.374 us to 104.907 us, a 17.667x
 microbenchmark speedup. The real `flow.pt` weights and a nonzero FP32 timestep
-produced maximum and mean absolute errors of `0.0`. Serving startup also has a
-fail-closed nonzero parity gate; incompatible block counts, shapes, devices,
-or results retain the per-block path. Four focused model tests and four deploy
-configuration tests passed in the server environment.
+produced maximum and mean absolute errors of `0.0` in the isolated harness.
+The live service's loaded/lowered tensors instead produced a maximum absolute
+drift of `9.53674316e-07`. Serving startup therefore uses a fail-closed,
+nonzero-input `1e-6` maximum-absolute-drift gate. Non-finite output, larger
+drift, or incompatible block counts, shapes, or devices retain the per-block
+path. Four focused model tests and four deploy configuration tests passed in
+the server environment.
 
 Fresh candidate and accepted-profile services then ran the same 32 fixed
 English Seed-TTS rows three times, with three warmups, concurrency one, seed
@@ -3551,15 +3554,47 @@ median run value from each side; lower is better except for throughput.
 | Mean / median / P99 audio TTFP | 789.17 / 790.29 / 929.78 ms | 787.94 / 785.92 / 942.90 ms | -0.16% / -0.55% / +1.41% |
 | Mean / median / P99 chunk RTF | 0.344823 / 0.195124 / 1.061778 | 0.335521 / 0.151692 / 1.055121 | -2.70% / -22.26% / -0.63% |
 
-The candidate materially improves serving duration, throughput, every E2E
-gate, and central chunk RTF. It also slightly improves central audio TTFP, but
-text TTFT median and P99 regress by about 4%, beyond the accepted profile's 2%
-guard, and audio TTFP P99 regresses 1.41%. The wide graph therefore remains an
-implemented opt-in candidate and is not inherited by the accepted profile.
-Because the latency gate is mixed, full Seed-TTS WER/SIM, Daily-Omni, and
-Video-MME qualification was not spent. The exact operator parity and unchanged
-output structure are evidence against accuracy drift, not a substitute for
-those competition gates.
+This first sample materially improved serving duration, throughput, every E2E
+gate, and central chunk RTF. It also slightly improved central audio TTFP, but
+text TTFT median and P99 appeared to regress by about 4%, beyond the accepted
+profile's 2% guard. A stage-instrumented follow-up showed that result was not a
+causal Stage-2 regression: client TTFT is the first Stage-0 text SSE delta, and
+the wide AdaLN path runs only in Stage 2.
+
+Fresh stage-instrumented runs measured accepted-control TTFT at
+321.60/325.23/455.51 ms mean/median/P99 and active-candidate TTFT at
+313.14/316.48/454.80 ms, changes of -2.63%/-2.69%/-0.16%. Stage-0 serving TTFT
+and model TTFT also improved in the candidate run. Serving duration was
+43.350 s for control and 43.786 s for candidate (+1.01%), while Stage-2
+generation time was statistically flat. This resolves the apparent TTFT
+regression and demonstrates that TTFT must not be attributed to a downstream
+Code2Wav-only change.
+
+A later fresh 32-row pair remained mixed:
+
+| Metric | Accepted control | Wide AdaLN | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 48.961 s | 51.100 s | +4.37% |
+| Request throughput | 0.6536 req/s | 0.6262 req/s | -4.19% |
+| Mean / median / P99 TTFT | 339.94 / 333.07 / 660.99 ms | 318.45 / 313.84 / 506.91 ms | -6.32% / -5.77% / -23.31% |
+| Mean / median / P99 audio TTFP | 837.69 / 796.37 / 1,469.97 ms | 786.80 / 765.33 / 1,062.76 ms | -6.08% / -3.90% / -27.70% |
+| Mean / median / P99 chunk RTF | 0.372492 / 0.189244 / 1.409467 | 0.383805 / 0.169480 / 1.265191 | +3.04% / -10.44% / -10.24% |
+
+Both sides completed 32/32 and produced byte-identical audio content hashes
+for all 32 requests, in addition to identical token, frame, and duration
+counts. The active candidate separately passed the cached Seed-TTS evaluator
+on eight rows with WER `0.0`, mean SIM `0.8391076`, zero request/ASR/SIM
+failures, and 100% streaming continuity. Because Stage 2 is downstream of the
+text answers scored by Daily-Omni and Video-MME, this candidate cannot alter
+those two suites' answers; this does not replace their release-level full-suite
+execution.
+
+The TTFT blocker is fixed, the accuracy evidence is stronger, and the startup
+gate now reflects live Ascend numerics. The end-to-end speed result is not yet
+reproducible, however: the original three-run median improved 4.19%, while the
+two fresh pairs measured +1.01% and +4.37% duration. The wide graph therefore
+remains an implemented opt-in candidate and is not inherited by the accepted
+profile until repeated interleaved trials show a stable end-to-end win.
 
 Raw artifacts are under:
 
@@ -3579,4 +3614,20 @@ a9f45e910500ab5e0b11c0dab74598c72b30931a00146981b0b73448e1b8f80c  control/result
 7a34d5e35fe9eacb0b46360742991cb0024f7127c2cefd4c491bd2cef9f73991  candidate-service.log
 a11ecefb9df800dc08f92dd4eb5e9a4b9f844483fd971ffe001e669677777bf0  control/control-service.log
 a94a26cc30a63e6e5757afae3ef88dc61d0a052f9db07648934445a249cd07c3  candidate/candidate-service-2.log
+```
+
+TTFT-fix and bounded-drift follow-up artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-wide-adaln-ttft-fix-20260819
+```
+
+```text
+7698ec3219bcb074fc55dd9ef4f2157c46a9441d9d644520936b8b2fd4d4aa02  control/perf-control-final.json
+d52f6bad9f67c72a9373689d69a01f602c551471c38d0925abe91545778b058c  candidate/perf-candidate-2.json
+d6e1181aaef52ec70d8719b736ebaa8b7d065e25bd08b37fe22b343b20f8e914  control/stage-control-1.json
+245ec7a2c7170a7b1ac5852006fe7e835177c1ab9ccd5959d3a528d9c3b0e97d  candidate/stage-candidate-1.json
+5592a3f7fb806a8229e077a8b4bddcbb055583e1572eb63ab907284373382cd7  candidate/quality-candidate-en8.json
+51208a4b65896a3e33c088843062a42d97606471db89133b05b23749c4a2dfbe  candidate/service-bounded.log
+c84bb02ae8df0a7ef1046a3c71c3c5184109216added37aa4124511c14f10a0a  control/service-control-final.log
 ```

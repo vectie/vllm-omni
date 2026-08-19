@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from flashcosyvoice.modules.hifigan import HiFTGenerator
 
 from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
@@ -48,6 +49,23 @@ def _frozen_features(value: torch.Tensor, *weights: torch.Tensor) -> torch.Tenso
     return _hift_f0_features(value, *weights)
 
 
+def _linearized_features(value: torch.Tensor, *weights: torch.Tensor) -> torch.Tensor:
+    """Evaluate the fixed kernel-3 stack as window packing plus Linear."""
+    for index in range(0, len(weights), 2):
+        width = value.shape[-1]
+        padded = F.pad(value, (1, 1)).transpose(1, 2)
+        windows = torch.cat(
+            (
+                padded[:, :width, :],
+                padded[:, 1 : width + 1, :],
+                padded[:, 2 : width + 2, :],
+            ),
+            dim=-1,
+        )
+        value = F.elu(F.linear(windows, weights[index], weights[index + 1])).transpose(1, 2)
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -70,6 +88,17 @@ def main() -> None:
         tensor for layer in convolutions for tensor in (layer.weight, layer.bias)
     )
     control_weights = tuple(weight.detach().clone() for weight in frozen_weights)
+    linear_weights = tuple(
+        tensor
+        for layer in convolutions
+        for tensor in (
+            layer.weight.detach()
+            .permute(0, 2, 1)
+            .reshape(layer.out_channels, -1)
+            .contiguous(),
+            layer.bias,
+        )
+    )
     value = frozen_weights[0].new_full(
         (1, int(convolutions[0].in_channels), args.width),
         0.125,
@@ -94,12 +123,20 @@ def main() -> None:
         fullgraph=True,
         dynamic=False,
     )
+    linearized_graph = torch.compile(
+        _linearized_features,
+        backend=torchair.get_npu_backend(compiler_config=torchair.CompilerConfig()),
+        fullgraph=True,
+        dynamic=False,
+    )
 
     control_args = (value, *control_weights)
     frozen_args = (value, *frozen_weights)
+    linearized_args = (value, *linear_weights)
     with torch.inference_mode():
         control = control_graph(*control_args)
         frozen = frozen_graph(*frozen_args)
+        linearized = linearized_graph(*linearized_args)
         expected = hift.f0_predictor.condnet(value)
         control_us = _measure(
             control_graph,
@@ -113,6 +150,12 @@ def main() -> None:
             warmups=args.warmups,
             iterations=args.iterations,
         )
+        linearized_us = _measure(
+            linearized_graph,
+            linearized_args,
+            warmups=args.warmups,
+            iterations=args.iterations,
+        )
 
     print(
         json.dumps(
@@ -123,9 +166,17 @@ def main() -> None:
                 "iterations": args.iterations,
                 "control_us": control_us,
                 "frozen_us": frozen_us,
+                "linearized_us": linearized_us,
                 "speedup": control_us / frozen_us,
+                "linearized_speedup": control_us / linearized_us,
                 "control_max_abs_error": float((control - expected).abs().max().item()),
                 "frozen_max_abs_error": float((frozen - expected).abs().max().item()),
+                "linearized_max_abs_error": float(
+                    (linearized - expected).abs().max().item()
+                ),
+                "linearized_mean_abs_error": float(
+                    (linearized - expected).abs().mean().item()
+                ),
             },
             indent=2,
         )

@@ -27,6 +27,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_wide_adaln_steps,
     _dit_wide_adaln_steps_with_final,
     _npu_cfm_integration_dtype,
+    _npu_cfm_fixed_kv_slabs_enabled,
     _npu_cfm_stacked_cache_out_enabled,
     _npu_dit_attn_cache_out_enabled,
     _npu_dit_cache_major_enabled,
@@ -1509,6 +1510,22 @@ def test_npu_cfm_stacked_cache_out_config_and_environment(monkeypatch):
         _npu_cfm_stacked_cache_out_enabled()
 
 
+def test_npu_cfm_fixed_kv_slabs_config_and_environment(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_FIXED_KV_SLABS", raising=False
+    )
+    assert _npu_cfm_fixed_kv_slabs_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_CFM_FIXED_KV_SLABS", "off")
+    assert _npu_cfm_fixed_kv_slabs_enabled(True) is False
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_FIXED_KV_SLABS", "sometimes"
+    )
+    with pytest.raises(ValueError, match="NPU_CFM_FIXED_KV_SLABS"):
+        _npu_cfm_fixed_kv_slabs_enabled()
+
+
 def test_npu_single_request_cache_passthrough_config_and_environment(monkeypatch):
     monkeypatch.delenv(
         "VLLM_OMNI_MINICPMO45_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH",
@@ -1672,6 +1689,81 @@ def test_single_request_cache_passthrough_is_exact_across_chunks():
             assert control_cache.keys() == candidate_cache.keys()
             for name in control_cache:
                 assert torch.equal(control_cache[name], candidate_cache[name])
+
+
+def test_fixed_estimator_kv_slabs_are_exact_and_keep_addresses():
+    control = BatchedToken2Wav(_FakeToken2Wav())
+    candidate = BatchedToken2Wav(
+        _FakeToken2Wav(),
+        npu_cfm_fixed_kv_slabs=True,
+    )
+    control_prompt = control.prepare_prompt("shared", "/fake/prompt.wav")
+    candidate_prompt = candidate.prepare_prompt("shared", "/fake/prompt.wav")
+    control_states = control.setup_batch(control_prompt, 1)
+    candidate_states = candidate.setup_batch(candidate_prompt, 1)
+    slabs = candidate_states[0].estimator_kv_slabs
+    assert slabs is not None
+    retained_address = slabs.retained.data_ptr()
+    append_address = slabs.append.data_ptr()
+    cnn_addresses = tuple(bank.data_ptr() for bank in slabs.cnn_banks)
+
+    for tokens, last_chunk in (
+        (torch.tensor([[10, 11]]), False),
+        (torch.tensor([[12, 13]]), False),
+        (torch.tensor([[14, 15]]), False),
+        (torch.tensor([[16]]), True),
+    ):
+        control_audio, control_states = control.decode_batch(
+            tokens,
+            control_prompt,
+            control_states,
+            last_chunk=last_chunk,
+        )
+        candidate_audio, candidate_states = candidate.decode_batch(
+            tokens,
+            candidate_prompt,
+            candidate_states,
+            last_chunk=last_chunk,
+        )
+        assert torch.equal(control_audio[0], candidate_audio[0])
+        for name in control_states[0].flow_cache:
+            assert torch.equal(
+                control_states[0].flow_cache[name],
+                candidate_states[0].flow_cache[name],
+            )
+        slabs = candidate_states[0].estimator_kv_slabs
+        assert slabs is not None
+        assert slabs.retained.data_ptr() == retained_address
+        assert slabs.append.data_ptr() == append_address
+        assert tuple(bank.data_ptr() for bank in slabs.cnn_banks) == cnn_addresses
+
+
+def test_fixed_estimator_kv_slabs_compact_exact_newest_first_history():
+    adapter = BatchedToken2Wav(
+        _FakeToken2Wav(),
+        npu_cfm_fixed_kv_slabs=True,
+    )
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    state = adapter.setup_batch(prompt, 1)[0]
+    slabs = state.estimator_kv_slabs
+    assert slabs is not None
+    output = slabs.append
+    frame_values = torch.arange(output.shape[4], dtype=output.dtype)
+    output.copy_(frame_values.reshape(1, 1, 1, 1, -1, 1))
+    cnn_output = torch.full_like(slabs.cnn_banks[1], 7)
+
+    advanced = adapter._advance_fixed_estimator_kv_slabs(
+        slabs, output, cnn_output
+    )
+
+    expected = torch.cat((frame_values[:4], frame_values[-100:]))
+    torch.testing.assert_close(
+        advanced.retained[0, 0, 0, 0, : advanced.logical_length, 0],
+        expected,
+    )
+    assert advanced.logical_length == 104
+    assert advanced.active_cnn_bank == 1
+    assert torch.equal(advanced.cnn_banks[1], cnn_output)
 
 
 def test_model_preserves_output_slots_and_prefers_runtime_codes():

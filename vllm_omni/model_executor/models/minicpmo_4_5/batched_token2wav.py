@@ -53,6 +53,7 @@ _NPU_DIT_POST_ATTN_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_POST_ATTN_GRAPH"
 _NPU_DIT_QKV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_QKV_PACK"
 _NPU_DIT_ATTN_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT"
 _NPU_CFM_STACKED_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT"
+_NPU_CFM_FIXED_KV_SLABS_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_FIXED_KV_SLABS"
 _NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH"
 )
@@ -126,6 +127,22 @@ def _npu_cfm_integration_dtype(config_value: Any = None) -> torch.dtype:
         f"Invalid {_NPU_CFM_INTEGRATION_DTYPE_ENV}={raw!r}; "
         "expected fp32 or bf16"
     )
+
+
+def _npu_cfm_fixed_kv_slabs_enabled(config_value: Any = None) -> bool:
+    """Resolve the opt-in, request-owned fixed estimator KV workspace."""
+    env_value = os.environ.get(_NPU_CFM_FIXED_KV_SLABS_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_CFM_FIXED_KV_SLABS_ENV}={raw!r}")
 
 
 def _npu_dit_mlp_graph_enabled(config_value: Any = None) -> bool:
@@ -1290,7 +1307,20 @@ class _DiTFullStackGraph(nn.Module):
 def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
     flow = tuple((name, tensor_signature(state.flow_cache[name])) for name in sorted(state.flow_cache))
     hift = tuple((name, tensor_signature(state.hift_cache[name])) for name in sorted(state.hift_cache))
-    return flow, hift
+    slab = state.estimator_kv_slabs
+    slab_signature = (
+        None
+        if slab is None
+        else (
+            tensor_signature(slab.retained),
+            tensor_signature(slab.append),
+            tuple(tensor_signature(bank) for bank in slab.cnn_banks),
+            slab.prompt_length,
+            slab.logical_length,
+            slab.active_cnn_bank,
+        )
+    )
+    return flow, hift, slab_signature
 
 
 @dataclass(frozen=True)
@@ -1302,9 +1332,29 @@ class PromptFeatures:
 
 
 @dataclass(frozen=True)
+class FixedEstimatorKVSlabs:
+    """Fixed-address storage for one request's six-step, 16-block KV state.
+
+    ``retained`` is consumed by the next chunk. ``append`` is a separate
+    full-output workspace, so compaction never performs overlapping copies.
+    MiniCPM-o prepends each new chunk to the old cache; consequently the first
+    ``prompt_length`` frames are not an immutable prompt after the first
+    decode. Compaction deliberately preserves that exact ordering.
+    """
+
+    retained: torch.Tensor
+    append: torch.Tensor
+    cnn_banks: tuple[torch.Tensor, torch.Tensor]
+    prompt_length: int
+    logical_length: int
+    active_cnn_bank: int
+
+
+@dataclass(frozen=True)
 class BatchedToken2WavState:
     flow_cache: dict[str, torch.Tensor]
     hift_cache: dict[str, torch.Tensor]
+    estimator_kv_slabs: FixedEstimatorKVSlabs | None = None
 
 
 class BatchedToken2Wav(nn.Module):
@@ -1339,6 +1389,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_qkv_pack: Any = None,
         npu_dit_attn_cache_out: Any = None,
         npu_cfm_stacked_cache_out: Any = None,
+        npu_cfm_fixed_kv_slabs: Any = None,
         npu_single_request_cache_passthrough: Any = None,
         npu_dit_fused_conv_block: Any = None,
         npu_dit_fused_conv_linear: Any = None,
@@ -1496,6 +1547,10 @@ class BatchedToken2Wav(nn.Module):
             npu_cfm_stacked_cache_out
         )
         self._npu_cfm_stacked_cache_out_used = False
+        self._npu_cfm_fixed_kv_slabs_enabled = _npu_cfm_fixed_kv_slabs_enabled(
+            npu_cfm_fixed_kv_slabs
+        )
+        self._npu_cfm_fixed_kv_slabs_used = False
         self._npu_single_request_cache_passthrough_enabled = (
             _npu_single_request_cache_passthrough_enabled(
                 npu_single_request_cache_passthrough
@@ -3846,6 +3901,8 @@ class BatchedToken2Wav(nn.Module):
         *,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
+        cnn_output: torch.Tensor | None = None,
+        att_output: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         decoder = self.flow.decoder
         estimator = decoder.estimator
@@ -3951,9 +4008,14 @@ class BatchedToken2Wav(nn.Module):
         # BF16 mode instead removes per-step estimator-boundary casts and casts
         # the completed mel once before the FP32 HiFT boundary.
         deltas = self._cfm_deltas_for(integration_timeline)
-        direct_cache_output = self._npu_cfm_stacked_cache_out_enabled and mu.device.type == "npu"
-        stacked_cnn_out: torch.Tensor | None = None
-        stacked_att_out: torch.Tensor | None = None
+        if (cnn_output is None) != (att_output is None):
+            raise ValueError("cnn_output and att_output must be provided together")
+        direct_cache_output = (
+            cnn_output is not None
+            or (self._npu_cfm_stacked_cache_out_enabled and mu.device.type == "npu")
+        )
+        stacked_cnn_out = cnn_output
+        stacked_att_out = att_output
         if direct_cache_output:
             first_old_cnn = working_cnn_cache[0] if working_cnn_cache is not None else None
             first_old_att = att_cache[0] if att_cache is not None else None
@@ -3963,8 +4025,21 @@ class BatchedToken2Wav(nn.Module):
                 first_old_att,
                 cache_major=self._is_cache_major_cnn(first_old_cnn),
             )
-            stacked_cnn_out = mu_cfg.new_empty((self.n_timesteps, *cnn_shape))
-            stacked_att_out = mu_cfg.new_empty((self.n_timesteps, *att_shape))
+            expected_cnn = (self.n_timesteps, *cnn_shape)
+            expected_att = (self.n_timesteps, *att_shape)
+            if stacked_cnn_out is None:
+                stacked_cnn_out = mu_cfg.new_empty(expected_cnn)
+                stacked_att_out = mu_cfg.new_empty(expected_att)
+            elif (
+                tuple(stacked_cnn_out.shape) != expected_cnn
+                or tuple(stacked_att_out.shape) != expected_att
+            ):
+                raise ValueError(
+                    "fixed CFM output slab shape mismatch: "
+                    f"expected cnn={expected_cnn}, att={expected_att}; "
+                    f"got cnn={tuple(stacked_cnn_out.shape)}, "
+                    f"att={tuple(stacked_att_out.shape)}"
+                )
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
         for step in range(self.n_timesteps):
@@ -4052,6 +4127,9 @@ class BatchedToken2Wav(nn.Module):
         *,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
+        cnn_output: torch.Tensor | None = None,
+        att_output: torch.Tensor | None = None,
+        steady_graph: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         enabled = os.environ.get("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH", "0").strip().lower()
         if enabled not in {"1", "true", "yes", "on"} or mu.device.type != "npu" or self._npu_cfm_graph_disabled:
@@ -4061,21 +4139,69 @@ class BatchedToken2Wav(nn.Module):
                 cond,
                 cnn_cache=cnn_cache,
                 att_cache=att_cache,
+                cnn_output=cnn_output,
+                att_output=att_output,
             )
 
-        inputs = (mu, speakers, cond, cnn_cache, att_cache)
+        # Fixed-slab mode captures only the repetitive width-50/cache-402
+        # steady state. Prompt and cache-fill shapes remain eager and therefore
+        # cannot churn the graph cache or evict the useful executable.
+        if self._npu_cfm_fixed_kv_slabs_enabled and not steady_graph:
+            return self._decode_cfm_eager(
+                mu,
+                speakers,
+                cond,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+                cnn_output=cnn_output,
+                att_output=att_output,
+            )
+
+        inputs = (mu, speakers, cond, cnn_cache, att_cache, cnn_output, att_output)
         key = tuple(self._optional_tensor_signature(value) for value in inputs)
         entry = self._npu_cfm_graphs.get(key)
-        if entry is not None:
+        slot_count = 2 if self._npu_cfm_fixed_kv_slabs_enabled else 1
+        if entry is not None and len(entry["slots"]) >= slot_count:
             self._npu_cfm_graphs.move_to_end(key)
-            for static, current in zip(entry["inputs"], inputs, strict=True):
+            slot_index = int(entry["next_slot"])
+            slot = entry["slots"][slot_index]
+            entry["next_slot"] = (slot_index + 1) % slot_count
+            # The final two buffers are graph destinations, not inputs. Copying
+            # their old contents was a full-cache HBM round trip every replay.
+            for static, current in zip(slot["inputs"][:5], inputs[:5], strict=True):
                 if static is not None and current is not None:
                     static.copy_(current)
-            entry["graph"].replay()
-            return tuple(output.clone() for output in entry["outputs"])
+            slot["graph"].replay()
+            if self._npu_cfm_fixed_kv_slabs_enabled:
+                return slot["outputs"]
+            return tuple(output.clone() for output in slot["outputs"])
 
-        static_inputs = tuple(value.clone() if value is not None else None for value in inputs)
-        static_mu, static_speakers, static_cond, static_cnn, static_att = static_inputs
+        if entry is None:
+            entry = {
+                "slots": [],
+                "next_slot": 0,
+                "pool": torch.npu.graph_pool_handle(),
+            }
+            self._npu_cfm_graphs[key] = entry
+        static_inputs = tuple(
+            (
+                value.clone()
+                if index < 5
+                else torch.empty_like(value)
+            )
+            if value is not None
+            else None
+            for index, value in enumerate(inputs)
+        )
+        (
+            static_mu,
+            static_speakers,
+            static_cond,
+            static_cnn,
+            static_att,
+            static_cnn_output,
+            static_att_output,
+        ) = static_inputs
         try:
             with torch.inference_mode():
                 self._decode_cfm_eager(
@@ -4084,16 +4210,20 @@ class BatchedToken2Wav(nn.Module):
                     static_cond,
                     cnn_cache=static_cnn,
                     att_cache=static_att,
+                    cnn_output=static_cnn_output,
+                    att_output=static_att_output,
                 )
             torch.npu.synchronize()
             graph = torch.npu.NPUGraph()
-            with torch.inference_mode(), torch.npu.graph(graph, pool=torch.npu.graph_pool_handle()):
+            with torch.inference_mode(), torch.npu.graph(graph, pool=entry["pool"]):
                 outputs = self._decode_cfm_eager(
                     static_mu,
                     static_speakers,
                     static_cond,
                     cnn_cache=static_cnn,
                     att_cache=static_att,
+                    cnn_output=static_cnn_output,
+                    att_output=static_att_output,
                 )
             graph.replay()
         except Exception:
@@ -4106,16 +4236,21 @@ class BatchedToken2Wav(nn.Module):
                 cond,
                 cnn_cache=cnn_cache,
                 att_cache=att_cache,
+                cnn_output=cnn_output,
+                att_output=att_output,
             )
 
-        self._npu_cfm_graphs[key] = {
+        entry["slots"].append({
             "graph": graph,
             "inputs": static_inputs,
             "outputs": outputs,
-        }
+        })
+        entry["next_slot"] = len(entry["slots"]) % slot_count
         max_graphs = self._npu_cfm_graph_cache_limit()
         while len(self._npu_cfm_graphs) > max_graphs:
             self._npu_cfm_graphs.popitem(last=False)
+        if self._npu_cfm_fixed_kv_slabs_enabled:
+            return outputs
         return tuple(output.clone() for output in outputs)
 
     def _split_flow_cache(
@@ -4167,6 +4302,64 @@ class BatchedToken2Wav(nn.Module):
             "estimator_att_cache": torch.cat((*conditional_att, *unconditional_att), dim=2),
         }
 
+    @staticmethod
+    def _make_fixed_estimator_kv_slabs(
+        cache: torch.Tensor,
+        cnn_cache: torch.Tensor,
+        prompt_length: int,
+    ) -> FixedEstimatorKVSlabs | None:
+        logical_length = int(cache.shape[4])
+        if logical_length != prompt_length:
+            logger.warning(
+                "MiniCPM-o fixed KV slabs disabled for request: prompt=%d, cache=%d",
+                prompt_length,
+                logical_length,
+            )
+            return None
+        retained_shape = (*cache.shape[:4], prompt_length + 100, cache.shape[5])
+        append_shape = (*cache.shape[:4], prompt_length + 150, cache.shape[5])
+        retained = cache.new_empty(retained_shape)
+        append = cache.new_empty(append_shape)
+        retained[..., :logical_length, :].copy_(cache)
+        cnn_banks = (cnn_cache.clone(), torch.empty_like(cnn_cache))
+        return FixedEstimatorKVSlabs(
+            retained=retained,
+            append=append,
+            cnn_banks=cnn_banks,
+            prompt_length=prompt_length,
+            logical_length=logical_length,
+            active_cnn_bank=0,
+        )
+
+    @staticmethod
+    def _advance_fixed_estimator_kv_slabs(
+        slabs: FixedEstimatorKVSlabs,
+        att_output: torch.Tensor,
+        cnn_output: torch.Tensor,
+    ) -> FixedEstimatorKVSlabs:
+        output_length = int(att_output.shape[4])
+        retained_length = min(output_length, slabs.prompt_length + 100)
+        if output_length <= retained_length:
+            slabs.retained[..., :output_length, :].copy_(att_output)
+        else:
+            prompt = slabs.prompt_length
+            slabs.retained[..., :prompt, :].copy_(att_output[..., :prompt, :])
+            slabs.retained[..., prompt : prompt + 100, :].copy_(
+                att_output[..., -100:, :]
+            )
+        next_cnn_bank = 1 - slabs.active_cnn_bank
+        cnn_bank = slabs.cnn_banks[next_cnn_bank]
+        if cnn_bank.data_ptr() != cnn_output.data_ptr():
+            cnn_bank.copy_(cnn_output)
+        return FixedEstimatorKVSlabs(
+            retained=slabs.retained,
+            append=slabs.append,
+            cnn_banks=slabs.cnn_banks,
+            prompt_length=slabs.prompt_length,
+            logical_length=retained_length,
+            active_cnn_bank=next_cnn_bank,
+        )
+
     def setup_batch(
         self,
         features: PromptFeatures,
@@ -4200,17 +4393,36 @@ class BatchedToken2Wav(nn.Module):
         }
         split = self._split_flow_cache(flow_cache, batch_size)
         mel_channels = int(prompt_mels.shape[2])
-        return [
-            BatchedToken2WavState(
+        states: list[BatchedToken2WavState] = []
+        prompt_length = int(features.mels.shape[1])
+        for row in split:
+            slabs = (
+                self._make_fixed_estimator_kv_slabs(
+                    row["estimator_att_cache"],
+                    row["estimator_cnn_cache"],
+                    prompt_length,
+                )
+                if self._npu_cfm_fixed_kv_slabs_enabled and batch_size == 1
+                else None
+            )
+            if slabs is not None:
+                row = dict(row)
+                row["estimator_att_cache"] = slabs.retained[
+                    ..., : slabs.logical_length, :
+                ]
+                row["estimator_cnn_cache"] = slabs.cnn_banks[
+                    slabs.active_cnn_bank
+                ]
+            states.append(BatchedToken2WavState(
                 flow_cache=row,
                 hift_cache={
                     "mel": prompt_mels.new_zeros((1, mel_channels, 0)),
                     "source": prompt_mels.new_zeros((1, 1, 0)),
                     "speech": prompt_mels.new_zeros((1, 0)),
                 },
-            )
-            for row in split
-        ]
+                estimator_kv_slabs=slabs,
+            ))
+        return states
 
     @staticmethod
     def _fade_in_out(
@@ -4256,6 +4468,11 @@ class BatchedToken2Wav(nn.Module):
                     f'"minimum":{lookahead + 1}}}'
                 )
         flow_cache = self._stack_flow_cache(states)
+        fixed_slabs = (
+            states[0].estimator_kv_slabs
+            if batch_size == 1 and self._npu_cfm_fixed_kv_slabs_enabled
+            else None
+        )
         projected_speakers = features.projected_speaker_embedding.expand(batch_size, -1)
         with self._autocast(tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
@@ -4265,16 +4482,56 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=flow_cache["conformer_att_cache"],
             )
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
+            cnn_output = None
+            att_output = None
+            steady_graph = False
+            if fixed_slabs is not None:
+                output_length = fixed_slabs.logical_length + int(hidden.shape[1])
+                if output_length > int(fixed_slabs.append.shape[4]):
+                    raise RuntimeError(
+                        "MiniCPMO45Code2WavBatchError "
+                        f'{{"reason":"kv_slab_capacity","required":{output_length},'
+                        f'"available":{int(fixed_slabs.append.shape[4])}}}'
+                    )
+                att_output = fixed_slabs.append[..., :output_length, :]
+                cnn_output = fixed_slabs.cnn_banks[
+                    1 - fixed_slabs.active_cnn_bank
+                ]
+                steady_graph = (
+                    int(hidden.shape[1]) == 50
+                    and fixed_slabs.logical_length
+                    == fixed_slabs.prompt_length + 100
+                )
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
                 cond,
                 cnn_cache=flow_cache["estimator_cnn_cache"],
                 att_cache=flow_cache["estimator_att_cache"],
+                cnn_output=cnn_output,
+                att_output=att_output,
+                steady_graph=steady_graph,
             )
 
         prompt_len = int(features.mels.shape[1])
-        if estimator_att.shape[4] > prompt_len + 100:
+        if fixed_slabs is not None:
+            fixed_slabs = self._advance_fixed_estimator_kv_slabs(
+                fixed_slabs, estimator_att, estimator_cnn
+            )
+            estimator_att = fixed_slabs.retained[
+                ..., : fixed_slabs.logical_length, :
+            ]
+            estimator_cnn = fixed_slabs.cnn_banks[
+                fixed_slabs.active_cnn_bank
+            ]
+            if not self._npu_cfm_fixed_kv_slabs_used:
+                logger.info(
+                    "MiniCPM-o fixed estimator KV slabs active: retained=%d, append=%d",
+                    int(fixed_slabs.retained.shape[4]),
+                    int(fixed_slabs.append.shape[4]),
+                )
+                self._npu_cfm_fixed_kv_slabs_used = True
+        elif estimator_att.shape[4] > prompt_len + 100:
             estimator_att = torch.cat(
                 (estimator_att[..., :prompt_len, :], estimator_att[..., -100:, :]),
                 dim=4,
@@ -4311,6 +4568,7 @@ class BatchedToken2Wav(nn.Module):
             BatchedToken2WavState(
                 flow_cache=new_flow[row],
                 hift_cache={name: value[row : row + 1].detach().clone() for name, value in next_hift.items()},
+                estimator_kv_slabs=fixed_slabs if row == 0 else None,
             )
             for row in range(batch_size)
         ]

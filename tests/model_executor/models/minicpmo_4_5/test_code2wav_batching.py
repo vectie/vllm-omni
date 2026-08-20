@@ -26,9 +26,11 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_mlp_residual,
     _dit_wide_adaln_steps,
     _dit_wide_adaln_steps_with_final,
+    _npu_cfm_integration_dtype,
     _npu_cfm_stacked_cache_out_enabled,
     _npu_dit_attn_cache_out_enabled,
     _npu_dit_cache_major_enabled,
+    _npu_dit_compute_dtype,
     _npu_dit_conv_mlp_graph_enabled,
     _npu_dit_final_addcmul_enabled,
     _npu_dit_fused_final_adaln_enabled,
@@ -235,6 +237,101 @@ def _model():
 def test_token2wav_step_count_defaults_to_checkpoint_quality() -> None:
     assert _resolve_token2wav_n_timesteps({}) == 10
     assert _resolve_token2wav_n_timesteps({"token2wav_n_timesteps": 8}) == 8
+
+
+def test_npu_dit_compute_dtype_config_and_environment(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_COMPUTE_DTYPE",
+        raising=False,
+    )
+    assert _npu_dit_compute_dtype() == torch.float32
+    assert _npu_dit_compute_dtype("bf16") == torch.bfloat16
+    assert _npu_dit_compute_dtype("torch.bfloat16") == torch.bfloat16
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_COMPUTE_DTYPE",
+        "fp32",
+    )
+    assert _npu_dit_compute_dtype("bf16") == torch.float32
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_COMPUTE_DTYPE",
+        "fp16",
+    )
+    with pytest.raises(ValueError, match="NPU_DIT_COMPUTE_DTYPE"):
+        _npu_dit_compute_dtype()
+
+
+def test_npu_cfm_integration_dtype_config_and_environment(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_INTEGRATION_DTYPE",
+        raising=False,
+    )
+    assert _npu_cfm_integration_dtype() == torch.float32
+    assert _npu_cfm_integration_dtype("bf16") == torch.bfloat16
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_INTEGRATION_DTYPE",
+        "fp32",
+    )
+    assert _npu_cfm_integration_dtype("bf16") == torch.float32
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_INTEGRATION_DTYPE",
+        "fp16",
+    )
+    with pytest.raises(ValueError, match="NPU_CFM_INTEGRATION_DTYPE"):
+        _npu_cfm_integration_dtype()
+
+
+def test_selective_bf16_dit_keeps_integration_and_hift_fp32() -> None:
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    # CPU tests cannot activate the NPU-only constructor branch. Exercise the
+    # dtype boundary directly with the same state used after a successful NPU
+    # estimator conversion.
+    adapter._npu_dit_compute_dtype = torch.bfloat16
+    adapter._npu_cfm_integration_dtype = torch.float32
+    adapter._npu_dit_mixed_precision_enabled = True
+
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+    state = states[0]
+    assert state.flow_cache["conformer_cnn_cache"].dtype == torch.float32
+    assert state.flow_cache["estimator_cnn_cache"].dtype == torch.bfloat16
+    assert state.flow_cache["estimator_att_cache"].dtype == torch.bfloat16
+    assert state.hift_cache["mel"].dtype == torch.float32
+
+    audios, states = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=False,
+    )
+    assert audios[0].dtype == torch.float32
+    assert states[0].flow_cache["estimator_cnn_cache"].dtype == torch.bfloat16
+    assert states[0].hift_cache["speech"].dtype == torch.float32
+
+
+def test_homogeneous_bf16_cfm_casts_once_before_hift() -> None:
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    adapter.flow.decoder.estimator.to(dtype=torch.bfloat16)
+    adapter._npu_dit_compute_dtype = torch.bfloat16
+    adapter._npu_cfm_integration_dtype = torch.bfloat16
+    adapter._npu_dit_mixed_precision_enabled = True
+
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+    audios, states = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=False,
+    )
+
+    assert audios[0].dtype == torch.float32
+    assert states[0].flow_cache["estimator_cnn_cache"].dtype == torch.bfloat16
+    assert states[0].flow_cache["estimator_att_cache"].dtype == torch.bfloat16
+    assert states[0].hift_cache["mel"].dtype == torch.float32
 
 
 def test_token2wav_step_count_environment_override_wins(monkeypatch) -> None:

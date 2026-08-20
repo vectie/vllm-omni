@@ -1,0 +1,36 @@
+# Atlas 800I A3 / Ascend 910C homogeneous-BF16 CFM experiment.
+#
+# Preserve the accepted CFM6 prompt/steady graph profile, but keep the decoder
+# estimator, CFM noise, CFG reduction, and six-step Euler state in BF16. This
+# removes per-step dtype boundaries; the completed mel is cast once before the
+# FP32 HiFT vocoder. This profile remains opt-in until Seed-TTS WER/SIM and
+# serving gates qualify it.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      raw_tensor_shm: false
+      shm_event_notifications: true
+      shm_notification_namespace: minicpmo45-910c
+      token2wav_n_timesteps: 6
+      npu_dit_mlp_graph: true
+      npu_dit_mlp_graph_width: 50
+      npu_dit_graph_buckets: [20, 302]
+      npu_dit_preamble_graph: true
+      npu_dit_wide_adaln: true
+      npu_dit_wide_final_adaln: true
+      npu_dit_final_addcmul: true
+      npu_dit_conv_mlp_graph: true
+      npu_dit_prompt_conv_mlp_graph: true
+      npu_dit_fused_conv_pack: true
+      npu_single_request_cache_passthrough: true
+      npu_dit_compute_dtype: bf16
+      npu_cfm_integration_dtype: bf16

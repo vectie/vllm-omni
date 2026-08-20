@@ -58,6 +58,8 @@ _NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH_ENV = (
 )
 _NPU_DIT_FUSED_CONV_BLOCK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_BLOCK"
 _NPU_DIT_FUSED_CONV_LINEAR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR"
+_NPU_DIT_COMPUTE_DTYPE_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_COMPUTE_DTYPE"
+_NPU_CFM_INTEGRATION_DTYPE_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_INTEGRATION_DTYPE"
 logger = logging.getLogger(__name__)
 
 
@@ -77,6 +79,53 @@ def _autocast_disabled(device: torch.device):
 
 def tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
     return tuple(value.shape), str(value.dtype), value.device.type
+
+
+def _npu_dit_compute_dtype(config_value: Any = None) -> torch.dtype:
+    """Resolve the opt-in precision used by the NPU CFM estimator.
+
+    Token2Wav is intentionally loaded in FP32 because its encoder and HiFT
+    contain FP32-only modules. The DiT estimator is a separate submodule, so
+    it can use BF16 without changing prompt extraction, the flow encoder, or
+    HiFT. A separate policy controls whether the CFM integration state stays
+    FP32 or follows the estimator dtype.
+    """
+    env_value = os.environ.get(_NPU_DIT_COMPUTE_DTYPE_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return torch.float32
+    normalized = str(raw).strip().lower().replace("torch.", "")
+    if normalized in {"fp32", "float32"}:
+        return torch.float32
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    raise ValueError(
+        f"Invalid {_NPU_DIT_COMPUTE_DTYPE_ENV}={raw!r}; "
+        "expected fp32 or bf16"
+    )
+
+
+def _npu_cfm_integration_dtype(config_value: Any = None) -> torch.dtype:
+    """Resolve the opt-in CFM state/integrator dtype.
+
+    FP32 remains the default quality boundary. BF16 is an experimental NPU
+    mode that avoids two casts per estimator evaluation by keeping noise,
+    CFG, and Euler recurrence in the estimator dtype. The completed mel is
+    converted back to the flow/HiFT dtype exactly once.
+    """
+    env_value = os.environ.get(_NPU_CFM_INTEGRATION_DTYPE_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return torch.float32
+    normalized = str(raw).strip().lower().replace("torch.", "")
+    if normalized in {"fp32", "float32"}:
+        return torch.float32
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    raise ValueError(
+        f"Invalid {_NPU_CFM_INTEGRATION_DTYPE_ENV}={raw!r}; "
+        "expected fp32 or bf16"
+    )
 
 
 def _npu_dit_mlp_graph_enabled(config_value: Any = None) -> bool:
@@ -1293,6 +1342,8 @@ class BatchedToken2Wav(nn.Module):
         npu_single_request_cache_passthrough: Any = None,
         npu_dit_fused_conv_block: Any = None,
         npu_dit_fused_conv_linear: Any = None,
+        npu_dit_compute_dtype: Any = None,
+        npu_cfm_integration_dtype: Any = None,
     ):
         super().__init__()
         self._token2wav = token2wav
@@ -1455,6 +1506,72 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_fused_conv_block_used = False
         self._npu_dit_fused_conv_linear_enabled = _npu_dit_fused_conv_linear_enabled(npu_dit_fused_conv_linear)
         self._npu_dit_fused_conv_linear_used = False
+        requested_dit_dtype = _npu_dit_compute_dtype(npu_dit_compute_dtype)
+        requested_integration_dtype = _npu_cfm_integration_dtype(
+            npu_cfm_integration_dtype
+        )
+        self._npu_dit_compute_dtype = torch.float32
+        self._npu_cfm_integration_dtype = torch.float32
+        self._npu_dit_mixed_precision_enabled = False
+        estimator = getattr(getattr(self.flow, "decoder", None), "estimator", None)
+        estimator_parameter = (
+            next(estimator.parameters(), None)
+            if isinstance(estimator, nn.Module)
+            else None
+        )
+        if requested_dit_dtype != torch.float32:
+            if (
+                not isinstance(estimator, nn.Module)
+                or not isinstance(estimator_parameter, torch.Tensor)
+                or estimator_parameter.device.type != "npu"
+            ):
+                logger.warning(
+                    "MiniCPM-o NPU DiT %s requested outside an NPU estimator; "
+                    "retaining FP32",
+                    requested_dit_dtype,
+                )
+            else:
+                try:
+                    estimator.to(dtype=requested_dit_dtype)
+                    self._npu_dit_compute_dtype = requested_dit_dtype
+                    self._npu_dit_mixed_precision_enabled = True
+                    if requested_integration_dtype == requested_dit_dtype:
+                        self._npu_cfm_integration_dtype = requested_integration_dtype
+                    logger.info(
+                        "MiniCPM-o NPU DiT mixed precision active: estimator=%s, "
+                        "CFM integration=%s, HiFT=float32",
+                        requested_dit_dtype,
+                        self._npu_cfm_integration_dtype,
+                    )
+                except Exception:
+                    # ``Module.to`` can have converted an early parameter
+                    # before a later buffer fails. Restore the complete
+                    # estimator so an opt-in precision failure cannot leave a
+                    # partially converted serving path.
+                    estimator.to(dtype=torch.float32)
+                    logger.warning(
+                        "MiniCPM-o NPU DiT precision conversion failed; retaining FP32",
+                        exc_info=True,
+                    )
+        if (
+            requested_integration_dtype != torch.float32
+            and requested_integration_dtype != self._npu_dit_compute_dtype
+        ):
+            logger.warning(
+                "MiniCPM-o NPU CFM integration dtype %s requires the same DiT "
+                "compute dtype; retaining FP32 integration",
+                requested_integration_dtype,
+            )
+        if (
+            self._npu_dit_mixed_precision_enabled
+            and self._npu_cfm_integration_dtype != self._npu_dit_compute_dtype
+        ):
+            # This diagnostic region was already rejected on the serving
+            # gate, and its graph signature assumes that the CFM state and
+            # DiT hidden state have the same dtype. Keep it out of the BF16
+            # experiment instead of triggering a second compile or a hidden
+            # state cast inside the six-step loop.
+            self._npu_dit_last_block_final_euler_graph_enabled = False
         if self._npu_dit_wide_adaln_enabled and not self._npu_dit_preamble_graph_enabled:
             self._npu_dit_wide_adaln_enabled = False
             logger.warning(
@@ -3733,6 +3850,16 @@ class BatchedToken2Wav(nn.Module):
         decoder = self.flow.decoder
         estimator = decoder.estimator
         batch_size = int(mu.shape[0])
+        integration_dtype = (
+            self._npu_cfm_integration_dtype
+            if self._npu_dit_mixed_precision_enabled
+            else mu.dtype
+        )
+        estimator_dtype = (
+            self._npu_dit_compute_dtype
+            if self._npu_dit_mixed_precision_enabled
+            else mu.dtype
+        )
         offset = int(att_cache.shape[4]) if att_cache is not None else 0
         end = offset + int(mu.shape[2])
         if end > int(decoder.rand_noise.shape[2]):
@@ -3741,7 +3868,12 @@ class BatchedToken2Wav(nn.Module):
                 f'{{"reason":"noise_capacity","required":{end},'
                 f'"available":{int(decoder.rand_noise.shape[2])}}}'
             )
-        x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
+        x = (
+            decoder.rand_noise[:, :, offset:end]
+            .to(dtype=integration_dtype)
+            .expand(batch_size, -1, -1)
+            .clone()
+        )
         retain_cache_major = self._npu_dit_cache_major_enabled and mu.device.type == "npu"
         use_cache_major = (
             retain_cache_major
@@ -3754,11 +3886,24 @@ class BatchedToken2Wav(nn.Module):
             input_cache_major = self._is_cache_major_cnn(working_cnn_cache)
             if use_cache_major != input_cache_major:
                 working_cnn_cache = working_cnn_cache.transpose(-2, -1).contiguous()
-        timeline = self._timeline_for(mu)
-        mu_cfg = self._cfg_pair("mu", mu, zero_unconditional=True)
-        speakers_cfg = self._cfg_pair("speakers", speakers, zero_unconditional=True)
-        cond_cfg = self._cfg_pair("cond", cond, zero_unconditional=True)
-        time_embeddings = self._estimator_time_embeddings(estimator, timeline, batch_size * 2)
+        estimator_mu = mu.to(dtype=estimator_dtype)
+        estimator_speakers = speakers.to(dtype=estimator_dtype)
+        estimator_cond = cond.to(dtype=estimator_dtype)
+        estimator_timeline = self._timeline_for(estimator_mu)
+        integration_reference = mu.to(dtype=integration_dtype)
+        integration_timeline = self._timeline_for(integration_reference)
+        mu_cfg = self._cfg_pair("mu", estimator_mu, zero_unconditional=True)
+        speakers_cfg = self._cfg_pair(
+            "speakers",
+            estimator_speakers,
+            zero_unconditional=True,
+        )
+        cond_cfg = self._cfg_pair("cond", estimator_cond, zero_unconditional=True)
+        time_embeddings = self._estimator_time_embeddings(
+            estimator,
+            estimator_timeline,
+            batch_size * 2,
+        )
         wide_modulation_steps: torch.Tensor | None = None
         final_modulation_steps: torch.Tensor | None = None
         if self._npu_dit_wide_adaln_enabled:
@@ -3802,7 +3947,10 @@ class BatchedToken2Wav(nn.Module):
                     " plus final layer" if final_modulation_steps is not None else "",
                 )
                 self._npu_dit_wide_adaln_steps_used = True
-        deltas = self._cfm_deltas_for(timeline)
+        # The default keeps ODE recurrence in FP32. The experimental homogeneous
+        # BF16 mode instead removes per-step estimator-boundary casts and casts
+        # the completed mel once before the FP32 HiFT boundary.
+        deltas = self._cfm_deltas_for(integration_timeline)
         direct_cache_output = self._npu_cfm_stacked_cache_out_enabled and mu.device.type == "npu"
         stacked_cnn_out: torch.Tensor | None = None
         stacked_att_out: torch.Tensor | None = None
@@ -3815,8 +3963,8 @@ class BatchedToken2Wav(nn.Module):
                 first_old_att,
                 cache_major=self._is_cache_major_cnn(first_old_cnn),
             )
-            stacked_cnn_out = mu.new_empty((self.n_timesteps, *cnn_shape))
-            stacked_att_out = mu.new_empty((self.n_timesteps, *att_shape))
+            stacked_cnn_out = mu_cfg.new_empty((self.n_timesteps, *cnn_shape))
+            stacked_att_out = mu_cfg.new_empty((self.n_timesteps, *att_shape))
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
         for step in range(self.n_timesteps):
@@ -3824,7 +3972,11 @@ class BatchedToken2Wav(nn.Module):
             old_att = att_cache[step] if att_cache is not None else None
             estimate, step_cnn, step_att, cfm_updated = self._estimator_step(
                 estimator,
-                x=self._cfg_pair("x", x, zero_unconditional=False),
+                x=self._cfg_pair(
+                    "x",
+                    x.to(dtype=estimator_dtype),
+                    zero_unconditional=False,
+                ),
                 mu=mu_cfg,
                 time_embedding=time_embeddings[step],
                 speakers=speakers_cfg,
@@ -3848,9 +4000,11 @@ class BatchedToken2Wav(nn.Module):
                 cfm_cfg_rate=float(decoder.inference_cfg_rate),
             )
             if cfm_updated:
-                x = estimate
+                x = estimate.to(dtype=integration_dtype)
             else:
-                conditional, unconditional = estimate.split(batch_size, dim=0)
+                conditional, unconditional = estimate.to(
+                    dtype=integration_dtype
+                ).split(batch_size, dim=0)
                 velocity = (
                     (1.0 + decoder.inference_cfg_rate) * conditional
                     - decoder.inference_cfg_rate * unconditional
@@ -3870,7 +4024,7 @@ class BatchedToken2Wav(nn.Module):
         retain_cache_major = use_cache_major and not self._npu_dit_conv_mlp_graph_disabled
         if retain_cache_major != self._is_cache_major_cnn(stacked_cnn):
             stacked_cnn = stacked_cnn.transpose(-2, -1).contiguous()
-        return x, stacked_cnn, stacked_att
+        return x.to(dtype=mu.dtype), stacked_cnn, stacked_att
 
     @staticmethod
     def _optional_tensor_signature(value: torch.Tensor | None) -> Any:

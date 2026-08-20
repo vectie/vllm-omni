@@ -3930,3 +3930,75 @@ df4547dd197ee25937c00ea127af8468ba794ec6fb21393181dc85da23d1d68f  candidate/benc
 d66b3a364dafd85e3de0cdfd008319adce0ef655b0fc44609db4b883018c4f1b  candidate-service.log
 e6861eb526deed32f1c0b8741248824e3ba159436727d731c7535669c281283c  control-service.log
 ```
+
+## Rejected mixed Vector/Cube final AdaLN kernel
+
+The next kernel experiment fused the steady-width final affine-free
+LayerNorm, AdaLN shift/scale, and 512-to-80 projection into one AscendC mixed
+kernel. Ten Vector cores normalize and modulate the fixed FP32 `[2, 50, 512]`
+activation into workspace; five Cube cores then project 16 output channels
+each and add the 80-channel bias. Prompt and tail shapes continue through the
+accepted Addcmul fallback.
+
+An alternating 15-trial NPU-1 microbenchmark used 100 warmups and 200 timed
+iterations per trial. The accepted LayerNorm + Addcmul + linear boundary took
+70.876 us at the median, while the fused kernel took 29.773 us: a 2.3805x
+isolated speedup and about 246.6 us projected saving over six CFM steps. The
+synthetic parity fixture measured `0.00175923` maximum and `0.00017176` mean
+absolute drift. The real-checkpoint startup gate measured `0.000928760`
+maximum and `0.000284755` mean drift, inside the fail-closed `0.002` / `0.0005`
+bounds. Any shape, dtype, operator, or parity failure disables only this
+kernel and immediately retries the accepted Addcmul path.
+
+The service result did not follow the isolated result. Fresh candidate and
+accepted-control processes ran the same 32 fixed English Seed-TTS rows three
+times after three warmups, at concurrency one, seed zero, temperature zero,
+and CFM6. Every valid run completed 32/32 with zero failures and 100%
+continuity while preserving 4,801 input tokens, 480 output tokens, 3,362,880
+audio frames, and 140.12 seconds of audio. The table reports the median run
+value from each side; lower is better except for throughput.
+
+| Metric | Accepted control | Fused final AdaLN | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 43.835 s | 45.401 s | +3.57% |
+| Request throughput | 0.7300 req/s | 0.7048 req/s | -3.45% |
+| Mean / median / P99 E2E | 1,369.37 / 1,403.54 / 1,826.46 ms | 1,418.46 / 1,439.42 / 1,907.96 ms | +3.59% / +2.56% / +4.46% |
+| Mean / median / P99 TTFT | 315.30 / 316.13 / 448.59 ms | 317.71 / 320.25 / 450.78 ms | +0.76% / +1.30% / +0.49% |
+| Mean / median / P99 audio TTFP | 780.21 / 781.16 / 922.74 ms | 788.91 / 792.47 / 926.93 ms | +1.11% / +1.45% / +0.45% |
+| Mean / median / P99 whole-audio RTF | 0.319218 / 0.320959 / 0.430698 | 0.329750 / 0.331605 / 0.428053 | +3.30% / +3.32% / -0.61% |
+| Mean / median / P99 chunk RTF | 0.335295 / 0.183195 / 1.026925 | 0.345943 / 0.195240 / 1.025032 | +3.18% / +6.57% / -0.18% |
+
+The candidate fails the two-percent gate on serving duration, mean and median
+whole-audio RTF, mean and median chunk RTF, and all E2E aggregates. It is not
+enabled in the accepted prompt-width profile. The custom operator and guarded
+integration remain available through the explicitly named experimental YAML
+for profiler work.
+
+The likely cause is boundary placement, not arithmetic cost. The accepted
+LayerNorm, Addcmul, and linear operations remain visible to GE and can overlap
+or optimize with neighboring work. The ACLNN custom operator is an opaque
+synchronous boundary with a 200 KiB workspace round trip and a whole-device
+Vector-to-Cube barrier on every CFM step. Its microbenchmark removes Python
+launches in isolation, but the live pipeline loses more scheduling freedom
+than those launches cost. A future retry must fuse a larger producer-consumer
+region (for example final projection through CFG/Euler) or expose the operator
+to the graph compiler instead of inserting another eager ACLNN island.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-fused-final-adaln-20260820
+```
+
+Artifact checksums:
+
+```text
+bde59d8cb81a38b15c8b968455e72db8f1e08255e13a9d1c679519b16d73bd30  control/control-run1.json
+3165ed79423b95cb0b7b8c32225a08ce83abceeaaaf9c763317c3b58502edc6d  control/control-run2.json
+8ee302bd74378182a15aca4565c1a76d8e23fbb6f30f9b696853ac826665aedd  control/control-run3.json
+de61cff0e06ed34c47ba14dfc120bc9eefd6de73b65739fd829fc013e9fa8341  candidate/candidate-valid-run1.json
+62c81e4ba12390e17b2367a8621ec8e85e9d9db391fd9ce4c65f9c57ced73780  candidate/candidate-valid-run2.json
+c900e841f9dc6c01701a812b3af03656cf75f083331ad3f1314bbc1ed2effc09  candidate/candidate-valid-run3.json
+835ce8779f1a7493c0c4e6193f99073069b6cfe99d9dfe735a8ea025b18160be  candidate-service.log
+f0c3c2de53a1da9a7dc55d227db8d9626b68a7f8ec8115ab5b8b933a563d1137  control-service.log
+```

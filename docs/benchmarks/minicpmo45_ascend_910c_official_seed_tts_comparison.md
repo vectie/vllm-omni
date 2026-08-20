@@ -4243,3 +4243,76 @@ bec40f62c441fd307b05115e23af47874c7c333d4e49db699a7626c032bcdd93  homogeneous-qu
 07035b99ce23921a8542d814a27b4681374290912d81133a63d1e4fd2b906101  homogeneous-bf16-service.log
 454db6ee07d860572fed483370736aa2900ca5634b3ca84d04a43720985a7b82  final-control-service.log
 ```
+
+### Fixed-address estimator cache slabs
+
+The next cache-layer candidate removes request-time estimator-cache growth
+without changing MiniCPM-o's attention history. The upstream attention path
+orders its cache as `[new chunk, previous cache]`; therefore treating the
+first prompt-width region as immutable would change model semantics. The
+implemented representation instead owns, per concurrency-one request:
+
+- one retained six-step x 16-block KV slab with capacity `prompt + 100`;
+- one separate append/output slab with capacity `prompt + 150`;
+- a logical length rather than a changing allocation;
+- two reusable CNN-cache banks; and
+- direct CFM cache outputs into those workspaces.
+
+After each decode, the output slab is compacted into the distinct retained
+slab using the exact existing rule: preserve the first prompt-width frames and
+the newest retained 100-frame tail. Distinct source and destination buffers
+avoid undefined overlapping copies. Prompt/cache-fill/final shapes stay eager.
+The focused suite verifies exact audio and all flow-cache tensors across four
+chunks, fixed storage addresses, and the overflow retention order. Together
+with the deploy-inheritance gate, 104/104 focused tests passed.
+
+The adjacent hardware screen used the homogeneous-BF16 profile on both sides,
+the same first 12 shuffled English Seed-TTS rows, three warmups, concurrency
+one, seed zero, temperature zero, and CFM6. Both runs completed 12/12 with zero
+failures, 100% streaming continuity, 1,804 input tokens, 183 output tokens,
+1,252,800 frames, and 52.20 seconds of audio. Lower is better except
+throughput.
+
+| Metric | BF16 control | Fixed slabs | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 18.595 s | 17.835 s | -4.08% |
+| Request throughput | 0.6453 req/s | 0.6728 req/s | +4.26% |
+| Mean E2E | 1,549.17 ms | 1,485.89 ms | -4.08% |
+| Mean TTFT | 329.73 ms | 320.54 ms | -2.79% |
+| Mean audio TTFP | 832.49 ms | 818.93 ms | -1.63% |
+| Mean whole-audio RTF | 0.362937 | 0.349713 | -3.64% |
+| Mean / median chunk RTF | 0.390172 / 0.224625 | 0.378519 / 0.203973 | -2.99% / -9.19% |
+| P99 chunk RTF | 1.206069 | 1.224779 | +1.55% |
+
+The service logged `retained=402, append=452` and direct stacked CFM cache
+outputs. The primary means all improved, but the small 12-row chunk-P99 screen
+did not. Fixed slabs therefore remain an experimental speed candidate pending
+a 32-row repeated tail gate; they are not silently promoted to the default.
+Because the cache transformation is mathematically exact, it reuses the
+already-qualified homogeneous-BF16 accuracy boundary, but the full official
+Seed-TTS and cumulative Daily-Omni/Video-MME release gates still apply.
+
+A second profile enabled one steady width-50/cache-402 NPUGraph executable and
+two captured output slots. Capture failed closed on the real 910C stack:
+CosyVoice's causal Conv1d lowered to the legacy ACLop Conv2D path, which cannot
+run during NPU stream capture. The resulting 17.81-second run is eager fallback
+data, not a graph result. This closes another attempt at raw full-loop capture;
+the next implementation must make the convolution graph-visible through
+TorchAir/GE static compilation or a converter, rather than retrying
+`allow_internal_format=False`.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-fixed-kv-20260821
+```
+
+Selected checksums:
+
+```text
+be15a479c86c9b7de7367328b6444c928d95abb503442760e758071da8679101  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-164430.json
+f6a443e5bee4043dfdc04c54a301ac7e2d98a3971df372906a4344f2bcd9eb65  fixed/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-165055.json
+0fc109f1edcfa9a7692e34b09759afa8e38f2cd3fb3bce488b97595ea79f0b23  graph/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-165747.json
+7ca1bbba1f4a7e7b0325c7934e958fbdbe3e612ede78200978245c0b18a7a89c  fixed-service.log
+a31a74e7dcc243fc0c9a1bfbcdfeedb8c19e4a505578eaf4bfe159afd5090691  graph-service.log
+```

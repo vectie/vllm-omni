@@ -4163,3 +4163,83 @@ a2de666b40257368c34ddebd15b08e1640b670091d14dc4025cf05cde1bafbb1  gated-32/bench
 fd03982e17a31d8b347c33afd57c61b9940e26386008b7c7f7a07075165f5c31  gated-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-100149.json
 b4fd1f38c896e07e547e1281b43c536ebe48a65a36293d9f56c97c5009d5339d  gated-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-100310.json
 ```
+
+### Experimental homogeneous-BF16 CFM precision island
+
+The next lower-layer experiment moved the complete six-step CFM numerical
+island to BF16 on Ascend 910C: the DiT estimator, random-noise state, cached
+timestep/delta tensors, CFG reduction, and Euler recurrence now share one
+dtype. The completed mel is converted once at the FP32 HiFT boundary. The
+flow encoder, prompt extraction, HiFT vocoder, and public waveform contract
+remain FP32.
+
+This design replaces a rejected selective-BF16 prototype. Keeping the
+estimator in BF16 while casting every CFM step back to an FP32 Euler state
+completed 32/32 requests with exact structural parity, but took 71.57 seconds
+against its adjacent 67.14-second FP32 control: 6.60% slower. The repeated
+dtype boundaries also disabled a larger homogeneous graph signature. That
+prototype remains expressible for diagnosis, but is not the deploy profile.
+
+The homogeneous mode is opt-in through `npu_dit_compute_dtype: bf16` plus
+`npu_cfm_integration_dtype: bf16`. It fails closed to FP32 integration when
+the requested integration dtype does not match the active estimator dtype,
+and converts the estimator back to FP32 if module conversion fails. On real
+hardware the startup log confirmed `estimator=torch.bfloat16`,
+`CFM integration=torch.bfloat16`, and `HiFT=float32`. Existing graph drift
+gates remained active. In particular, the final Addcmul rewrite measured
+0.0078125 maximum drift against its 0.000001 bound and correctly retained the
+canonical AdaLN path instead of loosening the gate.
+
+The isolated checkout completed the entire focused Code2Wav suite, including
+the new precision-boundary cases: 100/100 passed. The hardware run used the
+same fixed 32 English Seed-TTS rows, three warmups, concurrency one, seed zero,
+temperature zero, and CFM6 on both sides. Both sides completed 32/32 with zero
+failures, 100% streaming continuity, 4,801 input tokens, 480 output tokens,
+3,362,880 frames, and 140.12 seconds of audio.
+
+The shared host showed substantial epoch variance: an earlier adjacent FP32
+control took 67.14 seconds, while the final immediate quality-paired FP32
+control took 46.87 seconds. The table therefore uses the faster final control
+as the conservative comparison. Lower is better except throughput.
+
+| Metric | FP32 control | Homogeneous BF16 | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 46.868 s | 45.331 s | -3.28% |
+| Request throughput | 0.6828 req/s | 0.7059 req/s | +3.39% |
+| Mean / median / P99 E2E | 1,463.92 / 1,488.74 / 1,999.56 ms | 1,416.00 / 1,450.05 / 1,898.76 ms | -3.27% / -2.60% / -5.04% |
+| Mean / median / P99 TTFT | 327.75 / 329.94 / 468.25 ms | 316.61 / 315.49 / 459.58 ms | -3.40% / -4.38% / -1.85% |
+| Mean / median / P99 audio TTFP | 815.03 / 810.22 / 975.74 ms | 786.90 / 785.87 / 937.00 ms | -3.45% / -3.00% / -3.97% |
+| Mean / median / P99 whole-audio RTF | 0.340990 / 0.340272 / 0.437862 | 0.329556 / 0.325919 / 0.416748 | -3.35% / -4.22% / -4.82% |
+
+The same outputs ran through Whisper-large-v3 WER and WavLM-base-plus SIM.
+Both evaluators processed all 32 rows with zero PCM, ASR, or embedding
+failures. WER is reported as a fraction below and percentage-point changes are
+computed on the corresponding 0-100 scale.
+
+| Accuracy metric | FP32 control | Homogeneous BF16 | Accuracy change |
+| --- | ---: | ---: | ---: |
+| Mean / median WER | 0.016588 / 0 | 0.016588 / 0 | 0.00 pp |
+| Mean / median WavLM SIM | 0.845234 / 0.851134 | 0.844850 / 0.851195 | -0.038 pp / +0.006 pp |
+
+This clears the 2-percentage-point screening gate with a large margin and is
+accepted as an experimental profile. It is not promoted into the default
+910C profile yet: the 32-row WavLM score is the repository's documented proxy,
+not the competition's fine-tuned UniSpeech/WavLM-SV protocol, and the full
+official 1,088-row Seed-TTS export/evaluation still remains a release gate.
+Daily-Omni and Video-MME are unaffected by this Stage-2-only numerical change,
+but their cumulative competition runs also remain required before submission.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-bf16-20260820
+```
+
+Selected checksums:
+
+```text
+bec40f62c441fd307b05115e23af47874c7c333d4e49db699a7626c032bcdd93  homogeneous-quality32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-150610.json
+0813cc8e834bb4a53c6051950442ac3fd4957208d26363c504ada566a2698683  control-quality32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-154644.json
+07035b99ce23921a8542d814a27b4681374290912d81133a63d1e4fd2b906101  homogeneous-bf16-service.log
+454db6ee07d860572fed483370736aa2900ca5634b3ca84d04a43720985a7b82  final-control-service.log
+```

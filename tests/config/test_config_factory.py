@@ -2387,6 +2387,25 @@ class TestPlatformOverrides:
         assert extra["npu_dit_final_addcmul"] is True
         assert extra["npu_dit_mlp_graph_width"] == 50
 
+    def test_minicpmo_4_5_910c_last_block_final_euler_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_last_block_final_euler_graph_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(deploy_path),
+            platform="npu",
+        )
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_conv_mlp_graph"] is True
+        assert extra["npu_dit_wide_final_adaln"] is True
+        assert extra["npu_dit_final_addcmul"] is True
+        assert extra["npu_dit_last_block_final_euler_graph"] is True
+        assert extra["npu_dit_mlp_graph_width"] == 50
+
     def test_minicpmo_4_5_910c_hift_source_noise_scratch_is_stage2_env(self):
         deploy_path = Path(
             get_deploy_config_path(

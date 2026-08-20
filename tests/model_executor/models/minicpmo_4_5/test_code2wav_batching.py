@@ -16,6 +16,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_cache_major_post_attention_conv_mlp_residual,
     _dit_conv_mlp_residual,
     _dit_explicit_attention,
+    _dit_final_cfg_euler_from_modulation,
     _dit_final_from_modulation,
     _dit_final_from_modulation_addcmul,
     _dit_fused_conv_block_mlp_residual,
@@ -29,6 +30,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_attn_cache_out_enabled,
     _npu_dit_cache_major_enabled,
     _npu_dit_conv_mlp_graph_enabled,
+    _npu_dit_last_block_final_euler_graph_enabled,
     _npu_dit_final_addcmul_enabled,
     _npu_dit_fused_final_adaln_enabled,
     _npu_dit_full_block_cache_buckets,
@@ -1214,6 +1216,39 @@ def test_dit_final_addcmul_matches_canonical_adaln():
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_dit_final_cfg_euler_matches_split_path():
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 5, 512)
+    modulation = torch.randn(2, 1, 1024)
+    output = nn.Linear(512, 80)
+    norm = nn.LayerNorm(512, elementwise_affine=False, eps=1e-6)
+    x = torch.randn(1, 80, 5)
+    delta = torch.tensor(0.125)
+    cfg_rate = 0.7
+
+    estimate = _dit_final_from_modulation_addcmul(
+        hidden,
+        modulation,
+        norm,
+        output,
+    ).transpose(1, 2)
+    conditional, unconditional = estimate.chunk(2, dim=0)
+    expected = x + delta * (
+        (1.0 + cfg_rate) * conditional - cfg_rate * unconditional
+    )
+    actual = _dit_final_cfg_euler_from_modulation(
+        hidden,
+        modulation,
+        output.weight,
+        output.bias,
+        x,
+        delta,
+        cfg_rate,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_dit_wide_adaln_steps_preserves_step_and_block_axes():
     time_embeddings = torch.empty(6, 2, 1, 512, device="meta")
     packed_weight = torch.empty(16 * 9 * 512, 512, device="meta")
@@ -1254,6 +1289,19 @@ def test_npu_dit_conv_mlp_graph_config_and_environment(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH", "sometimes")
     with pytest.raises(ValueError, match="NPU_DIT_CONV_MLP_GRAPH"):
         _npu_dit_conv_mlp_graph_enabled()
+
+
+def test_npu_dit_last_block_final_euler_graph_config_and_environment(monkeypatch):
+    name = "VLLM_OMNI_MINICPMO45_NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH"
+    monkeypatch.delenv(name, raising=False)
+    assert _npu_dit_last_block_final_euler_graph_enabled(True) is True
+
+    monkeypatch.setenv(name, "off")
+    assert _npu_dit_last_block_final_euler_graph_enabled(True) is False
+
+    monkeypatch.setenv(name, "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH"):
+        _npu_dit_last_block_final_euler_graph_enabled()
 
 
 def test_npu_dit_prompt_conv_mlp_graph_config_and_environment(monkeypatch):

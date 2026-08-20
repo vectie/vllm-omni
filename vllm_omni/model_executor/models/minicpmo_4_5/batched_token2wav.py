@@ -34,6 +34,11 @@ _NPU_DIT_FUSED_FINAL_ADALN_ENV = (
 _NPU_DIT_FUSED_FINAL_ADALN_MAX_ABS_DRIFT = 2.0e-3
 _NPU_DIT_FUSED_FINAL_ADALN_MEAN_ABS_DRIFT = 5.0e-4
 _NPU_DIT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH"
+_NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH"
+)
+_NPU_DIT_LAST_BLOCK_FINAL_EULER_MAX_ABS_DRIFT = 5.0e-3
+_NPU_DIT_LAST_BLOCK_FINAL_EULER_MEAN_ABS_DRIFT = 5.0e-4
 _NPU_DIT_PROMPT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PROMPT_CONV_MLP_GRAPH"
 _NPU_DIT_FULL_BLOCK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_GRAPH"
 _NPU_DIT_FULL_STACK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_STACK_GRAPH"
@@ -173,6 +178,25 @@ def _npu_dit_conv_mlp_graph_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_DIT_CONV_MLP_GRAPH_ENV}={raw!r}")
+
+
+def _npu_dit_last_block_final_euler_graph_enabled(
+    config_value: Any = None,
+) -> bool:
+    env_value = os.environ.get(_NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid {_NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH_ENV}={raw!r}"
+    )
 
 
 def _npu_dit_prompt_conv_mlp_graph_enabled(config_value: Any = None) -> bool:
@@ -527,6 +551,29 @@ def _dit_final_from_modulation_fused_npu(
     )
 
 
+def _dit_final_cfg_euler_from_modulation(
+    hidden: torch.Tensor,
+    modulation: torch.Tensor,
+    output_weight: torch.Tensor,
+    output_bias: torch.Tensor,
+    x: torch.Tensor,
+    delta: torch.Tensor,
+    cfg_rate: float,
+) -> torch.Tensor:
+    """Finish one CFG-batch DiT step and update the Euler state."""
+    shift, scale = modulation.chunk(2, dim=-1)
+    normalized = F.layer_norm(hidden, (512,), eps=1e-6)
+    projected = F.linear(
+        torch.addcmul(normalized + shift, normalized, scale),
+        output_weight,
+        output_bias,
+    ).transpose(1, 2)
+    conditional = projected[:1]
+    unconditional = projected[1:2]
+    velocity = (1.0 + cfg_rate) * conditional - cfg_rate * unconditional
+    return x + delta * velocity
+
+
 def _dit_attention_from_modulation(
     x: torch.Tensor,
     modulation: torch.Tensor,
@@ -751,6 +798,65 @@ def _dit_fused_conv_mlp_residual(
         fc2_bias,
     )
     return hidden, torch.cat((new_cache1, new_cache2), dim=1)
+
+
+def _dit_fused_conv_mlp_final_euler_residual(
+    hidden: torch.Tensor,
+    conv_input: torch.Tensor,
+    cnn_cache: torch.Tensor,
+    gate_conv: torch.Tensor,
+    shift_mlp: torch.Tensor,
+    scale_mlp: torch.Tensor,
+    gate_mlp: torch.Tensor,
+    conv1_flat_weight: torch.Tensor,
+    conv1_bias: torch.Tensor,
+    conv_norm_weight: torch.Tensor,
+    conv_norm_bias: torch.Tensor,
+    conv2_flat_weight: torch.Tensor,
+    conv2_bias: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc1_bias: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    fc2_bias: torch.Tensor,
+    final_modulation: torch.Tensor,
+    final_weight: torch.Tensor,
+    final_bias: torch.Tensor,
+    x: torch.Tensor,
+    delta: torch.Tensor,
+    cfg_rate: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse the last Conv+MLP replay with final projection, CFG, and Euler."""
+    hidden, new_cache = _dit_fused_conv_mlp_residual(
+        hidden,
+        conv_input,
+        cnn_cache,
+        gate_conv,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+        conv1_flat_weight,
+        conv1_bias,
+        conv_norm_weight,
+        conv_norm_bias,
+        conv2_flat_weight,
+        conv2_bias,
+        fc1_weight,
+        fc1_bias,
+        fc2_weight,
+        fc2_bias,
+    )
+    return (
+        _dit_final_cfg_euler_from_modulation(
+            hidden,
+            final_modulation,
+            final_weight,
+            final_bias,
+            x,
+            delta,
+            cfg_rate,
+        ),
+        new_cache,
+    )
 
 
 def _dit_cache_major_conv_mlp_residual(
@@ -1147,6 +1253,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_final_addcmul: Any = None,
         npu_dit_fused_final_adaln: Any = None,
         npu_dit_conv_mlp_graph: Any = None,
+        npu_dit_last_block_final_euler_graph: Any = None,
         npu_dit_prompt_conv_mlp_graph: Any = None,
         npu_dit_full_block_graph: Any = None,
         npu_dit_full_stack_graph: Any = None,
@@ -1266,6 +1373,13 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_conv_mlp_graph: Any | None = None
         self._npu_dit_conv_mlp_graph_disabled = False
         self._npu_dit_conv_mlp_graph_used = False
+        self._npu_dit_last_block_final_euler_graph_enabled = (
+            _npu_dit_last_block_final_euler_graph_enabled(
+                npu_dit_last_block_final_euler_graph
+            )
+        )
+        self._npu_dit_last_block_final_euler_graph: Any | None = None
+        self._npu_dit_last_block_final_euler_graph_used = False
         self._npu_dit_prompt_conv_mlp_graph_enabled = _npu_dit_prompt_conv_mlp_graph_enabled(
             npu_dit_prompt_conv_mlp_graph
         )
@@ -1352,10 +1466,35 @@ class BatchedToken2Wav(nn.Module):
             logger.warning(
                 "MiniCPM-o NPU post-attention graph requires cache-major Conv+MLP; disabling it"
             )
+        if self._npu_dit_last_block_final_euler_graph_enabled and not (
+            self._npu_dit_conv_mlp_graph_enabled
+            and self._npu_dit_fused_conv_pack_enabled
+            and self._npu_dit_wide_final_adaln_enabled
+            and self._npu_dit_final_addcmul_enabled
+            and not self._npu_dit_cache_major_enabled
+            and not self._npu_dit_post_attn_graph_enabled
+            and not self._npu_dit_fused_conv_linear_enabled
+            and not self._npu_dit_full_block_graph_enabled
+            and not self._npu_dit_full_stack_graph_enabled
+        ):
+            self._npu_dit_last_block_final_euler_graph_enabled = False
+            logger.warning(
+                "MiniCPM-o last-block final Euler graph requires the accepted "
+                "causal-pack Conv+MLP and final Addcmul profile; disabling it"
+            )
+        if (
+            self._npu_dit_last_block_final_euler_graph_enabled
+            and self._npu_dit_fused_final_adaln_enabled
+        ):
+            self._npu_dit_fused_final_adaln_enabled = False
+            logger.info(
+                "MiniCPM-o last-block final Euler graph supersedes the standalone fused final AdaLN"
+            )
         self._warmup_npu_dit_mlp_graph()
         self._warmup_npu_dit_wide_adaln_graph()
         self._warmup_npu_dit_preamble_graph()
         self._warmup_npu_dit_conv_mlp_graph()
+        self._warmup_npu_dit_last_block_final_euler_graph()
         self._warmup_npu_dit_prompt_conv_mlp_graphs()
         self._warmup_npu_dit_full_block_graphs()
         self._warmup_npu_dit_full_stack_graphs()
@@ -2152,6 +2291,164 @@ class BatchedToken2Wav(nn.Module):
             )
         return self._npu_dit_conv_mlp_graph
 
+    def _warmup_npu_dit_last_block_final_euler_graph(self) -> None:
+        """Compile and validate the last-block-to-Euler producer/consumer graph."""
+        if not self._npu_dit_last_block_final_euler_graph_enabled:
+            return
+        decoder = getattr(self.flow, "decoder", None)
+        estimator = getattr(decoder, "estimator", None)
+        blocks = getattr(estimator, "blocks", None)
+        final_layer = getattr(estimator, "final_layer", None)
+        block = blocks[-1] if blocks else None
+        if (
+            block is None
+            or final_layer is None
+            or self._npu_dit_conv_mlp_graph_disabled
+            or not self._npu_dit_final_addcmul_enabled
+            or not self._dit_conv_mlp_compatible(
+                block,
+                self._npu_dit_mlp_graph_width,
+            )
+            or tuple(final_layer.norm_final.normalized_shape) != (512,)
+            or final_layer.norm_final.elementwise_affine
+            or float(final_layer.norm_final.eps) != 1.0e-6
+            or not isinstance(final_layer.linear, nn.Linear)
+            or tuple(final_layer.linear.weight.shape) != (80, 512)
+            or final_layer.linear.bias is None
+        ):
+            self._npu_dit_last_block_final_euler_graph_enabled = False
+            logger.warning(
+                "MiniCPM-o last-block final Euler graph disabled: model layout is incompatible"
+            )
+            return
+
+        conv1 = block.conv.block[1]
+        conv_norm = block.conv.block[3]
+        conv2 = block.conv.block[6]
+        weight = block.mlp.fc1.weight
+        width = self._npu_dit_mlp_graph_width
+        hidden = torch.linspace(
+            -0.125,
+            0.125,
+            2 * width * 512,
+            device=weight.device,
+            dtype=weight.dtype,
+        ).reshape(2, width, 512)
+        conv_input = hidden.flip(-1).contiguous()
+        cnn_cache = weight.new_zeros((2, 1024, 2))
+        gate_conv = weight.new_full((2, 1, 512), 0.05)
+        shift_mlp = weight.new_full((2, 1, 512), 0.01)
+        scale_mlp = weight.new_full((2, 1, 512), 0.02)
+        gate_mlp = weight.new_full((2, 1, 512), 0.05)
+        time_embedding = weight.new_full((2, 1, 512), 0.125)
+        final_modulation = final_layer.adaLN_modulation(time_embedding)
+        x = torch.linspace(
+            -0.05,
+            0.05,
+            width * 80,
+            device=weight.device,
+            dtype=weight.dtype,
+        ).reshape(1, 80, width)
+        delta = weight.new_tensor(0.125)
+        cfg_rate = float(decoder.inference_cfg_rate)
+        base_graph = self._get_npu_dit_conv_mlp_graph()
+        fused_graph = self._get_npu_dit_last_block_final_euler_graph()
+        if base_graph is None or fused_graph is None:
+            self._npu_dit_last_block_final_euler_graph_enabled = False
+            return
+        args = (
+            hidden,
+            conv_input,
+            cnn_cache,
+            gate_conv,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+            self._dit_conv_graph_weight(conv1),
+            conv1.bias,
+            conv_norm.weight,
+            conv_norm.bias,
+            self._dit_conv_graph_weight(conv2),
+            conv2.bias,
+            block.mlp.fc1.weight,
+            block.mlp.fc1.bias,
+            block.mlp.fc2.weight,
+            block.mlp.fc2.bias,
+        )
+        try:
+            with torch.inference_mode():
+                expected_hidden, expected_cache = base_graph(*args)
+                expected_x = _dit_final_cfg_euler_from_modulation(
+                    expected_hidden,
+                    final_modulation,
+                    final_layer.linear.weight,
+                    final_layer.linear.bias,
+                    x,
+                    delta,
+                    cfg_rate,
+                )
+                actual_x, actual_cache = fused_graph(
+                    *args,
+                    final_modulation,
+                    final_layer.linear.weight,
+                    final_layer.linear.bias,
+                    x,
+                    delta,
+                    cfg_rate,
+                )
+                x_drift = float((actual_x - expected_x).abs().max().item())
+                x_mean_drift = float((actual_x - expected_x).abs().mean().item())
+                cache_drift = float(
+                    (actual_cache - expected_cache).abs().max().item()
+                )
+                if (
+                    not torch.isfinite(actual_x).all()
+                    or not torch.isfinite(actual_cache).all()
+                    or x_drift > _NPU_DIT_LAST_BLOCK_FINAL_EULER_MAX_ABS_DRIFT
+                    or x_mean_drift
+                    > _NPU_DIT_LAST_BLOCK_FINAL_EULER_MEAN_ABS_DRIFT
+                    or cache_drift > _NPU_DIT_LAST_BLOCK_FINAL_EULER_MAX_ABS_DRIFT
+                ):
+                    raise RuntimeError(
+                        "last-block final Euler graph exceeded its startup drift bound: "
+                        f"x_max_abs_drift={x_drift:.9g}, "
+                        f"x_mean_abs_drift={x_mean_drift:.9g}, "
+                        f"cache_max_abs_drift={cache_drift:.9g}"
+                    )
+            torch.npu.synchronize()
+            logger.info(
+                "Compiled bounded-drift MiniCPM-o last-block final Euler graph; "
+                "x_max_abs_drift=%.9g, x_mean_abs_drift=%.9g, "
+                "cache_max_abs_drift=%.9g",
+                x_drift,
+                x_mean_drift,
+                cache_drift,
+            )
+        except Exception:
+            self._npu_dit_last_block_final_euler_graph = None
+            self._npu_dit_last_block_final_euler_graph_enabled = False
+            logger.warning(
+                "MiniCPM-o last-block final Euler graph compilation/parity gate failed; "
+                "retaining the accepted split path",
+                exc_info=True,
+            )
+
+    def _get_npu_dit_last_block_final_euler_graph(self):
+        if not self._npu_dit_last_block_final_euler_graph_enabled:
+            return None
+        if self._npu_dit_last_block_final_euler_graph is None:
+            from torch_npu.dynamo import torchair
+
+            _ensure_torchair_broadcast_alias()
+            compiler_config = torchair.CompilerConfig()
+            self._npu_dit_last_block_final_euler_graph = torch.compile(
+                _dit_fused_conv_mlp_final_euler_residual,
+                backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self._npu_dit_last_block_final_euler_graph
+
     def _warmup_npu_dit_prompt_conv_mlp_graphs(self) -> None:
         """Compile regular Conv/cache + MLP graphs for non-stream buckets.
 
@@ -2647,7 +2944,10 @@ class BatchedToken2Wav(nn.Module):
         att_out: torch.Tensor | None = None,
         wide_modulations: torch.Tensor | None = None,
         final_modulation: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cfm_x: torch.Tensor | None = None,
+        cfm_delta: torch.Tensor | None = None,
+        cfm_cfg_rate: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
@@ -2709,7 +3009,7 @@ class BatchedToken2Wav(nn.Module):
                             self._npu_dit_full_stack_graph_used_lengths.add(
                                 full_stack_cache_length
                             )
-                        return result, cnn_out, att_out
+                        return result, cnn_out, att_out, False
                     preamble_graph_fn = None
                     if (
                         self._npu_dit_preamble_graph_enabled
@@ -2718,6 +3018,7 @@ class BatchedToken2Wav(nn.Module):
                     ):
                         preamble_graph_fn = self._get_npu_dit_preamble_graph(graph_width)
                     conv_mlp_graph_fn = None
+                    last_block_final_euler_graph_fn = None
                     conv_mlp_standard_weights = False
                     full_block_graph_fn = None
                     full_block_cache_length = _dit_attention_cache_length(att_cache)
@@ -2739,6 +3040,17 @@ class BatchedToken2Wav(nn.Module):
                         and not self._npu_dit_conv_mlp_graph_disabled
                     ):
                         conv_mlp_graph_fn = self._get_npu_dit_conv_mlp_graph()
+                        if (
+                            conv_mlp_graph_fn is not None
+                            and self._npu_dit_last_block_final_euler_graph_enabled
+                            and final_modulation is not None
+                            and cfm_x is not None
+                            and cfm_delta is not None
+                            and cfm_cfg_rate is not None
+                        ):
+                            last_block_final_euler_graph_fn = (
+                                self._get_npu_dit_last_block_final_euler_graph()
+                            )
                     elif full_block_graph_fn is None and (
                         graph_width != self._npu_dit_mlp_graph_width
                         and self._npu_dit_prompt_conv_mlp_graph_enabled
@@ -2746,7 +3058,7 @@ class BatchedToken2Wav(nn.Module):
                     ):
                         conv_mlp_graph_fn = self._get_npu_dit_prompt_conv_mlp_graph()
                         conv_mlp_standard_weights = conv_mlp_graph_fn is not None
-                    result = self._estimator_blocks_forward_chunk_mlp_graph(
+                    result, cfm_updated = self._estimator_blocks_forward_chunk_mlp_graph(
                         estimator,
                         estimator_input,
                         time_embedding,
@@ -2761,6 +3073,10 @@ class BatchedToken2Wav(nn.Module):
                         full_block_graph_fn,
                         wide_modulations,
                         final_modulation,
+                        last_block_final_euler_graph_fn,
+                        cfm_x,
+                        cfm_delta,
+                        cfm_cfg_rate,
                     )
                     if not self._npu_dit_mlp_graph_used:
                         logger.info(
@@ -2817,7 +3133,12 @@ class BatchedToken2Wav(nn.Module):
                             full_block_cache_length,
                         )
                         self._npu_dit_full_block_graph_used_lengths.add(full_block_cache_length)
-                    return result, cnn_out, att_out
+                    if cfm_updated and not self._npu_dit_last_block_final_euler_graph_used:
+                        logger.info(
+                            "MiniCPM-o NPU last-block-to-Euler megagraph replay active"
+                        )
+                        self._npu_dit_last_block_final_euler_graph_used = True
+                    return result, cnn_out, att_out, cfm_updated
             except Exception:
                 self._npu_dit_mlp_graph_disabled_widths.add(graph_width)
                 logger.warning(
@@ -2837,7 +3158,7 @@ class BatchedToken2Wav(nn.Module):
             cnn_out,
             att_out,
         )
-        return result, cnn_out, att_out
+        return result, cnn_out, att_out, False
 
     @staticmethod
     def _is_cache_major_cnn(cache: torch.Tensor | None) -> bool:
@@ -2864,7 +3185,11 @@ class BatchedToken2Wav(nn.Module):
         full_block_graph_fn: Any | None = None,
         precomputed_wide_modulations: torch.Tensor | None = None,
         precomputed_final_modulation: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        last_block_final_euler_graph_fn: Any | None = None,
+        cfm_x: torch.Tensor | None = None,
+        cfm_delta: torch.Tensor | None = None,
+        cfm_cfg_rate: float | None = None,
+    ) -> tuple[torch.Tensor, bool]:
         """Replay enabled shape-bucketed partitions with exact eager fallbacks."""
         hidden = estimator.in_proj(estimator_input.transpose(1, 2))
         wide_modulations = precomputed_wide_modulations
@@ -2884,6 +3209,7 @@ class BatchedToken2Wav(nn.Module):
                     "MiniCPM-o wide AdaLN graph replay active for 16 block projections"
                 )
                 self._npu_dit_wide_adaln_used = True
+        cfm_updated = False
         for block_idx, block in enumerate(estimator.blocks):
             if full_block_graph_fn is not None:
                 if not self._dit_full_block_compatible(block):
@@ -3007,6 +3333,16 @@ class BatchedToken2Wav(nn.Module):
                 conv2_weight = (
                     conv2.weight if conv_mlp_standard_weights else self._dit_conv_graph_weight(conv2)
                 )
+                use_last_block_final_euler_graph = (
+                    last_block_final_euler_graph_fn is not None
+                    and block_idx == len(estimator.blocks) - 1
+                    and not post_attention_graph
+                    and not conv_mlp_standard_weights
+                    and precomputed_final_modulation is not None
+                    and cfm_x is not None
+                    and cfm_delta is not None
+                    and cfm_cfg_rate is not None
+                )
                 if post_attention_graph:
                     hidden, new_cnn = conv_mlp_graph_fn(
                         hidden,
@@ -3030,6 +3366,62 @@ class BatchedToken2Wav(nn.Module):
                         block.mlp.fc2.weight,
                         block.mlp.fc2.bias,
                     )
+                elif use_last_block_final_euler_graph:
+                    final_layer = estimator.final_layer
+                    try:
+                        hidden, new_cnn = last_block_final_euler_graph_fn(
+                            hidden,
+                            conv_input,
+                            block_cnn_cache,
+                            gate_conv,
+                            shift_mlp,
+                            scale_mlp,
+                            gate_mlp,
+                            conv1_weight,
+                            conv1.bias,
+                            conv_norm.weight,
+                            conv_norm.bias,
+                            conv2_weight,
+                            conv2.bias,
+                            block.mlp.fc1.weight,
+                            block.mlp.fc1.bias,
+                            block.mlp.fc2.weight,
+                            block.mlp.fc2.bias,
+                            precomputed_final_modulation,
+                            final_layer.linear.weight,
+                            final_layer.linear.bias,
+                            cfm_x,
+                            cfm_delta,
+                            cfm_cfg_rate,
+                        )
+                        cfm_updated = True
+                    except Exception:
+                        self._npu_dit_last_block_final_euler_graph_enabled = False
+                        self._npu_dit_last_block_final_euler_graph = None
+                        logger.warning(
+                            "MiniCPM-o last-block final Euler graph replay failed; "
+                            "retaining the accepted Conv+MLP and final path",
+                            exc_info=True,
+                        )
+                        hidden, new_cnn = conv_mlp_graph_fn(
+                            hidden,
+                            conv_input,
+                            block_cnn_cache,
+                            gate_conv,
+                            shift_mlp,
+                            scale_mlp,
+                            gate_mlp,
+                            conv1_weight,
+                            conv1.bias,
+                            conv_norm.weight,
+                            conv_norm.bias,
+                            conv2_weight,
+                            conv2.bias,
+                            block.mlp.fc1.weight,
+                            block.mlp.fc1.bias,
+                            block.mlp.fc2.weight,
+                            block.mlp.fc2.bias,
+                        )
                 else:
                     hidden, new_cnn = conv_mlp_graph_fn(
                         hidden,
@@ -3054,6 +3446,8 @@ class BatchedToken2Wav(nn.Module):
             if not attention_cache_written:
                 att_out[block_idx, :, :, : new_att.shape[2], :].copy_(new_att)
 
+        if cfm_updated:
+            return hidden, True
         if precomputed_final_modulation is None:
             hidden = estimator.final_layer(hidden, time_embedding)
         elif (
@@ -3122,7 +3516,7 @@ class BatchedToken2Wav(nn.Module):
                 final_layer.norm_final,
                 final_layer.linear,
             )
-        return hidden.transpose(1, 2)
+        return hidden.transpose(1, 2), False
 
     @staticmethod
     def _attention_from_projected_qkv(
@@ -3331,7 +3725,7 @@ class BatchedToken2Wav(nn.Module):
         for step in range(self.n_timesteps):
             old_cnn = working_cnn_cache[step] if working_cnn_cache is not None else None
             old_att = att_cache[step] if att_cache is not None else None
-            estimate, step_cnn, step_att = self._estimator_step(
+            estimate, step_cnn, step_att, cfm_updated = self._estimator_step(
                 estimator,
                 x=self._cfg_pair("x", x, zero_unconditional=False),
                 mu=mu_cfg,
@@ -3352,10 +3746,19 @@ class BatchedToken2Wav(nn.Module):
                     if final_modulation_steps is not None
                     else None
                 ),
+                cfm_x=x,
+                cfm_delta=deltas[step],
+                cfm_cfg_rate=float(decoder.inference_cfg_rate),
             )
-            conditional, unconditional = estimate.split(batch_size, dim=0)
-            velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
-            x = x + deltas[step] * velocity
+            if cfm_updated:
+                x = estimate
+            else:
+                conditional, unconditional = estimate.split(batch_size, dim=0)
+                velocity = (
+                    (1.0 + decoder.inference_cfg_rate) * conditional
+                    - decoder.inference_cfg_rate * unconditional
+                )
+                x = x + deltas[step] * velocity
             if stacked_cnn_out is None:
                 next_cnn.append(step_cnn)
                 next_att.append(step_att)

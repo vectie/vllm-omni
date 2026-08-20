@@ -3,8 +3,9 @@
 # Extend the accepted prompt-width profile by absorbing the final streaming
 # DiT block's Conv+MLP residual, final AdaLN/projection, CFG reduction, and
 # Euler update into its existing static GE replay. Startup validates the fused
-# result against the accepted split graph with a strict maximum-drift gate;
-# any compile or runtime failure falls back to that accepted path.
+# result against the accepted split graph with strict drift and device-time
+# usefulness gates. A compile/runtime/parity failure, or insufficient absolute
+# latency headroom, falls back to the accepted path before serving traffic.
 
 base_config: minicpmo_4_5_2npu_910c_cfm6_hift_f0_graph_experimental.yaml
 

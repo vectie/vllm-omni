@@ -30,7 +30,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_attn_cache_out_enabled,
     _npu_dit_cache_major_enabled,
     _npu_dit_conv_mlp_graph_enabled,
-    _npu_dit_last_block_final_euler_graph_enabled,
     _npu_dit_final_addcmul_enabled,
     _npu_dit_fused_final_adaln_enabled,
     _npu_dit_full_block_cache_buckets,
@@ -40,6 +39,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_fused_conv_linear_enabled,
     _npu_dit_fused_conv_pack_enabled,
     _npu_dit_graph_buckets,
+    _npu_dit_last_block_final_euler_graph_enabled,
+    _npu_dit_last_block_final_euler_perf_qualifies,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
     _npu_dit_post_attn_graph_enabled,
@@ -1302,6 +1303,29 @@ def test_npu_dit_last_block_final_euler_graph_config_and_environment(monkeypatch
     monkeypatch.setenv(name, "sometimes")
     with pytest.raises(ValueError, match="NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH"):
         _npu_dit_last_block_final_euler_graph_enabled()
+
+
+@pytest.mark.parametrize(
+    ("control_us", "candidate_us", "expected"),
+    [
+        (500.0, 250.0, True),
+        (358.774, 298.390, False),
+        (500.0, 350.0, False),
+        (0.0, 0.0, False),
+    ],
+)
+def test_npu_dit_last_block_final_euler_perf_gate(
+    control_us,
+    candidate_us,
+    expected,
+):
+    assert (
+        _npu_dit_last_block_final_euler_perf_qualifies(
+            control_us,
+            candidate_us,
+        )
+        is expected
+    )
 
 
 def test_npu_dit_prompt_conv_mlp_graph_config_and_environment(monkeypatch):

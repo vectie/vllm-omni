@@ -39,6 +39,10 @@ _NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH_ENV = (
 )
 _NPU_DIT_LAST_BLOCK_FINAL_EULER_MAX_ABS_DRIFT = 5.0e-3
 _NPU_DIT_LAST_BLOCK_FINAL_EULER_MEAN_ABS_DRIFT = 5.0e-4
+_NPU_DIT_LAST_BLOCK_FINAL_EULER_MIN_SAVING_US = 200.0
+_NPU_DIT_LAST_BLOCK_FINAL_EULER_MIN_SPEEDUP = 1.10
+_NPU_DIT_LAST_BLOCK_FINAL_EULER_PERF_TRIALS = 5
+_NPU_DIT_LAST_BLOCK_FINAL_EULER_PERF_ITERATIONS = 20
 _NPU_DIT_PROMPT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PROMPT_CONV_MLP_GRAPH"
 _NPU_DIT_FULL_BLOCK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_GRAPH"
 _NPU_DIT_FULL_STACK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_STACK_GRAPH"
@@ -196,6 +200,28 @@ def _npu_dit_last_block_final_euler_graph_enabled(
         return False
     raise ValueError(
         f"Invalid {_NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH_ENV}={raw!r}"
+    )
+
+
+def _npu_dit_last_block_final_euler_perf_qualifies(
+    control_us: float,
+    candidate_us: float,
+    *,
+    min_saving_us: float = _NPU_DIT_LAST_BLOCK_FINAL_EULER_MIN_SAVING_US,
+    min_speedup: float = _NPU_DIT_LAST_BLOCK_FINAL_EULER_MIN_SPEEDUP,
+) -> bool:
+    """Require enough device-time headroom for a wider graph to matter live.
+
+    Small isolated wins repeatedly disappeared after graph scheduling, cache
+    publication, and pipeline overlap were included. Keep the extension
+    fail-closed unless it clears both an absolute and a relative device-time
+    threshold on the loaded checkpoint.
+    """
+    if control_us <= 0.0 or candidate_us <= 0.0:
+        return False
+    return (
+        control_us - candidate_us >= min_saving_us
+        and control_us / candidate_us >= min_speedup
     )
 
 
@@ -2375,27 +2401,51 @@ class BatchedToken2Wav(nn.Module):
             block.mlp.fc2.weight,
             block.mlp.fc2.bias,
         )
+
+        def control_replay() -> tuple[torch.Tensor, torch.Tensor]:
+            control_hidden, control_cache = base_graph(*args)
+            return (
+                _dit_final_cfg_euler_from_modulation(
+                    control_hidden,
+                    final_modulation,
+                    final_layer.linear.weight,
+                    final_layer.linear.bias,
+                    x,
+                    delta,
+                    cfg_rate,
+                ),
+                control_cache,
+            )
+
+        def candidate_replay() -> tuple[torch.Tensor, torch.Tensor]:
+            return fused_graph(
+                *args,
+                final_modulation,
+                final_layer.linear.weight,
+                final_layer.linear.bias,
+                x,
+                delta,
+                cfg_rate,
+            )
+
+        def timed_replay_us(replay: Any) -> float:
+            start = torch.npu.Event(enable_timing=True)
+            end_event = torch.npu.Event(enable_timing=True)
+            start.record()
+            for _ in range(_NPU_DIT_LAST_BLOCK_FINAL_EULER_PERF_ITERATIONS):
+                replay()
+            end_event.record()
+            torch.npu.synchronize()
+            return (
+                float(start.elapsed_time(end_event))
+                * 1000.0
+                / _NPU_DIT_LAST_BLOCK_FINAL_EULER_PERF_ITERATIONS
+            )
+
         try:
             with torch.inference_mode():
-                expected_hidden, expected_cache = base_graph(*args)
-                expected_x = _dit_final_cfg_euler_from_modulation(
-                    expected_hidden,
-                    final_modulation,
-                    final_layer.linear.weight,
-                    final_layer.linear.bias,
-                    x,
-                    delta,
-                    cfg_rate,
-                )
-                actual_x, actual_cache = fused_graph(
-                    *args,
-                    final_modulation,
-                    final_layer.linear.weight,
-                    final_layer.linear.bias,
-                    x,
-                    delta,
-                    cfg_rate,
-                )
+                expected_x, expected_cache = control_replay()
+                actual_x, actual_cache = candidate_replay()
                 x_drift = float((actual_x - expected_x).abs().max().item())
                 x_mean_drift = float((actual_x - expected_x).abs().mean().item())
                 cache_drift = float(
@@ -2416,13 +2466,60 @@ class BatchedToken2Wav(nn.Module):
                         f"cache_max_abs_drift={cache_drift:.9g}"
                     )
             torch.npu.synchronize()
+            control_trials: list[float] = []
+            candidate_trials: list[float] = []
+            with torch.inference_mode():
+                for trial in range(
+                    _NPU_DIT_LAST_BLOCK_FINAL_EULER_PERF_TRIALS
+                ):
+                    ordered = (
+                        (
+                            (control_replay, control_trials),
+                            (candidate_replay, candidate_trials),
+                        )
+                        if trial % 2 == 0
+                        else (
+                            (candidate_replay, candidate_trials),
+                            (control_replay, control_trials),
+                        )
+                    )
+                    for replay, samples in ordered:
+                        samples.append(timed_replay_us(replay))
+            control_us = sorted(control_trials)[len(control_trials) // 2]
+            candidate_us = sorted(candidate_trials)[len(candidate_trials) // 2]
+            speedup = control_us / candidate_us
+            saving_us = control_us - candidate_us
+            if not _npu_dit_last_block_final_euler_perf_qualifies(
+                control_us,
+                candidate_us,
+            ):
+                self._npu_dit_last_block_final_euler_graph = None
+                self._npu_dit_last_block_final_euler_graph_enabled = False
+                logger.warning(
+                    "MiniCPM-o last-block final Euler graph disabled by device-time "
+                    "usefulness gate: control=%.3f us, candidate=%.3f us, "
+                    "saving=%.3f us, speedup=%.4fx; required saving>=%.3f us "
+                    "and speedup>=%.4fx",
+                    control_us,
+                    candidate_us,
+                    saving_us,
+                    speedup,
+                    _NPU_DIT_LAST_BLOCK_FINAL_EULER_MIN_SAVING_US,
+                    _NPU_DIT_LAST_BLOCK_FINAL_EULER_MIN_SPEEDUP,
+                )
+                return
             logger.info(
                 "Compiled bounded-drift MiniCPM-o last-block final Euler graph; "
                 "x_max_abs_drift=%.9g, x_mean_abs_drift=%.9g, "
-                "cache_max_abs_drift=%.9g",
+                "cache_max_abs_drift=%.9g, control=%.3f us, candidate=%.3f us, "
+                "saving=%.3f us, speedup=%.4fx",
                 x_drift,
                 x_mean_drift,
                 cache_drift,
+                control_us,
+                candidate_us,
+                saving_us,
+                speedup,
             )
         except Exception:
             self._npu_dit_last_block_final_euler_graph = None

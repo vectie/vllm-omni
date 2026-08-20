@@ -26,6 +26,8 @@ _NPU_DIT_WIDE_FINAL_ADALN_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_FINAL_ADALN"
 )
 _NPU_DIT_WIDE_ADALN_MAX_ABS_DRIFT = 1.0e-6
+_NPU_DIT_FINAL_ADDCMUL_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FINAL_ADDCMUL"
+_NPU_DIT_FINAL_ADDCMUL_MAX_ABS_DRIFT = 1.0e-6
 _NPU_DIT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH"
 _NPU_DIT_PROMPT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PROMPT_CONV_MLP_GRAPH"
 _NPU_DIT_FULL_BLOCK_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_GRAPH"
@@ -121,6 +123,21 @@ def _npu_dit_wide_final_adaln_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_DIT_WIDE_FINAL_ADALN_ENV}={raw!r}")
+
+
+def _npu_dit_final_addcmul_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_FINAL_ADDCMUL_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_FINAL_ADDCMUL_ENV}={raw!r}")
 
 
 def _npu_dit_conv_mlp_graph_enabled(config_value: Any = None) -> bool:
@@ -460,6 +477,18 @@ def _dit_final_from_modulation(
     """Run the source final layer from a precomputed AdaLN modulation."""
     shift, scale = modulation.chunk(2, dim=-1)
     return output(norm(hidden) * (1 + scale) + shift)
+
+
+def _dit_final_from_modulation_addcmul(
+    hidden: torch.Tensor,
+    modulation: torch.Tensor,
+    norm: nn.Module,
+    output: nn.Module,
+) -> torch.Tensor:
+    """Run final AdaLN with one fewer eager elementwise launch."""
+    shift, scale = modulation.chunk(2, dim=-1)
+    normalized = norm(hidden)
+    return output(torch.addcmul(normalized + shift, normalized, scale))
 
 
 def _dit_attention_from_modulation(
@@ -1079,6 +1108,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_preamble_graph: Any = None,
         npu_dit_wide_adaln: Any = None,
         npu_dit_wide_final_adaln: Any = None,
+        npu_dit_final_addcmul: Any = None,
         npu_dit_conv_mlp_graph: Any = None,
         npu_dit_prompt_conv_mlp_graph: Any = None,
         npu_dit_full_block_graph: Any = None,
@@ -1162,6 +1192,10 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_wide_final_adaln_enabled = (
             _npu_dit_wide_final_adaln_enabled(npu_dit_wide_final_adaln)
         )
+        self._npu_dit_final_addcmul_enabled = _npu_dit_final_addcmul_enabled(
+            npu_dit_final_addcmul
+        )
+        self._npu_dit_final_addcmul_used = False
         self._npu_dit_wide_adaln_graph: Any | None = None
         self._npu_dit_wide_adaln_steps_graph: Any | None = None
         self._npu_dit_wide_final_adaln_steps_graph: Any | None = None
@@ -1249,6 +1283,11 @@ class BatchedToken2Wav(nn.Module):
             self._npu_dit_wide_final_adaln_enabled = False
             logger.warning(
                 "MiniCPM-o wide final AdaLN requires all-step wide AdaLN; disabling it"
+            )
+        if self._npu_dit_final_addcmul_enabled and not self._npu_dit_wide_final_adaln_enabled:
+            self._npu_dit_final_addcmul_enabled = False
+            logger.warning(
+                "MiniCPM-o final Addcmul requires wide final AdaLN; disabling it"
             )
         if self._npu_dit_wide_adaln_enabled and self._npu_dit_qkv_pack_enabled:
             self._npu_dit_qkv_pack_enabled = False
@@ -1518,14 +1557,69 @@ class BatchedToken2Wav(nn.Module):
                 block_drift,
                 final_drift,
             )
+            self._warmup_npu_dit_final_addcmul(
+                final_layer,
+                actual_final[0],
+            )
         except Exception:
             self._npu_dit_wide_final_adaln_enabled = False
+            self._npu_dit_final_addcmul_enabled = False
             self._npu_dit_wide_final_adaln_steps_graph = None
             self._npu_dit_wide_final_adaln_weight = None
             self._npu_dit_wide_final_adaln_bias = None
             logger.warning(
                 "MiniCPM-o wide final AdaLN compilation/parity gate failed; "
                 "retaining block-only wide AdaLN",
+                exc_info=True,
+            )
+
+    def _warmup_npu_dit_final_addcmul(
+        self,
+        final_layer: nn.Module,
+        modulation: torch.Tensor,
+    ) -> None:
+        if not self._npu_dit_final_addcmul_enabled:
+            return
+        try:
+            width = self._npu_dit_mlp_graph_width
+            hidden = torch.linspace(
+                -0.125,
+                0.125,
+                2 * width * 512,
+                device=modulation.device,
+                dtype=modulation.dtype,
+            ).reshape(2, width, 512)
+            expected = _dit_final_from_modulation(
+                hidden,
+                modulation,
+                final_layer.norm_final,
+                final_layer.linear,
+            )
+            actual = _dit_final_from_modulation_addcmul(
+                hidden,
+                modulation,
+                final_layer.norm_final,
+                final_layer.linear,
+            )
+            max_abs_drift = float((actual - expected).abs().max().item())
+            if (
+                not torch.isfinite(actual).all()
+                or max_abs_drift > _NPU_DIT_FINAL_ADDCMUL_MAX_ABS_DRIFT
+            ):
+                raise RuntimeError(
+                    "final Addcmul exceeded its startup drift bound: "
+                    f"max_abs_drift={max_abs_drift:.9g}, "
+                    f"limit={_NPU_DIT_FINAL_ADDCMUL_MAX_ABS_DRIFT:.9g}"
+                )
+            logger.info(
+                "Validated bounded-drift MiniCPM-o final Addcmul path; "
+                "max_abs_drift=%.9g",
+                max_abs_drift,
+            )
+        except Exception:
+            self._npu_dit_final_addcmul_enabled = False
+            logger.warning(
+                "MiniCPM-o final Addcmul parity gate failed; retaining canonical AdaLN",
                 exc_info=True,
             )
 
@@ -2852,6 +2946,30 @@ class BatchedToken2Wav(nn.Module):
 
         if precomputed_final_modulation is None:
             hidden = estimator.final_layer(hidden, time_embedding)
+        elif self._npu_dit_final_addcmul_enabled:
+            final_layer = estimator.final_layer
+            try:
+                hidden = _dit_final_from_modulation_addcmul(
+                    hidden,
+                    precomputed_final_modulation,
+                    final_layer.norm_final,
+                    final_layer.linear,
+                )
+                if not self._npu_dit_final_addcmul_used:
+                    logger.info("MiniCPM-o final Addcmul replay active")
+                    self._npu_dit_final_addcmul_used = True
+            except Exception:
+                self._npu_dit_final_addcmul_enabled = False
+                logger.warning(
+                    "MiniCPM-o final Addcmul replay failed; retaining canonical AdaLN",
+                    exc_info=True,
+                )
+                hidden = _dit_final_from_modulation(
+                    hidden,
+                    precomputed_final_modulation,
+                    final_layer.norm_final,
+                    final_layer.linear,
+                )
         else:
             final_layer = estimator.final_layer
             hidden = _dit_final_from_modulation(

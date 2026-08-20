@@ -16,6 +16,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_cache_major_post_attention_conv_mlp_residual,
     _dit_conv_mlp_residual,
     _dit_explicit_attention,
+    _dit_final_from_modulation,
+    _dit_final_from_modulation_addcmul,
     _dit_fused_conv_block_mlp_residual,
     _dit_fused_conv_linear_mlp_residual,
     _dit_fused_conv_mlp_residual,
@@ -27,6 +29,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_attn_cache_out_enabled,
     _npu_dit_cache_major_enabled,
     _npu_dit_conv_mlp_graph_enabled,
+    _npu_dit_final_addcmul_enabled,
     _npu_dit_full_block_cache_buckets,
     _npu_dit_full_block_graph_enabled,
     _npu_dit_full_stack_graph_enabled,
@@ -1148,6 +1151,45 @@ def test_npu_dit_wide_final_adaln_config_and_environment(monkeypatch):
     )
     with pytest.raises(ValueError, match="NPU_DIT_WIDE_FINAL_ADALN"):
         _npu_dit_wide_final_adaln_enabled()
+
+
+def test_npu_dit_final_addcmul_config_and_environment(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_FINAL_ADDCMUL",
+        raising=False,
+    )
+    assert _npu_dit_final_addcmul_enabled(True) is True
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_FINAL_ADDCMUL",
+        "off",
+    )
+    assert _npu_dit_final_addcmul_enabled(True) is False
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_FINAL_ADDCMUL",
+        "sometimes",
+    )
+    with pytest.raises(ValueError, match="NPU_DIT_FINAL_ADDCMUL"):
+        _npu_dit_final_addcmul_enabled()
+
+
+def test_dit_final_addcmul_matches_canonical_adaln():
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 5, 8)
+    modulation = torch.randn(2, 1, 16)
+    norm = nn.LayerNorm(8, elementwise_affine=False, eps=1e-6)
+    output = nn.Linear(8, 3)
+
+    expected = _dit_final_from_modulation(hidden, modulation, norm, output)
+    actual = _dit_final_from_modulation_addcmul(
+        hidden,
+        modulation,
+        norm,
+        output,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_dit_wide_adaln_steps_preserves_step_and_block_axes():

@@ -3860,3 +3860,73 @@ d084cf39a7ba8f6eb64cbd6d0d05e7226446f563a071df183751bc7dfe03eb17  candidate/benc
 25cbb569e702fc8287055ac92c6a7437acb83e32c15df39ceda09286ebe38cb3  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-030708.json
 f220ccc094043abd3002dadcca23fdbe82ddcb142e1a4b5b9880fd279d148a1b  candidate-service.log
 ```
+
+## Promoted final AdaLN Addcmul lowering
+
+After the all-step final projection landed, the remaining six-step CFM
+epilogue divided into 373.998 us of final LayerNorm/modulation and 488.405 us
+of output projection, CFG guidance, and Euler update. The canonical modulation
+`norm * (1 + scale) + shift` issues three eager elementwise operations after
+LayerNorm. Reassociating the same expression as
+`addcmul(norm + shift, norm, scale)` removes one launch and one intermediate
+without hiding the final 512-to-80 Cube GEMM from the native runtime.
+
+The real-checkpoint NPU-1 harness measured six canonical modulations at
+373.998 us and the Addcmul form at 308.726 us, a 17.45% reduction. The full
+six-step epilogue improved from 849.465 us to 788.316 us, or 7.20%. Maximum
+final-state drift was `2.38e-7`. Live startup separately measured `4.77e-7`
+maximum output drift and enables the path only below a fail-closed `1e-6`
+bound. A runtime exception disables only Addcmul and immediately retries the
+canonical AdaLN expression.
+
+Two broader alternatives were rejected in the same harness. Compiling the
+complete final-layer, CFG, and Euler boundary took 890--913 us instead of
+814--875 us. Moving CFG before the output projection was mathematically
+linear and bounded to `5.36e-7`, but the smaller batch-one GEMM lost Cube
+efficiency and did not beat the canonical path.
+
+Fresh candidate and accepted-control processes ran the same 32 fixed English
+Seed-TTS rows three times after two warmups, at concurrency one, seed zero,
+temperature zero, and CFM6. Every run completed 32/32 with zero failures and
+100% continuity while preserving 4,801 input tokens, 480 output tokens,
+3,362,880 frames, and 140.12 seconds of audio. Every candidate duration
+(43.858--44.764 seconds) was lower than every control duration
+(45.592--46.318 seconds). The table reports three-run medians; lower is
+better except for throughput.
+
+| Metric | Accepted control | Final Addcmul | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 45.859 s | 43.880 s | -4.32% |
+| Request throughput | 0.6978 req/s | 0.7293 req/s | +4.51% |
+| Mean / median / P99 E2E | 1,432.74 / 1,461.83 / 1,945.93 ms | 1,370.82 / 1,398.01 / 1,847.38 ms | -4.32% / -4.37% / -5.06% |
+| Mean / median / P99 TTFT | 316.50 / 320.61 / 453.20 ms | 317.49 / 322.12 / 454.62 ms | +0.31% / +0.47% / +0.31% |
+| Mean / median / P99 audio TTFP | 802.41 / 800.09 / 966.63 ms | 783.13 / 788.72 / 933.13 ms | -2.40% / -1.42% / -3.47% |
+| Mean / median / P99 chunk RTF | 0.334418 / 0.329847 / 0.435565 | 0.319463 / 0.316592 / 0.419713 | -4.47% / -4.02% / -3.64% |
+
+TTFT is produced by Stage 0 before this Stage-2-only path executes, and its
+three gates remain inside the two-percent variance guard. Every Stage-2 and
+end-to-end gate improves, so `npu_dit_final_addcmul` is enabled in the
+accepted prompt-width profile. The complete Code2Wav suite passed 89/89 and
+all relevant 910C configuration tests passed 29/29. Full Seed-TTS WER/SIM,
+Daily-Omni, and Video-MME remain part of final cumulative qualification; this
+bounded downstream rewrite cannot change the Stage-0 answers scored by the
+latter two suites.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-final-addcmul-20260820
+```
+
+Artifact checksums:
+
+```text
+54afb25588f5954e29948a725e07e90d4bd93120253223e648b9ecaa233553a5  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-052041.json
+c9ae1f377a90cb707d23e5f1631083d8132119b34d552a620e0dfec555abbe75  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-052239.json
+b5ac4d078e608eab1e9ecd0e017274621f316ac529c7299d74a935a83acc5158  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-052350.json
+ede3dacc001ad97dd7136e0e645d9e63b43638a253dbd5db6d2247d7dfd99980  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-051116.json
+df4547dd197ee25937c00ea127af8468ba794ec6fb21393181dc85da23d1d68f  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-051305.json
+09baabb4aa9a80f50bc887437c1631767380a1099aa22b2fb70db14ffacf4d1a  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-051410.json
+d66b3a364dafd85e3de0cdfd008319adce0ef655b0fc44609db4b883018c4f1b  candidate-service.log
+e6861eb526deed32f1c0b8741248824e3ba159436727d731c7535669c281283c  control-service.log
+```

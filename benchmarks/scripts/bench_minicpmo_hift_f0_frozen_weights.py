@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from flashcosyvoice.modules.hifigan import HiFTGenerator
 
 from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
@@ -88,6 +89,12 @@ def main() -> None:
         tensor for layer in convolutions for tensor in (layer.weight, layer.bias)
     )
     control_weights = tuple(weight.detach().clone() for weight in frozen_weights)
+    fractal_weights = tuple(
+        torch_npu.npu_format_cast(tensor.detach().contiguous(), 4)
+        if index % 2 == 0
+        else tensor
+        for index, tensor in enumerate(frozen_weights)
+    )
     linear_weights = tuple(
         tensor
         for layer in convolutions
@@ -123,6 +130,12 @@ def main() -> None:
         fullgraph=True,
         dynamic=False,
     )
+    fractal_graph = torch.compile(
+        _frozen_features,
+        backend=torchair.get_npu_backend(compiler_config=torchair.CompilerConfig()),
+        fullgraph=True,
+        dynamic=False,
+    )
     linearized_graph = torch.compile(
         _linearized_features,
         backend=torchair.get_npu_backend(compiler_config=torchair.CompilerConfig()),
@@ -132,10 +145,12 @@ def main() -> None:
 
     control_args = (value, *control_weights)
     frozen_args = (value, *frozen_weights)
+    fractal_args = (value, *fractal_weights)
     linearized_args = (value, *linear_weights)
     with torch.inference_mode():
         control = control_graph(*control_args)
         frozen = frozen_graph(*frozen_args)
+        fractal = fractal_graph(*fractal_args)
         linearized = linearized_graph(*linearized_args)
         expected = hift.f0_predictor.condnet(value)
         control_us = _measure(
@@ -147,6 +162,12 @@ def main() -> None:
         frozen_us = _measure(
             frozen_graph,
             frozen_args,
+            warmups=args.warmups,
+            iterations=args.iterations,
+        )
+        fractal_us = _measure(
+            fractal_graph,
+            fractal_args,
             warmups=args.warmups,
             iterations=args.iterations,
         )
@@ -166,11 +187,16 @@ def main() -> None:
                 "iterations": args.iterations,
                 "control_us": control_us,
                 "frozen_us": frozen_us,
+                "fractal_z_us": fractal_us,
                 "linearized_us": linearized_us,
                 "speedup": control_us / frozen_us,
+                "fractal_z_speedup": control_us / fractal_us,
                 "linearized_speedup": control_us / linearized_us,
                 "control_max_abs_error": float((control - expected).abs().max().item()),
                 "frozen_max_abs_error": float((frozen - expected).abs().max().item()),
+                "fractal_z_max_abs_error": float(
+                    (fractal - expected).abs().max().item()
+                ),
                 "linearized_max_abs_error": float(
                     (linearized - expected).abs().max().item()
                 ),

@@ -1,12 +1,10 @@
-# Atlas 800I A3 / Ascend 910C accepted prompt-width DiT graph profile.
+# Atlas 800I A3 / Ascend 910C all-step final AdaLN candidate.
 #
-# The established streaming path remains the 50-frame fused Conv+MLP graph.
-# Setup and finalization also produce stable 302- and 20-frame DiT shapes;
-# precompile their attention preamble and MLP partitions while retaining eager
-# convolution, including the uncached setup pass. Project the six fixed CFM
-# timesteps' 16 AdaLN modulation banks with one bounded-drift Cube GEMM.
+# Extend the accepted all-step, 16-block AdaLN Cube GEMM with the final DiT
+# layer's 1024-row modulation projection. Final normalization and the 512-to-80
+# output projection stay eager so GE retains their favorable native lowering.
 
-base_config: minicpmo_4_5_2npu_910c_cfm6_hift_f0_graph_experimental.yaml
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
 
 connectors:
   connector_of_shared_memory:

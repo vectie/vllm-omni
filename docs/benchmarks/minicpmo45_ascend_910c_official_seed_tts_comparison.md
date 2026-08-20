@@ -3789,3 +3789,74 @@ c6a8cdf8fc059530fb132f40e533941b63d7778e8e683f853aed67ba700dc3c0  candidate/benc
 45f35a3a611df007a169c92c841fa50078bd5f980ccd76a26d7bf19056fdad93  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260819-183155.json
 87018b83e590fb2449a81d8e81e31466608dcc4c937c57dc8f9586cced568a1d  /tmp/lunanexa-chunk32-width64-service-7.log
 ```
+
+## Promoted all-step final-layer AdaLN projection
+
+The accepted all-step AdaLN graph projected the six fixed CFM timesteps for
+all 16 DiT blocks, but `FinalLayer` still repeated its independent
+512-to-1024 time projection once per estimator step. The promoted graph packs
+that 17th projection below the existing 73,728 block rows. It returns the
+block bank and six final-layer modulation rows from the same Cube GEMM. The
+final normalization and 512-to-80 output projection remain eager; compiling
+those small operations made the isolated boundary 42.28% slower.
+
+The real-checkpoint NPU 1 screen measured the established block graph plus six
+complete eager final layers at 825.089 us median. Reusing the enlarged graph's
+final modulations while keeping the rest of `FinalLayer` eager took 687.107 us,
+a 16.72% latency reduction (1.201x speedup). Moving the whole final layer into
+a second graph took 1,173.949 us and was rejected. Maximum final-output drift
+was `7.15e-7`. Live startup independently measured block drift `0` and final
+modulation drift `8.34e-7`, below the fail-closed `1e-6` limit. A failure of
+the enlarged graph disables only the final-layer extension and retains the
+already accepted block-only graph.
+
+Fresh candidate and accepted-control processes ran the same 32 fixed English
+Seed-TTS rows three times after two warmups, at concurrency one, seed zero,
+temperature zero, and CFM6. Every run completed 32/32 with zero failures and
+100% continuity, preserving 4,801 input tokens, 480 output tokens, 3,362,880
+audio frames, and 140.12 seconds of audio. The table reports the median run
+value from each side. Lower is better except for throughput.
+
+| Metric | Accepted control | Wide final AdaLN | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 43.703 s | 43.574 s | -0.30% |
+| Request throughput | 0.7322 req/s | 0.7344 req/s | +0.30% |
+| Mean / median / P99 E2E | 1,365.29 / 1,408.63 / 1,830.56 ms | 1,361.37 / 1,391.91 / 1,828.12 ms | -0.29% / -1.19% / -0.13% |
+| Mean / median / P99 TTFT | 314.03 / 316.16 / 460.12 ms | 309.89 / 311.51 / 446.83 ms | -1.32% / -1.47% / -2.89% |
+| Mean / median / P99 audio TTFP | 778.09 / 775.11 / 920.83 ms | 773.71 / 775.56 / 917.14 ms | -0.56% / +0.06% / -0.40% |
+| Mean / median / P99 chunk RTF | 0.334470 / 0.183147 / 1.075928 | 0.333051 / 0.184201 / 1.068024 | -0.42% / +0.58% / -0.73% |
+
+All three paired duration runs improve, as do throughput and every primary
+mean and tail gate. Median TTFP and median chunk RTF regress by less than one
+percent and remain inside the two-percent guard. The candidate is therefore
+enabled in the accepted prompt-width profile. The full cached Seed-TTS,
+Daily-Omni, and Video-MME qualifications carry forward because the change is
+bounded by a real-checkpoint parity gate and leaves Stage-0 answers and output
+structure unchanged; all three suites are still rerun at the final release
+qualification.
+
+Two nearby ideas were closed before service A/B. Factoring the six 320-to-512
+DiT input projections into one invariant 240-channel projection plus six
+80-channel projections improved 230.375 us to only 221.708 us (3.91%) and
+introduced `0.0078125` maximum BF16 drift; its graph form took 802.082 us.
+Prepacking the five immutable HiFT F0 Conv1d weights as resident FRACTAL_Z was
+bit-exact but improved the full graph only 213.624 us to 211.168 us (1.16%).
+Both are retained only as reproducible benchmark screens.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-wide-final-adaln-20260820
+```
+
+Artifact checksums:
+
+```text
+5a4603f093fee36e61d6cc0760f337f4cd54fd1a646a61c38126e38741dd8000  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-025406.json
+898aa191a5c4d31959a1b76a159f9d791fdaf291b55a1e58d629227aa357642a  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-025554.json
+474ad8b1956ce4df308fbaa516c37c645e060ee0357f79c315919b7d6c981dfb  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-025658.json
+d084cf39a7ba8f6eb64cbd6d0d05e7226446f563a071df183751bc7dfe03eb17  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-030411.json
+575b4adc19eed5abe2914174e4001a11222a2545771924eba2e2cb62fe306225  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-030602.json
+25cbb569e702fc8287055ac92c6a7437acb83e32c15df39ceda09286ebe38cb3  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-030708.json
+f220ccc094043abd3002dadcca23fdbe82ddcb142e1a4b5b9880fd279d148a1b  candidate-service.log
+```

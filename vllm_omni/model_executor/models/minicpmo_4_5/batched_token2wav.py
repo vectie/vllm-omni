@@ -22,6 +22,9 @@ _NPU_DIT_MLP_GRAPH_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_MLP_GRAPH_WIDTH"
 _NPU_DIT_GRAPH_BUCKETS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS"
 _NPU_DIT_PREAMBLE_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PREAMBLE_GRAPH"
 _NPU_DIT_WIDE_ADALN_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_ADALN"
+_NPU_DIT_WIDE_FINAL_ADALN_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_FINAL_ADALN"
+)
 _NPU_DIT_WIDE_ADALN_MAX_ABS_DRIFT = 1.0e-6
 _NPU_DIT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CONV_MLP_GRAPH"
 _NPU_DIT_PROMPT_CONV_MLP_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_PROMPT_CONV_MLP_GRAPH"
@@ -103,6 +106,21 @@ def _npu_dit_wide_adaln_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_DIT_WIDE_ADALN_ENV}={raw!r}")
+
+
+def _npu_dit_wide_final_adaln_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_WIDE_FINAL_ADALN_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_WIDE_FINAL_ADALN_ENV}={raw!r}")
 
 
 def _npu_dit_conv_mlp_graph_enabled(config_value: Any = None) -> bool:
@@ -413,6 +431,35 @@ def _dit_wide_adaln_steps(
     """Project every fixed CFM timestep and DiT block in one Cube GEMM."""
     modulation = F.linear(F.silu(time_embeddings), packed_weight, packed_bias)
     return modulation.reshape(time_embeddings.shape[0], 2, 1, 16, 9 * 512)
+
+
+def _dit_wide_adaln_steps_with_final(
+    time_embeddings: torch.Tensor,
+    packed_weight: torch.Tensor,
+    packed_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project every block and the final layer for all fixed CFM timesteps."""
+    modulation = F.linear(F.silu(time_embeddings), packed_weight, packed_bias)
+    block_width = 16 * 9 * 512
+    block_modulation = modulation[..., :block_width].reshape(
+        time_embeddings.shape[0],
+        2,
+        1,
+        16,
+        9 * 512,
+    )
+    return block_modulation, modulation[..., block_width:]
+
+
+def _dit_final_from_modulation(
+    hidden: torch.Tensor,
+    modulation: torch.Tensor,
+    norm: nn.Module,
+    output: nn.Module,
+) -> torch.Tensor:
+    """Run the source final layer from a precomputed AdaLN modulation."""
+    shift, scale = modulation.chunk(2, dim=-1)
+    return output(norm(hidden) * (1 + scale) + shift)
 
 
 def _dit_attention_from_modulation(
@@ -1031,6 +1078,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_graph_buckets: Any = None,
         npu_dit_preamble_graph: Any = None,
         npu_dit_wide_adaln: Any = None,
+        npu_dit_wide_final_adaln: Any = None,
         npu_dit_conv_mlp_graph: Any = None,
         npu_dit_prompt_conv_mlp_graph: Any = None,
         npu_dit_full_block_graph: Any = None,
@@ -1111,8 +1159,12 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_wide_adaln_enabled = _npu_dit_wide_adaln_enabled(
             npu_dit_wide_adaln
         )
+        self._npu_dit_wide_final_adaln_enabled = (
+            _npu_dit_wide_final_adaln_enabled(npu_dit_wide_final_adaln)
+        )
         self._npu_dit_wide_adaln_graph: Any | None = None
         self._npu_dit_wide_adaln_steps_graph: Any | None = None
+        self._npu_dit_wide_final_adaln_steps_graph: Any | None = None
         self._npu_dit_wide_adaln_used = False
         self._npu_dit_wide_adaln_steps_used = False
         self.register_buffer(
@@ -1122,6 +1174,16 @@ class BatchedToken2Wav(nn.Module):
         )
         self.register_buffer(
             "_npu_dit_wide_adaln_bias",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_npu_dit_wide_final_adaln_weight",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_npu_dit_wide_final_adaln_bias",
             None,
             persistent=False,
         )
@@ -1182,6 +1244,11 @@ class BatchedToken2Wav(nn.Module):
             self._npu_dit_wide_adaln_enabled = False
             logger.warning(
                 "MiniCPM-o wide AdaLN requires the DiT preamble graph; disabling it"
+            )
+        if self._npu_dit_wide_final_adaln_enabled and not self._npu_dit_wide_adaln_enabled:
+            self._npu_dit_wide_final_adaln_enabled = False
+            logger.warning(
+                "MiniCPM-o wide final AdaLN requires all-step wide AdaLN; disabling it"
             )
         if self._npu_dit_wide_adaln_enabled and self._npu_dit_qkv_pack_enabled:
             self._npu_dit_qkv_pack_enabled = False
@@ -1374,6 +1441,11 @@ class BatchedToken2Wav(nn.Module):
                 max_abs_drift,
                 step_max_abs_drift,
             )
+            self._warmup_npu_dit_wide_final_adaln_graph(
+                estimator,
+                step_embeddings,
+                step_actual,
+            )
         except Exception:
             self._npu_dit_wide_adaln_enabled = False
             self._npu_dit_wide_adaln_graph = None
@@ -1382,6 +1454,78 @@ class BatchedToken2Wav(nn.Module):
             self._npu_dit_wide_adaln_bias = None
             logger.warning(
                 "MiniCPM-o wide AdaLN compilation/parity gate failed; using per-block projections",
+                exc_info=True,
+            )
+
+    def _warmup_npu_dit_wide_final_adaln_graph(
+        self,
+        estimator: nn.Module,
+        step_embeddings: torch.Tensor,
+        expected_blocks: torch.Tensor,
+    ) -> None:
+        if not self._npu_dit_wide_final_adaln_enabled:
+            return
+        try:
+            final_layer = estimator.final_layer
+            projection = final_layer.adaLN_modulation[1]
+            if (
+                not isinstance(projection, nn.Linear)
+                or tuple(projection.weight.shape) != (2 * 512, 512)
+                or projection.bias is None
+                or projection.weight.device.type != "npu"
+            ):
+                raise TypeError("final AdaLN projection is incompatible")
+            self._npu_dit_wide_final_adaln_weight = torch.cat(
+                (self._npu_dit_wide_adaln_weight, projection.weight.detach()),
+                dim=0,
+            ).contiguous()
+            self._npu_dit_wide_final_adaln_bias = torch.cat(
+                (self._npu_dit_wide_adaln_bias, projection.bias.detach()),
+                dim=0,
+            ).contiguous()
+            actual_blocks, actual_final = (
+                self._get_npu_dit_wide_final_adaln_steps_graph()(
+                    step_embeddings,
+                    self._npu_dit_wide_final_adaln_weight,
+                    self._npu_dit_wide_final_adaln_bias,
+                )
+            )
+            expected_final = torch.stack(
+                [
+                    final_layer.adaLN_modulation(step_embeddings[step])
+                    for step in range(self.n_timesteps)
+                ]
+            )
+            block_drift = float((actual_blocks - expected_blocks).abs().max().item())
+            final_drift = float((actual_final - expected_final).abs().max().item())
+            if (
+                not torch.isfinite(actual_blocks).all()
+                or not torch.isfinite(actual_final).all()
+                or block_drift > _NPU_DIT_WIDE_ADALN_MAX_ABS_DRIFT
+                or final_drift > _NPU_DIT_WIDE_ADALN_MAX_ABS_DRIFT
+            ):
+                raise RuntimeError(
+                    "wide final AdaLN exceeded its startup drift bound: "
+                    f"block_max_abs_drift={block_drift:.9g}, "
+                    f"final_max_abs_drift={final_drift:.9g}, "
+                    f"limit={_NPU_DIT_WIDE_ADALN_MAX_ABS_DRIFT:.9g}"
+                )
+            torch.npu.synchronize()
+            logger.info(
+                "Compiled bounded-drift MiniCPM-o all-step AdaLN graph for "
+                "16 blocks plus final layer; block_max_abs_drift=%.9g, "
+                "final_max_abs_drift=%.9g",
+                block_drift,
+                final_drift,
+            )
+        except Exception:
+            self._npu_dit_wide_final_adaln_enabled = False
+            self._npu_dit_wide_final_adaln_steps_graph = None
+            self._npu_dit_wide_final_adaln_weight = None
+            self._npu_dit_wide_final_adaln_bias = None
+            logger.warning(
+                "MiniCPM-o wide final AdaLN compilation/parity gate failed; "
+                "retaining block-only wide AdaLN",
                 exc_info=True,
             )
 
@@ -1412,6 +1556,20 @@ class BatchedToken2Wav(nn.Module):
                 dynamic=False,
             )
         return self._npu_dit_wide_adaln_steps_graph
+
+    def _get_npu_dit_wide_final_adaln_steps_graph(self):
+        if self._npu_dit_wide_final_adaln_steps_graph is None:
+            from torch_npu.dynamo import torchair
+
+            _ensure_torchair_broadcast_alias()
+            compiler_config = torchair.CompilerConfig()
+            self._npu_dit_wide_final_adaln_steps_graph = torch.compile(
+                _dit_wide_adaln_steps_with_final,
+                backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self._npu_dit_wide_final_adaln_steps_graph
 
     @staticmethod
     def _dit_preamble_compatible(block: nn.Module, width: int) -> bool:
@@ -2284,6 +2442,7 @@ class BatchedToken2Wav(nn.Module):
         cnn_out: torch.Tensor | None = None,
         att_out: torch.Tensor | None = None,
         wide_modulations: torch.Tensor | None = None,
+        final_modulation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
@@ -2397,6 +2556,7 @@ class BatchedToken2Wav(nn.Module):
                         conv_mlp_standard_weights,
                         full_block_graph_fn,
                         wide_modulations,
+                        final_modulation,
                     )
                     if not self._npu_dit_mlp_graph_used:
                         logger.info(
@@ -2499,6 +2659,7 @@ class BatchedToken2Wav(nn.Module):
         conv_mlp_standard_weights: bool = False,
         full_block_graph_fn: Any | None = None,
         precomputed_wide_modulations: torch.Tensor | None = None,
+        precomputed_final_modulation: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Replay enabled shape-bucketed partitions with exact eager fallbacks."""
         hidden = estimator.in_proj(estimator_input.transpose(1, 2))
@@ -2689,7 +2850,16 @@ class BatchedToken2Wav(nn.Module):
             if not attention_cache_written:
                 att_out[block_idx, :, :, : new_att.shape[2], :].copy_(new_att)
 
-        hidden = estimator.final_layer(hidden, time_embedding)
+        if precomputed_final_modulation is None:
+            hidden = estimator.final_layer(hidden, time_embedding)
+        else:
+            final_layer = estimator.final_layer
+            hidden = _dit_final_from_modulation(
+                hidden,
+                precomputed_final_modulation,
+                final_layer.norm_final,
+                final_layer.linear,
+            )
         return hidden.transpose(1, 2)
 
     @staticmethod
@@ -2837,27 +3007,48 @@ class BatchedToken2Wav(nn.Module):
         cond_cfg = self._cfg_pair("cond", cond, zero_unconditional=True)
         time_embeddings = self._estimator_time_embeddings(estimator, timeline, batch_size * 2)
         wide_modulation_steps: torch.Tensor | None = None
+        final_modulation_steps: torch.Tensor | None = None
         if self._npu_dit_wide_adaln_enabled:
-            try:
-                wide_modulation_steps = self._get_npu_dit_wide_adaln_steps_graph()(
-                    time_embeddings,
-                    self._npu_dit_wide_adaln_weight,
-                    self._npu_dit_wide_adaln_bias,
-                )
-                if not self._npu_dit_wide_adaln_steps_used:
-                    logger.info(
-                        "MiniCPM-o all-step wide AdaLN replay active for %d CFM steps x 16 blocks",
-                        self.n_timesteps,
+            if self._npu_dit_wide_final_adaln_enabled:
+                try:
+                    wide_modulation_steps, final_modulation_steps = (
+                        self._get_npu_dit_wide_final_adaln_steps_graph()(
+                            time_embeddings,
+                            self._npu_dit_wide_final_adaln_weight,
+                            self._npu_dit_wide_final_adaln_bias,
+                        )
                     )
-                    self._npu_dit_wide_adaln_steps_used = True
-            except Exception:
-                self._npu_dit_wide_adaln_enabled = False
-                self._npu_dit_wide_adaln_steps_graph = None
-                wide_modulation_steps = None
-                logger.warning(
-                    "MiniCPM-o all-step wide AdaLN replay failed; using per-block projections",
-                    exc_info=True,
+                except Exception:
+                    self._npu_dit_wide_final_adaln_enabled = False
+                    self._npu_dit_wide_final_adaln_steps_graph = None
+                    logger.warning(
+                        "MiniCPM-o all-step final AdaLN replay failed; retaining "
+                        "block-only wide AdaLN",
+                        exc_info=True,
+                    )
+            if wide_modulation_steps is None:
+                try:
+                    wide_modulation_steps = self._get_npu_dit_wide_adaln_steps_graph()(
+                        time_embeddings,
+                        self._npu_dit_wide_adaln_weight,
+                        self._npu_dit_wide_adaln_bias,
+                    )
+                except Exception:
+                    self._npu_dit_wide_adaln_enabled = False
+                    self._npu_dit_wide_adaln_steps_graph = None
+                    wide_modulation_steps = None
+                    logger.warning(
+                        "MiniCPM-o all-step wide AdaLN replay failed; using per-block projections",
+                        exc_info=True,
+                    )
+            if wide_modulation_steps is not None and not self._npu_dit_wide_adaln_steps_used:
+                logger.info(
+                    "MiniCPM-o all-step wide AdaLN replay active for %d CFM steps x "
+                    "16 blocks%s",
+                    self.n_timesteps,
+                    " plus final layer" if final_modulation_steps is not None else "",
                 )
+                self._npu_dit_wide_adaln_steps_used = True
         deltas = self._cfm_deltas_for(timeline)
         direct_cache_output = self._npu_cfm_stacked_cache_out_enabled and mu.device.type == "npu"
         stacked_cnn_out: torch.Tensor | None = None
@@ -2892,6 +3083,11 @@ class BatchedToken2Wav(nn.Module):
                 wide_modulations=(
                     wide_modulation_steps[step]
                     if wide_modulation_steps is not None
+                    else None
+                ),
+                final_modulation=(
+                    final_modulation_steps[step]
+                    if final_modulation_steps is not None
                     else None
                 ),
             )

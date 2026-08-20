@@ -22,6 +22,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_fused_full_block,
     _dit_mlp_residual,
     _dit_wide_adaln_steps,
+    _dit_wide_adaln_steps_with_final,
     _npu_cfm_stacked_cache_out_enabled,
     _npu_dit_attn_cache_out_enabled,
     _npu_dit_cache_major_enabled,
@@ -40,6 +41,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_prompt_conv_mlp_graph_enabled,
     _npu_dit_qkv_pack_enabled,
     _npu_dit_wide_adaln_enabled,
+    _npu_dit_wide_final_adaln_enabled,
     _npu_single_request_cache_passthrough_enabled,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
@@ -1127,6 +1129,27 @@ def test_npu_dit_wide_adaln_config_and_environment(monkeypatch):
         _npu_dit_wide_adaln_enabled()
 
 
+def test_npu_dit_wide_final_adaln_config_and_environment(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_FINAL_ADALN",
+        raising=False,
+    )
+    assert _npu_dit_wide_final_adaln_enabled(True) is True
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_FINAL_ADALN",
+        "off",
+    )
+    assert _npu_dit_wide_final_adaln_enabled(True) is False
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_WIDE_FINAL_ADALN",
+        "sometimes",
+    )
+    with pytest.raises(ValueError, match="NPU_DIT_WIDE_FINAL_ADALN"):
+        _npu_dit_wide_final_adaln_enabled()
+
+
 def test_dit_wide_adaln_steps_preserves_step_and_block_axes():
     time_embeddings = torch.empty(6, 2, 1, 512, device="meta")
     packed_weight = torch.empty(16 * 9 * 512, 512, device="meta")
@@ -1139,6 +1162,22 @@ def test_dit_wide_adaln_steps_preserves_step_and_block_axes():
     )
 
     assert actual.shape == (6, 2, 1, 16, 9 * 512)
+
+
+def test_dit_wide_adaln_steps_with_final_splits_projection_rows():
+    time_embeddings = torch.empty(6, 2, 1, 512, device="meta")
+    output_width = 16 * 9 * 512 + 2 * 512
+    packed_weight = torch.empty(output_width, 512, device="meta")
+    packed_bias = torch.empty(output_width, device="meta")
+
+    blocks, final = _dit_wide_adaln_steps_with_final(
+        time_embeddings,
+        packed_weight,
+        packed_bias,
+    )
+
+    assert blocks.shape == (6, 2, 1, 16, 9 * 512)
+    assert final.shape == (6, 2, 1, 2 * 512)
 
 
 def test_npu_dit_conv_mlp_graph_config_and_environment(monkeypatch):

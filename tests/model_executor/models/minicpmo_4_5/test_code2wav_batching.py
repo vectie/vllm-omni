@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_cache_major_enabled,
     _npu_dit_conv_mlp_graph_enabled,
     _npu_dit_final_addcmul_enabled,
+    _npu_dit_fused_final_adaln_enabled,
     _npu_dit_full_block_cache_buckets,
     _npu_dit_full_block_graph_enabled,
     _npu_dit_full_stack_graph_enabled,
@@ -1172,6 +1173,27 @@ def test_npu_dit_final_addcmul_config_and_environment(monkeypatch):
     )
     with pytest.raises(ValueError, match="NPU_DIT_FINAL_ADDCMUL"):
         _npu_dit_final_addcmul_enabled()
+
+
+def test_npu_dit_fused_final_adaln_config_and_environment(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_FINAL_ADALN",
+        raising=False,
+    )
+    assert _npu_dit_fused_final_adaln_enabled(True) is True
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_FINAL_ADALN",
+        "off",
+    )
+    assert _npu_dit_fused_final_adaln_enabled(True) is False
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_FINAL_ADALN",
+        "sometimes",
+    )
+    with pytest.raises(ValueError, match="NPU_DIT_FUSED_FINAL_ADALN"):
+        _npu_dit_fused_final_adaln_enabled()
 
 
 def test_dit_final_addcmul_matches_canonical_adaln():

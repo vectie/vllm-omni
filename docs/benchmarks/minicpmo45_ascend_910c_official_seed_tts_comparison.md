@@ -4095,3 +4095,71 @@ b5db1c13a83830d1f2f18ce1ebea061f62bdba10aab99a1c7b3f2385f903c95e  control/bench_
 3dc04960a7511607d810a99c5f1d4aaacaba6683ccf5762d8e6b5136365e63ce  isolated-fp32.log
 ba28ab6f3352c9765db4b8e6b5f3c43a4e3042de1afd5ad7d3e9fcc7c67c4fd0  isolated-bf16.log
 ```
+
+### Fix: fail-closed device-time usefulness gate
+
+The rejected graph originally used correctness as its only startup promotion
+gate. That was insufficient: its isolated win was genuine but too small to
+survive the live scheduling boundary. The implementation now times the loaded
+checkpoint's accepted and fused regions with NPU events after compilation,
+using five alternating trials of 20 replays. Promotion requires both at least
+`1.10x` speedup and at least 200 us absolute saving per CFM step. Failure of
+either condition discards the fused callable before serving traffic; the
+accepted Conv+MLP, final Addcmul, CFG, and Euler path remains active.
+
+On the Atlas 800I A3 / 910C host, the startup gate measured 366.860 us for the
+accepted region and 287.193 us for the fused region: `1.2774x`, but only
+79.667 us saved. It therefore rejected the graph on the absolute-headroom
+criterion. This fixes the regression without pretending that a microbenchmark
+win is a deployable serving win.
+
+An adjacent, fully warmed 12-row Stage benchmark compared the active fused
+process with a fresh process where the usefulness gate selected the accepted
+fallback. Both sides preserved 1,804 input tokens, 183 output tokens, 1,252,800
+audio frames, 52.2 seconds of audio, zero failures, and 100% continuity.
+
+| Metric | Active fused graph | Gated accepted fallback | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 17.289 s | 16.594 s | -4.02% |
+| Request throughput | 0.6941 req/s | 0.7231 req/s | +4.19% |
+| Mean / median / P99 E2E | 1,440.19 / 1,411.47 / 1,784.75 ms | 1,382.38 / 1,404.97 / 1,793.04 ms | -4.01% / -0.46% / +0.46% |
+| Mean Stage-2 generation time | 1,437.46 ms | 1,385.04 ms | -3.65% |
+| Mean / median / P99 TTFT | 320.54 / 318.09 / 454.53 ms | 319.89 / 311.09 / 467.23 ms | -0.20% / -2.20% / +2.79% |
+| Mean / median / P99 audio TTFP | 803.80 / 789.80 / 954.73 ms | 800.62 / 781.50 / 976.46 ms | -0.40% / -1.05% / +2.28% |
+| Mean / median / P99 whole-audio RTF | 0.338513 / 0.324029 / 0.415314 | 0.323665 / 0.324948 / 0.377660 | -4.39% / +0.28% / -9.07% |
+
+The tail TTFT/TTFP changes are upstream variance: Stage 2 cannot affect text
+TTFT, and both are based on only 12 rows. The causal signal is the Stage-2
+mean plus serving-duration/throughput/mean-RTF recovery. This run is used only
+to validate the fallback decision, not to promote a new speed claim.
+
+The gated process then completed three full 32-row Seed-TTS runs. Every run
+preserved the official structural signature: 4,801 input tokens, 480 output
+tokens, 3,362,880 frames, 140.12 seconds of audio, 32/32 successes, zero
+failures, and 100% streaming continuity. Componentwise medians were 44.949 s
+duration, 0.7119 requests/s, 1,404.25 ms mean E2E, 315.21 ms mean TTFT,
+801.52 ms mean TTFP, 0.328143 mean whole-audio RTF, and 0.345399 mean chunk
+RTF. These are fallback validation results; they are not compared with the
+earlier process epoch as a performance A/B.
+
+The focused Code2Wav and 910C configuration selection completed 182/182 tests.
+The graph is still available for future larger boundaries, but this exact
+last-block region can no longer become a live regression on hardware where it
+lacks enough absolute device-time budget.
+
+Fix artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-last-block-fix-20260820
+```
+
+Selected checksums:
+
+```text
+be038c461e02e329794e9cb05c6a832c393e18add0d52e5df704e56ae436334b  gated-service.log
+7bffb228c4579a6ff55d0ddc4184bb1a639dc43c5073d68bbc140a1ece6a0b46  candidate-stage-warm/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-094558.json
+c10431541585f505a4f84be318efff1ed5785e4ec5a402463022fd7e09b4a63a  gated-stage-warm/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-095921.json
+a2de666b40257368c34ddebd15b08e1640b670091d14dc4025cf05cde1bafbb1  gated-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-100016.json
+fd03982e17a31d8b347c33afd57c61b9940e26386008b7c7f7a07075165f5c31  gated-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-100149.json
+b4fd1f38c896e07e547e1281b43c536ebe48a65a36293d9f56c97c5009d5339d  gated-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-100310.json
+```

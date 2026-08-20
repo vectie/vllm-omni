@@ -4002,3 +4002,96 @@ c900e841f9dc6c01701a812b3af03656cf75f083331ad3f1314bbc1ed2effc09  candidate/cand
 835ce8779f1a7493c0c4e6193f99073069b6cfe99d9dfe735a8ea025b18160be  candidate-service.log
 f0c3c2de53a1da9a7dc55d227db8d9626b68a7f8ec8115ab5b8b933a563d1137  control-service.log
 ```
+
+## Rejected GE-visible last-block-to-Euler megagraph
+
+The next experiment removed the opaque ACLNN island and instead enlarged the
+already accepted TorchAir/GE replay. For the steady `[2,50,512]` CFM shape,
+the last DiT block's causal-pack Conv, MLP residual, affine-free final
+LayerNorm, AdaLN Addcmul, 512-to-80 output projection, CFG reduction, and
+Euler state update execute as one static graph. This removes a Python/ACLNN
+boundary without hiding operations from GE. Prompt and tail widths retain the
+accepted split path.
+
+The implementation is guarded by
+`npu_dit_last_block_final_euler_graph` (or
+`VLLM_OMNI_MINICPMO45_NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH`) and the explicit
+profile:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_last_block_final_euler_graph_experimental.yaml
+benchmarks/scripts/bench_minicpmo_dit_last_block_final_euler.py
+```
+
+It requires the accepted causal-pack Conv+MLP, wide final AdaLN, and final
+Addcmul profile. Incompatible layouts fail closed. Startup compares the new
+graph with the accepted graph using loaded model tensors, rejects non-finite
+outputs, and enforces `0.005` maximum / `0.0005` mean state drift plus
+`0.005` cache drift. A runtime failure disables only this extension and
+immediately replays the accepted Conv+MLP and final path.
+
+The corrected real-checkpoint FP32 NPU-1 harness used nine alternating trials,
+20 warmups, and 100 timed iterations. It reduced the fused region from
+358.774 us to 298.390 us, a 1.2024x speedup. State maximum/mean drift was
+`5.96e-8` / `6.17e-9`, and cache drift was zero. The live startup gate measured
+`1.04e-7` maximum and `1.40e-8` mean state drift with zero cache drift, then
+logged that the last-block-to-Euler replay was active. A BF16 screening run
+also improved 343.948 us to 240.365 us (1.4309x), but is not the serving dtype
+and is recorded only to prevent that result from being mistaken for the live
+projection.
+
+The isolated FP32 saving is only 60.384 us per CFM step. Even across six steps
+and several streamed chunks, its projected request saving is around one to two
+milliseconds, far below the roughly 1.3-second end-to-end request time. The
+larger graph therefore needed a live promotion result; the microbenchmark was
+not sufficient evidence.
+
+Fresh candidate and accepted-control processes each ran the same 32 fixed
+English Seed-TTS rows three times after three warmups, at concurrency one,
+seed zero, temperature zero, and CFM6. Every run completed 32/32 with zero
+failures and 100% continuity while preserving 4,801 input tokens, 480 output
+tokens, 3,362,880 audio frames, and 140.12 seconds of audio. The table reports
+componentwise three-run medians; lower is better except for throughput.
+
+| Metric | Accepted control | Last-block-to-Euler | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.472 s | 43.859 s | +5.76% |
+| Request throughput | 0.7716 req/s | 0.7296 req/s | -5.44% |
+| Mean / median / P99 E2E | 1,295.62 / 1,326.78 / 1,745.15 ms | 1,370.09 / 1,407.12 / 1,838.94 ms | +5.75% / +6.05% / +5.37% |
+| Mean / median / P99 TTFT | 315.60 / 316.72 / 455.62 ms | 322.79 / 330.39 / 462.01 ms | +2.28% / +4.32% / +1.40% |
+| Mean / median / P99 audio TTFP | 757.68 / 768.45 / 916.55 ms | 786.40 / 794.05 / 928.96 ms | +3.79% / +3.33% / +1.35% |
+| Mean / median / P99 whole-audio RTF | 0.303011 / 0.305925 / 0.400238 | 0.319225 / 0.319531 / 0.426683 | +5.35% / +4.45% / +6.61% |
+| Mean / median / P99 chunk RTF | 0.319334 / 0.142588 / 1.021162 | 0.335713 / 0.181280 / 1.050555 | +5.13% / +27.14% / +2.88% |
+
+The candidate fails every primary Stage-2 and end-to-end promotion gate and is
+not enabled in the accepted prompt-width profile. Because the expected saving
+is much smaller than process-level variance, this experiment does not prove
+that the fused graph itself causes the entire five-percent difference. It does
+prove that absorbing only the last block's epilogue cannot deliver a stable,
+measurable serving win on this stack. The accepted service remains active.
+
+The next lower-layer attempt should target a region with an order-of-magnitude
+larger budget: multiple DiT blocks in one GE replay, attention-to-Conv producer
+fusion without cache-layout conversions, or the complete six-step CFM loop.
+Each needs live-FP32 isolated accounting before another service A/B.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-last-block-final-euler-20260820
+```
+
+Artifact checksums:
+
+```text
+0601fa1e7070a8895f00ee35558eaea85a737a64841c66a55924e819b703e5a7  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-073717.json
+71b4f4bcdbf61d69e65b41416beb2a0452c73cb108a0b734287ca4c81faa084d  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-073914.json
+2e727366836606998ae302cb38c08865c4650807c5bbd2269f5033cb3af057ca  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-074023.json
+0af451c226f974bf64ed246a6279f475f693fff8d3361abd3cb05c00f1912440  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-074808.json
+4b18afd3e0743df5abcf5336fe2ae9aec1cdab8a55e06b6b528310ae3b2665a2  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-075001.json
+b5db1c13a83830d1f2f18ce1ebea061f62bdba10aab99a1c7b3f2385f903c95e  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-075107.json
+597260dc2c65fd1986ac75b0cd34258df373ce301e2e865e483ab573d88039cb  candidate-service.log
+6d01e1d090d75b0de089fa4bf4fb448905fd2b1690747c960fd26fc2ff065957  control-service.log
+3dc04960a7511607d810a99c5f1d4aaacaba6683ccf5762d8e6b5136365e63ce  isolated-fp32.log
+ba28ab6f3352c9765db4b8e6b5f3c43a4e3042de1afd5ad7d3e9fcc7c67c4fd0  isolated-bf16.log
+```

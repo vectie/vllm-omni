@@ -98,11 +98,14 @@ This captures the failure mode where `RTF_p50 < 1` (server keeps up in
 aggregate) but per-stream chunk arrival is bursty enough that listeners
 still hear gaps - common at high concurrency on streaming TTS pipelines.
 
-#### Add WER / SIM / UTMOS to any of the above
+#### Add WER, SIM, or UTMOS to any of the above
 
-Append `--seed-tts-wer-eval` (and optionally `SEED_TTS_EVAL_DEVICE=cuda:0`
-in the env, per PR #2558). This triggers the seed-tts-eval protocol:
-Whisper-large-v3 ASR → WER, WavLM embeddings → SIM, balacoon/utmos → UTMOS.
+Append `--seed-tts-wer-eval` for Whisper-large-v3 ASR → WER. Add
+`--seed-tts-sim-eval` for WavLM embeddings → SIM; this flag also enables
+the PCM/ASR path needed by the evaluator. UTMOS is independently opt-in with
+`SEED_TTS_UTMOS_EVAL=1` alongside either evaluation flag. The convenience
+wrapper exposes the first two as `--wer-eval` and `--sim-eval` so a missing
+SIM run cannot be mistaken for a complete quality screen.
 
 ### 3. Convenience wrapper (`bench_tts.py`)
 
@@ -129,12 +132,12 @@ python benchmarks/tts/bench_tts.py \
     --num-prompts 20 \
     --output-dir ./results
 
-# With WER / SIM / UTMOS quality eval (adds ASR + embedding compute)
+# With WER + SIM quality evaluation (adds ASR + embedding compute)
 python benchmarks/tts/bench_tts.py \
     --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --task voice_clone \
     --dataset-path /path/to/seed-tts-eval \
-    --wer-eval \
+    --wer-eval --sim-eval \
     --concurrency 4 --num-prompts 200 \
     --output-dir ./results
 ```

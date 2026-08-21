@@ -815,6 +815,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             npu_cfm_stacked_cache_out=extra.get("npu_cfm_stacked_cache_out"),
             npu_cfm_fixed_kv_slabs=extra.get("npu_cfm_fixed_kv_slabs"),
             npu_cfm_planar_kv_slabs=extra.get("npu_cfm_planar_kv_slabs"),
+            npu_dit_bsh_attention=extra.get("npu_dit_bsh_attention"),
             npu_single_request_cache_passthrough=extra.get(
                 "npu_single_request_cache_passthrough"
             ),

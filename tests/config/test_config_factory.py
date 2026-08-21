@@ -2615,8 +2615,33 @@ class TestPlatformOverrides:
         )
         assert deploy.connectors is not None
         extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_dit_wide_adaln"] is True
         assert extra["npu_cfm_fixed_kv_slabs"] is True
         assert extra["npu_cfm_planar_kv_slabs"] is True
+        assert extra["npu_dit_compute_dtype"] == "bf16"
+        assert extra["npu_cfm_integration_dtype"] == "bf16"
+
+    def test_minicpmo_4_5_910c_bsh_attention_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_bsh_attention_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(deploy_path), platform="npu"
+        )
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_dit_wide_adaln"] is True
+        assert extra["npu_dit_wide_final_adaln"] is True
+        assert extra["npu_cfm_fixed_kv_slabs"] is True
+        assert extra["npu_cfm_planar_kv_slabs"] is True
+        assert extra["npu_dit_bsh_attention"] is True
         assert extra["npu_dit_compute_dtype"] == "bf16"
         assert extra["npu_cfm_integration_dtype"] == "bf16"
 

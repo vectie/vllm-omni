@@ -8,8 +8,10 @@ import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    BatchedToken2WavState,
     _dit_attention_cache_length,
     _dit_attention_preamble,
+    _dit_attention_preamble_bsh_from_modulation,
     _dit_attention_preamble_from_modulation,
     _dit_attention_preamble_fused_qkv_from_modulation,
     _dit_attention_preamble_qkv_pack,
@@ -32,6 +34,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_cfm_planar_kv_slabs_enabled,
     _npu_cfm_stacked_cache_out_enabled,
     _npu_dit_attn_cache_out_enabled,
+    _npu_dit_bsh_attention_enabled,
     _npu_dit_cache_major_enabled,
     _npu_dit_compute_dtype,
     _npu_dit_conv_mlp_graph_enabled,
@@ -659,6 +662,52 @@ def test_dit_attention_preamble_fused_qkv_matches_standard_partition(width: int)
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("width", [20, 50])
+def test_dit_attention_preamble_bsh_matches_standard_partition(width: int):
+    torch.manual_seed(23)
+    x = torch.randn(2, width, 512)
+    modulation = torch.randn(2, 1, 9 * 512)
+    to_q = nn.Linear(512, 512)
+    to_k = nn.Linear(512, 512)
+    to_v = nn.Linear(512, 512)
+    q_norm = nn.LayerNorm(64)
+    k_norm = nn.LayerNorm(64)
+
+    actual = _dit_attention_preamble_bsh_from_modulation(
+        x,
+        modulation,
+        to_q.weight,
+        to_q.bias,
+        to_k.weight,
+        to_k.bias,
+        to_v.weight,
+        to_v.bias,
+        q_norm.weight,
+        q_norm.bias,
+        k_norm.weight,
+        k_norm.bias,
+    )
+    expected = _dit_attention_preamble_from_modulation(
+        x,
+        modulation,
+        to_q.weight,
+        to_q.bias,
+        to_k.weight,
+        to_k.bias,
+        to_v.weight,
+        to_v.bias,
+        q_norm.weight,
+        q_norm.bias,
+        k_norm.weight,
+        k_norm.bias,
+    )
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    for bsh, bhsd in zip(actual[1:], expected[1:], strict=True):
+        reference = bhsd.transpose(1, 2).reshape(2, width, 512)
+        torch.testing.assert_close(bsh, reference, rtol=0, atol=0)
+
+
 def test_attention_from_projected_qkv_matches_cached_sdpa_math():
     torch.manual_seed(12)
     attention = SimpleNamespace(proj=nn.Linear(512, 512), proj_drop=nn.Identity())
@@ -718,6 +767,53 @@ def test_planar_attention_from_projected_qkv_matches_legacy_cache_math():
         atol=0,
     )
     assert actual_cache is planar_output
+    assert actual_cache.select(0, 0).is_contiguous()
+    assert actual_cache.select(0, 1).is_contiguous()
+
+
+def test_bsh_planar_attention_matches_legacy_cache_math():
+    torch.manual_seed(29)
+    attention = SimpleNamespace(
+        num_heads=8,
+        head_dim=64,
+        proj=nn.Linear(512, 512),
+        proj_drop=nn.Identity(),
+    )
+    q_bhsd = torch.randn(2, 8, 50, 64)
+    k_bhsd = torch.randn(2, 8, 50, 64)
+    v_bhsd = torch.randn(2, 8, 50, 64)
+    legacy_cache = torch.randn(2, 8, 7, 128)
+    cached_k, cached_v = legacy_cache.chunk(2, dim=-1)
+
+    def to_bsh(value: torch.Tensor) -> torch.Tensor:
+        return value.transpose(1, 2).reshape(2, value.shape[2], 512)
+
+    bsh_cache = torch.stack((to_bsh(cached_k), to_bsh(cached_v)), dim=0)
+    bsh_output = torch.empty(2, 2, 57, 512)
+    expected, expected_cache = BatchedToken2Wav._attention_from_projected_qkv(
+        attention, q_bhsd, k_bhsd, v_bhsd, legacy_cache
+    )
+    actual, actual_cache = (
+        BatchedToken2Wav._attention_from_projected_qkv_bsh_planar(
+            attention,
+            to_bsh(q_bhsd),
+            to_bsh(k_bhsd),
+            to_bsh(v_bhsd),
+            bsh_cache,
+            bsh_output,
+        )
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        BatchedToken2Wav._legacy_att_cache_from_bsh_planar(
+            actual_cache, 8, 64
+        ),
+        expected_cache,
+        rtol=0,
+        atol=0,
+    )
+    assert actual_cache is bsh_output
     assert actual_cache.select(0, 0).is_contiguous()
     assert actual_cache.select(0, 1).is_contiguous()
 
@@ -1633,6 +1729,24 @@ def test_npu_cfm_planar_kv_slabs_config_and_environment(monkeypatch):
         _npu_cfm_planar_kv_slabs_enabled()
 
 
+def test_npu_dit_bsh_attention_config_and_environment(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_BSH_ATTENTION", raising=False
+    )
+    assert _npu_dit_bsh_attention_enabled(True) is True
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_BSH_ATTENTION", "off"
+    )
+    assert _npu_dit_bsh_attention_enabled(True) is False
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_DIT_BSH_ATTENTION", "sometimes"
+    )
+    with pytest.raises(ValueError, match="NPU_DIT_BSH_ATTENTION"):
+        _npu_dit_bsh_attention_enabled()
+
+
 def test_npu_single_request_cache_passthrough_config_and_environment(monkeypatch):
     monkeypatch.delenv(
         "VLLM_OMNI_MINICPMO45_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH",
@@ -1742,6 +1856,41 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
             round_tripped["estimator_att_cache"],
             original.flow_cache["estimator_att_cache"],
         )
+
+
+def test_bsh_estimator_cache_split_and_stack_use_cfg_axis():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    # Match the real MiniCPM-o DiT attention geometry used by BSH detection
+    # and by the conversion back to the canonical BHSD cache.
+    adapter.flow.decoder.estimator.blocks[0].attn.num_heads = 8
+    adapter.flow.decoder.estimator.blocks[0].attn.head_dim = 64
+    adapter._npu_dit_bsh_attention_enabled = True
+    cache = {
+        "conformer_cnn_cache": torch.randn(2, 4, 3),
+        "conformer_att_cache": torch.randn(2, 2, 4, 3),
+        "estimator_cnn_cache": torch.randn(6, 16, 4, 1024, 2),
+        "estimator_att_cache": torch.randn(6, 16, 2, 4, 5, 512),
+    }
+
+    split = adapter._split_flow_cache(cache, 2)
+    for row, flow in enumerate(split):
+        expected_bsh = torch.cat(
+            (
+                cache["estimator_att_cache"][:, :, :, row : row + 1],
+                cache["estimator_att_cache"][:, :, :, 2 + row : 3 + row],
+            ),
+            dim=3,
+        )
+        torch.testing.assert_close(flow["estimator_att_cache"], expected_bsh)
+
+    states = [
+        BatchedToken2WavState(flow_cache=flow, hift_cache={}) for flow in split
+    ]
+    stacked = adapter._stack_flow_cache(states)
+    expected_legacy = BatchedToken2Wav._legacy_att_cache_from_bsh_planar(
+        cache["estimator_att_cache"], 8, 64
+    )
+    torch.testing.assert_close(stacked["estimator_att_cache"], expected_legacy)
 
 
 def test_single_request_cache_passthrough_preserves_storage():
@@ -1871,6 +2020,61 @@ def test_fixed_estimator_slabs_keep_cnn_cache_major_across_eager_tail():
         advanced.cnn_banks[advanced.active_cnn_bank],
         eager_tail_cnn.transpose(-2, -1),
     )
+
+
+def test_bsh_estimator_kv_slabs_preserve_legacy_cache_and_addresses():
+    torch.manual_seed(31)
+    attention = torch.randn(6, 16, 2, 8, 4, 128)
+    cnn = torch.randn(6, 16, 2, 1024, 2)
+    slabs = BatchedToken2Wav._make_fixed_estimator_kv_slabs(
+        attention,
+        cnn,
+        4,
+        bsh_attention=True,
+    )
+
+    assert slabs is not None
+    assert slabs.planar is True
+    assert slabs.bsh_attention is True
+    assert slabs.retained.shape == (6, 16, 2, 2, 104, 512)
+    assert slabs.append.shape == (6, 16, 2, 2, 154, 512)
+    retained_address = slabs.retained.data_ptr()
+    append_address = slabs.append.data_ptr()
+    restored = BatchedToken2Wav._legacy_att_cache_from_bsh_planar(
+        slabs.retained[..., :4, :], 8, 64
+    )
+    torch.testing.assert_close(restored, attention, rtol=0, atol=0)
+
+    # The accepted profile also carries the older planar flag. Once the first
+    # prompt decode already emitted BSH storage, that flag must not reinterpret
+    # the 512-wide sequence-major axis as another packed K/V axis.
+    bsh_source = slabs.retained[..., :4, :].clone()
+    inherited_planar_slabs = BatchedToken2Wav._make_fixed_estimator_kv_slabs(
+        bsh_source,
+        cnn,
+        4,
+        planar=True,
+        bsh_attention=True,
+    )
+    assert inherited_planar_slabs is not None
+    assert inherited_planar_slabs.retained.shape == (6, 16, 2, 2, 104, 512)
+    torch.testing.assert_close(
+        inherited_planar_slabs.retained[..., :4, :],
+        bsh_source,
+        rtol=0,
+        atol=0,
+    )
+
+    output = slabs.append[..., :6, :]
+    output.copy_(torch.randn_like(output))
+    advanced = BatchedToken2Wav._advance_fixed_estimator_kv_slabs(
+        slabs,
+        output,
+        torch.randn_like(cnn),
+    )
+    assert advanced.bsh_attention is True
+    assert advanced.retained.data_ptr() == retained_address
+    assert advanced.append.data_ptr() == append_address
 
 
 def test_planar_estimator_kv_slabs_are_exact_and_keep_addresses():

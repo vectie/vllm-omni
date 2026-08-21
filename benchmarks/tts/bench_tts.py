@@ -86,6 +86,7 @@ def build_bench_args(
     concurrency: int | None,
     dataset_path: str | None,
     wer_eval: bool,
+    sim_eval: bool,
     output_dir: str | None,
     result_filename: str | None,
     extra_cli_args: list[str],
@@ -147,6 +148,8 @@ def build_bench_args(
 
     if wer_eval:
         cmd.append("--seed-tts-wer-eval")
+    if sim_eval:
+        cmd.append("--seed-tts-sim-eval")
 
     if output_len is not None:
         cmd += ["--hf-output-len", str(output_len)]
@@ -250,7 +253,12 @@ def main() -> None:
     parser.add_argument(
         "--dataset-path", default=None, help="Root of seed-tts-eval dataset (required for voice_clone/default_voice)"
     )
-    parser.add_argument("--wer-eval", action="store_true", help="Enable WER/SIM/UTMOS quality eval")
+    parser.add_argument("--wer-eval", action="store_true", help="Enable Seed-TTS ASR/WER quality evaluation")
+    parser.add_argument(
+        "--sim-eval",
+        action="store_true",
+        help="Enable Seed-TTS WavLM speaker-similarity evaluation (also captures audio for WER)",
+    )
     parser.add_argument("--output-dir", default=None, help="Directory to save result JSON files")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
@@ -317,6 +325,7 @@ def main() -> None:
                 concurrency=concurrency,
                 dataset_path=args.dataset_path,
                 wer_eval=args.wer_eval,
+                sim_eval=args.sim_eval,
                 output_dir=args.output_dir,
                 result_filename=result_filename,
                 extra_cli_args=extra_cli_args,

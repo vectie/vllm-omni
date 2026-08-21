@@ -73,6 +73,7 @@ def test_build_bench_args_voice_clone(model_configs_path: Path) -> None:
         concurrency=1,
         dataset_path="/data/seed-tts",
         wer_eval=False,
+        sim_eval=False,
         output_dir=None,
         result_filename=None,
         extra_cli_args=[],
@@ -100,6 +101,7 @@ def test_build_bench_args_default_voice_has_voice_param(model_configs_path: Path
         concurrency=1,
         dataset_path="/data/seed-tts",
         wer_eval=False,
+        sim_eval=False,
         output_dir=None,
         result_filename=None,
         extra_cli_args=[],
@@ -125,11 +127,35 @@ def test_build_bench_args_wer_eval_adds_flag(model_configs_path: Path) -> None:
         concurrency=1,
         dataset_path="/data/seed-tts",
         wer_eval=True,
+        sim_eval=False,
         output_dir=None,
         result_filename=None,
         extra_cli_args=[],
     )
     assert "--seed-tts-wer-eval" in cmd
+    assert "--seed-tts-sim-eval" not in cmd
+
+
+def test_build_bench_args_sim_eval_adds_flag(model_configs_path: Path) -> None:
+    configs = bench_tts.load_model_configs(model_configs_path)
+    cmd = bench_tts.build_bench_args(
+        host="localhost",
+        port=8000,
+        model="test/ModelA",
+        served_model_name=None,
+        task="voice_clone",
+        model_cfg=configs["test/ModelA"],
+        locale="en",
+        num_prompts=10,
+        concurrency=1,
+        dataset_path="/data/seed-tts",
+        wer_eval=False,
+        sim_eval=True,
+        output_dir=None,
+        result_filename=None,
+        extra_cli_args=[],
+    )
+    assert "--seed-tts-sim-eval" in cmd
 
 
 def test_unsupported_task_exits(model_configs_path: Path, capsys: pytest.CaptureFixture, mocker) -> None:

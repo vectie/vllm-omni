@@ -4611,3 +4611,148 @@ b47bbbf1370d4c88ef3e8be8c020177754b9a187b150a1fe7d402e85aea0c5d4  op_statistic.c
 3b0f665978b6d0ce6241fe2fa61cc751be7b7df0c39aacfb6fce563441c1f2e2  v3-valid-run1.json
 c5561b8a4f65a2c58a80cd0d6d43fc61d6756fef6c1742f3cd6f803f7e8d4f75  v3-valid-run2.json
 ```
+
+## Sequence-major BSH attention candidate
+
+The next layout candidate is implemented behind
+`npu_dit_bsh_attention: true`. It extends the accepted homogeneous-BF16,
+fixed-planar-slab profile while changing the attention producer/consumer
+contract from `[batch, heads, sequence, head_dim]` to
+`[batch, sequence, hidden]` across Q/K/V projection, K/V cache append,
+Ascend fused attention, and the output projection. Q/K normalization still
+uses an internal `[batch, sequence, heads, head_dim]` view, but does not
+transpose the head and sequence axes.
+
+The request-owned cache remains six CFM steps by sixteen DiT blocks with
+separate K and V planes. Its new physical shape is:
+
+```text
+[six steps, sixteen blocks, K/V=2, CFG batch, time, hidden=512]
+```
+
+Prompt setup converts once from the checkpoint-compatible packed BHSD cache.
+Steady chunks write directly into the fixed BSH append slab. Unsupported
+platforms and graph failures convert through the exact legacy cache path, so
+the candidate fails closed without changing the public waveform contract.
+
+CPU PyTorch checks prove exact Q/K/V preamble parity, cached SDPA parity,
+legacy-cache round trips, stable slab addresses, and correct multi-request CFG
+split/stack axes. The deploy overlay is
+`minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_bsh_attention_experimental.yaml`.
+Its connector block deliberately repeats the accepted profile because
+top-level connector overlays replace rather than deep-merge their base. A
+thin first draft silently discarded CFM6/BF16/fixed-slab settings and loaded
+CFM10; the strengthened configuration test now verifies all inherited
+prerequisites together.
+
+The loaded-checkpoint startup gate passed on the Atlas 800I A3 / 910C host at
+widths 50, 20, and 302. Every BSH preamble plus fused-attention comparison
+reported zero maximum and mean absolute drift. The server log also confirmed
+CFM6, homogeneous BF16, direct BSH attention, and fixed BSH slabs. The
+unrelated final-Addcmul candidate again exceeded its own strict drift bound
+and correctly retained canonical AdaLN.
+
+The isolated attention screen includes cache append, Ascend fused attention,
+and output projection. With the accepted width-50/cache-402 shape, queued
+throughput used 100 iterations per trial over nine alternating trials;
+serialized latency used one iteration over 21 trials. Lower is better.
+
+| Mode | BNSD control | BSH candidate | Speedup | Max / mean drift |
+| --- | ---: | ---: | ---: | ---: |
+| Queued median | 152.459 us | 78.035 us | 1.9537x | 0 / 0 |
+| Serialized median | 195.330 us | 125.270 us | 1.5593x | 0 / 0 |
+
+The first real request exposed a second integration bug that the isolated
+screen could not: the inherited `planar=true` flag reinterpreted an already
+BSH cache a second time, changing the slab from a 512-wide BSH representation
+to a spurious `2 x 256` representation. BSH now has explicit precedence over
+the older planar conversion. The exact failing combination has a regression
+test, and the deployed synthetic check preserves retained and append shapes
+`[6,16,2,2,402,512]` and `[6,16,2,2,452,512]`.
+
+The fresh-process control and both corrected candidate trials used the same
+first 12 shuffled English Seed-TTS rows, two warmups, concurrency one, seed
+zero, temperature zero, and CFM6. All three completed 12/12 with zero
+failures, 100% continuity, 1,804 input tokens, 183 output tokens, 1,252,800
+frames, and 52.20 seconds of audio. Candidate values are the arithmetic mean
+of its two runs. Lower is better except throughput.
+
+| Metric | Accepted planar control | BSH two-run mean | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 17.596 s | 15.671 s | -10.94% |
+| Request throughput | 0.6820 req/s | 0.7658 req/s | +12.30% |
+| Audio throughput | 2.9666 audio-s/s | 3.3314 audio-s/s | +12.30% |
+| Mean / P99 E2E | 1,465.87 / 1,901.21 ms | 1,305.40 / 1,612.54 ms | -10.95% / -15.18% |
+| Mean / P99 TTFT | 333.43 / 483.15 ms | 314.90 / 443.13 ms | -5.56% / -8.28% |
+| Mean / P99 audio TTFP | 798.43 / 949.64 ms | 746.60 / 888.54 ms | -6.49% / -6.43% |
+| Mean / P99 whole-audio RTF | 0.340706 / 0.489958 | 0.304337 / 0.382010 | -10.67% / -22.03% |
+
+Chunk timing shows that the improvement is concentrated in the repeated
+Stage-2 path rather than only the first packet.
+
+| Chunk metric | Accepted planar control | BSH two-run mean | Change |
+| --- | ---: | ---: | ---: |
+| Mean first-chunk RTF | 0.950518 | 0.888804 | -6.49% |
+| Mean steady-chunk RTF | 0.227254 | 0.182423 | -19.73% |
+| Median steady-chunk RTF | 0.159447 | 0.131855 | -17.31% |
+| P99 steady-chunk RTF | 1.384496 | 0.873416 | -36.91% |
+| Mean / median all-chunk RTF | 0.379520 / 0.190300 | 0.331135 / 0.143456 | -12.75% / -24.62% |
+| P99 all-chunk RTF | 1.503704 | 1.103255 | -26.63% |
+
+Candidate durations were 15.840 and 15.502 seconds. The follow-up 32-row
+stability gate completed 32/32 with zero failures and zero underrun while
+preserving the official 4,801-input-token, 480-output-token, 3,362,880-frame,
+140.12-second signature. It measured 42.586 seconds duration, 1,330.48 ms
+mean E2E, 322.82 ms mean TTFT, 751.21 ms mean TTFP, 0.309511 mean
+whole-audio RTF, and 0.180239 mean steady-chunk RTF. The 32-row steady-chunk
+P99 was 0.834274.
+
+The cached offline Whisper-large-v3/WavLM 32-row quality screen passed the
+repository's strict two-percentage-point gate. Both runs evaluated the same
+32 rows with the same in-tree aligned WER and WavLM mean-pool proxy protocols.
+The candidate had zero request, PCM, ASR, and SIM failures.
+
+| Quality metric | Accepted planar control | BSH candidate | Regression | Gate |
+| --- | ---: | ---: | ---: | --- |
+| Mean / median WER (lower is better) | 0.016588 / 0 | 0.016588 / 0 | 0.000 pp | pass |
+| Mean WavLM SIM (higher is better) | 0.844747 | 0.845047 | -0.030 pp | pass |
+| Median WavLM SIM (higher is better) | 0.851154 | 0.852045 | -0.089 pp | pass |
+| WER / SIM evaluated | 32 / 32 | 32 / 32 | matched | pass |
+
+A negative regression means the candidate improved. This accepts BSH as the
+next experimental 910C speed profile: its two-run request throughput improved
+12.30%, mean steady-chunk RTF fell 19.73%, WER was bit-for-bit equal at the
+aggregate level, and mean SIM improved slightly. It does **not** promote the
+profile to a competition release. Full 1,088-row official Seed-TTS,
+Daily-Omni, and Video-MME are still required release gates.
+
+This run also found and fixed a benchmark-wrapper ambiguity. `--wer-eval`
+previously claimed to enable WER/SIM/UTMOS but forwarded only WER, yielding a
+plausible-looking result with `seed_tts_sim_evaluated=0`. The wrapper now
+describes `--wer-eval` accurately and exposes explicit `--sim-eval`; UTMOS
+remains separately opt-in through `SEED_TTS_UTMOS_EVAL=1` alongside an
+evaluation flag.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-bsh-attention-20260821
+```
+
+Selected checksums:
+
+```text
+97ba2ba0d553a77005e37b7d8249dec54dd19cba84498dfb95b587298ab891e7  control.json
+1f810967ebba1ee5179d7211932d1c57756cd90868627d3b1bb310219a233586  candidate-run1.json
+71e7bdb73f4f4fa1bba5b26766287a1726989548844159b0cb34e5b11e9ade00  candidate-run2.json
+29726bc5cc0628a7cea28e1d318b2211cdf0995bd4aab951e5a4af84065811c8  candidate-32.json
+6bead4b3543faac8d5113473a576ea269f963ba7e08731224b7fa699703117a8  candidate-quality32-wer.json
+002576b97d77772663536a6b46c5728662a935415d55d874491d89e3689d03df  candidate-quality32-wer-sim.json
+```
+
+The reusable hardware command is:
+
+```bash
+python benchmarks/scripts/bench_minicpmo_dit_bsh_attention.py \
+  --device 1 --width 50 --cache-length 402 --dtype bf16
+```

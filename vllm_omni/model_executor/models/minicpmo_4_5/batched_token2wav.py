@@ -56,6 +56,9 @@ _NPU_DIT_ATTN_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT"
 _NPU_CFM_STACKED_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT"
 _NPU_CFM_FIXED_KV_SLABS_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_FIXED_KV_SLABS"
 _NPU_CFM_PLANAR_KV_SLABS_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_PLANAR_KV_SLABS"
+_NPU_DIT_BSH_ATTENTION_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_BSH_ATTENTION"
+_NPU_DIT_BSH_ATTENTION_MAX_ABS_DRIFT = 2.0e-2
+_NPU_DIT_BSH_ATTENTION_MEAN_ABS_DRIFT = 2.0e-3
 _NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH"
 )
@@ -161,6 +164,22 @@ def _npu_cfm_planar_kv_slabs_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_CFM_PLANAR_KV_SLABS_ENV}={raw!r}")
+
+
+def _npu_dit_bsh_attention_enabled(config_value: Any = None) -> bool:
+    """Resolve the opt-in BSH Q/K/V, cache, and fused-attention path."""
+    env_value = os.environ.get(_NPU_DIT_BSH_ATTENTION_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_BSH_ATTENTION_ENV}={raw!r}")
 
 
 def _npu_dit_mlp_graph_enabled(config_value: Any = None) -> bool:
@@ -727,6 +746,44 @@ def _dit_attention_from_modulation(
     return modulation, q, k, v
 
 
+def _dit_attention_from_modulation_bsh(
+    x: torch.Tensor,
+    modulation: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_norm_bias: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build normalized Q/K/V without leaving the DiT's BSH layout.
+
+    Q/K normalization still sees the exact 64-wide head dimension, but the
+    head axis is never transposed across sequence. This representation feeds
+    Ascend fused attention directly and keeps the fixed K/V slabs contiguous
+    in the same sequence-major layout as the surrounding DiT blocks.
+    """
+    shift_msa = modulation[:, :, :512]
+    scale_msa = modulation[:, :, 512:1024]
+    hidden = F.layer_norm(x, (512,), eps=1e-6)
+    hidden = hidden * (1 + scale_msa) + shift_msa
+    batch, width, _ = hidden.shape
+    q = F.linear(hidden, q_weight, q_bias).reshape(batch, width, 8, 64)
+    k = F.linear(hidden, k_weight, k_bias).reshape(batch, width, 8, 64)
+    q = F.layer_norm(q, (64,), q_norm_weight, q_norm_bias, 1e-5).reshape(
+        batch, width, 512
+    )
+    k = F.layer_norm(k, (64,), k_norm_weight, k_norm_bias, 1e-5).reshape(
+        batch, width, 512
+    )
+    v = F.linear(hidden, v_weight, v_bias)
+    return modulation, q, k, v
+
+
 def _dit_attention_preamble(
     x: torch.Tensor,
     time_embedding: torch.Tensor,
@@ -783,6 +840,37 @@ def _dit_attention_preamble_from_modulation(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Attention preamble consuming one row from the wide AdaLN bank."""
     return _dit_attention_from_modulation(
+        x,
+        modulation,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        v_weight,
+        v_bias,
+        q_norm_weight,
+        q_norm_bias,
+        k_norm_weight,
+        k_norm_bias,
+    )
+
+
+def _dit_attention_preamble_bsh_from_modulation(
+    x: torch.Tensor,
+    modulation: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_norm_bias: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Attention preamble whose public outputs remain BSH."""
+    return _dit_attention_from_modulation_bsh(
         x,
         modulation,
         q_weight,
@@ -1377,6 +1465,7 @@ def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
             slab.logical_length,
             slab.active_cnn_bank,
             slab.planar,
+            slab.bsh_attention,
             slab.cnn_cache_major,
         )
     )
@@ -1409,6 +1498,7 @@ class FixedEstimatorKVSlabs:
     logical_length: int
     active_cnn_bank: int
     planar: bool = False
+    bsh_attention: bool = False
     cnn_cache_major: bool = False
 
 
@@ -1454,6 +1544,7 @@ class BatchedToken2Wav(nn.Module):
         npu_cfm_stacked_cache_out: Any = None,
         npu_cfm_fixed_kv_slabs: Any = None,
         npu_cfm_planar_kv_slabs: Any = None,
+        npu_dit_bsh_attention: Any = None,
         npu_single_request_cache_passthrough: Any = None,
         npu_dit_fused_conv_block: Any = None,
         npu_dit_fused_conv_linear: Any = None,
@@ -1624,6 +1715,14 @@ class BatchedToken2Wav(nn.Module):
         if self._npu_cfm_planar_kv_slabs_enabled:
             self._npu_cfm_fixed_kv_slabs_enabled = True
         self._npu_cfm_planar_kv_slabs_used = False
+        self._npu_dit_bsh_attention_enabled = _npu_dit_bsh_attention_enabled(
+            npu_dit_bsh_attention
+        )
+        self._npu_dit_bsh_attention_used = False
+        self._npu_dit_bsh_preamble_graph: Any | None = None
+        if self._npu_dit_bsh_attention_enabled:
+            self._npu_cfm_fixed_kv_slabs_enabled = True
+            self._npu_cfm_planar_kv_slabs_enabled = True
         self._npu_cfm_fixed_kv_tail_fallback_used = False
         self._npu_single_request_cache_passthrough_enabled = (
             _npu_single_request_cache_passthrough_enabled(
@@ -1732,6 +1831,23 @@ class BatchedToken2Wav(nn.Module):
             self._npu_dit_qkv_pack_enabled = False
             logger.warning(
                 "MiniCPM-o wide AdaLN currently uses the ordinary QKV preamble; disabling native QKV pack"
+            )
+        if self._npu_dit_bsh_attention_enabled and not (
+            self._npu_dit_preamble_graph_enabled
+            and self._npu_dit_wide_adaln_enabled
+        ):
+            self._npu_dit_bsh_attention_enabled = False
+            logger.warning(
+                "MiniCPM-o BSH attention requires the graph-visible preamble "
+                "and wide AdaLN; disabling it"
+            )
+        if self._npu_dit_bsh_attention_enabled and (
+            self._npu_dit_qkv_pack_enabled or self._npu_dit_fused_qkv_enabled
+        ):
+            self._npu_dit_qkv_pack_enabled = False
+            self._npu_dit_fused_qkv_enabled = False
+            logger.info(
+                "MiniCPM-o BSH attention supersedes BHSD QKV packing candidates"
             )
         if self._npu_dit_cache_major_enabled and (
             not self._npu_dit_fused_conv_pack_enabled or self._npu_dit_fused_conv_linear_enabled
@@ -2209,6 +2325,80 @@ class BatchedToken2Wav(nn.Module):
             and float(block.attn.k_norm.eps) == 1e-5
         )
 
+    @staticmethod
+    def _validate_npu_dit_bsh_attention(
+        block: nn.Module,
+        hidden: torch.Tensor,
+        modulation: torch.Tensor,
+        candidate: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[float, float]:
+        """Validate loaded-weight BSH preamble and fused attention together."""
+        attention = block.attn
+        reference = _dit_attention_preamble_from_modulation(
+            hidden,
+            modulation,
+            attention.to_q.weight,
+            attention.to_q.bias,
+            attention.to_k.weight,
+            attention.to_k.bias,
+            attention.to_v.weight,
+            attention.to_v.bias,
+            attention.q_norm.weight,
+            attention.q_norm.bias,
+            attention.k_norm.weight,
+            attention.k_norm.bias,
+        )
+        differences: list[torch.Tensor] = []
+        for bsh, bhsd in zip(candidate[1:], reference[1:], strict=True):
+            expected_bsh = bhsd.transpose(1, 2).reshape_as(bsh)
+            differences.append((bsh.float() - expected_bsh.float()).abs())
+
+        _, q, k, v = candidate
+        cache_width = 7
+        bsh_cache = q.new_zeros((2, q.shape[0], cache_width, q.shape[-1]))
+        bsh_output = q.new_empty(
+            (2, q.shape[0], q.shape[1] + cache_width, q.shape[-1])
+        )
+        candidate_attention, _ = (
+            BatchedToken2Wav._attention_from_projected_qkv_bsh_planar(
+                attention,
+                q,
+                k,
+                v,
+                bsh_cache,
+                bsh_output,
+            )
+        )
+        legacy_cache = BatchedToken2Wav._legacy_att_cache_from_bsh_planar(
+            bsh_cache,
+            int(attention.num_heads),
+            int(attention.head_dim),
+        )
+        reference_attention, _ = BatchedToken2Wav._attention_from_projected_qkv(
+            attention,
+            reference[1],
+            reference[2],
+            reference[3],
+            legacy_cache,
+        )
+        differences.append(
+            (candidate_attention.float() - reference_attention.float()).abs()
+        )
+        max_abs_drift = max(float(value.max().item()) for value in differences)
+        mean_abs_drift = sum(float(value.mean().item()) for value in differences) / len(
+            differences
+        )
+        if (
+            max_abs_drift > _NPU_DIT_BSH_ATTENTION_MAX_ABS_DRIFT
+            or mean_abs_drift > _NPU_DIT_BSH_ATTENTION_MEAN_ABS_DRIFT
+        ):
+            raise RuntimeError(
+                "BSH attention exceeded its loaded-checkpoint drift bound: "
+                f"max_abs_drift={max_abs_drift:.9g}, "
+                f"mean_abs_drift={mean_abs_drift:.9g}"
+            )
+        return max_abs_drift, mean_abs_drift
+
     def _warmup_npu_dit_preamble_graph(self) -> None:
         if not self._npu_dit_preamble_graph_enabled:
             return
@@ -2282,18 +2472,40 @@ class BatchedToken2Wav(nn.Module):
                     continue
                 x = weight.new_zeros((2, width, 512))
                 with torch.inference_mode():
-                    self._call_npu_dit_preamble_graph(
+                    result = self._call_npu_dit_preamble_graph(
                         graph_fn,
                         block,
                         x,
                         time_embedding,
                         None if wide_modulations is None else wide_modulations[:, :, 0, :],
                     )
+                    if self._npu_dit_bsh_attention_enabled:
+                        if wide_modulations is None:
+                            raise RuntimeError(
+                                "MiniCPM-o BSH attention requires loaded wide modulation"
+                            )
+                        max_abs_drift, mean_abs_drift = (
+                            self._validate_npu_dit_bsh_attention(
+                                block,
+                                x,
+                                wide_modulations[:, :, 0, :],
+                                result,
+                            )
+                        )
                 torch.npu.synchronize()
                 if self._npu_dit_fused_qkv_enabled:
                     logger.info(
                         "Compiled MiniCPM-o NPU DiT fused-QKV preamble graph for 2x%dx512, 8x64 heads",
                         width,
+                    )
+                elif self._npu_dit_bsh_attention_enabled:
+                    logger.info(
+                        "Compiled MiniCPM-o NPU DiT BSH attention preamble graph "
+                        "for 2x%dx512, 8x64 heads; max_abs_drift=%.9g, "
+                        "mean_abs_drift=%.9g",
+                        width,
+                        max_abs_drift,
+                        mean_abs_drift,
                     )
                 elif self._npu_dit_qkv_pack_enabled and width == self._npu_dit_mlp_graph_width:
                     logger.info(
@@ -2306,6 +2518,37 @@ class BatchedToken2Wav(nn.Module):
                         width,
                     )
             except Exception:
+                if self._npu_dit_bsh_attention_enabled:
+                    self._npu_dit_bsh_attention_enabled = False
+                    self._npu_dit_bsh_preamble_graph = None
+                    logger.warning(
+                        "MiniCPM-o BSH attention parity/compile gate failed at "
+                        "width=%d; retrying the accepted planar BHSD path",
+                        width,
+                        exc_info=True,
+                    )
+                    try:
+                        graph_fn = self._get_npu_dit_preamble_graph(width)
+                        with torch.inference_mode():
+                            self._call_npu_dit_preamble_graph(
+                                graph_fn,
+                                block,
+                                x,
+                                time_embedding,
+                                (
+                                    None
+                                    if wide_modulations is None
+                                    else wide_modulations[:, :, 0, :]
+                                ),
+                            )
+                        torch.npu.synchronize()
+                        continue
+                    except Exception:
+                        logger.warning(
+                            "MiniCPM-o accepted planar BHSD retry failed at width=%d",
+                            width,
+                            exc_info=True,
+                        )
                 if self._npu_dit_fused_qkv_enabled:
                     self._npu_dit_fused_qkv_enabled = False
                     self._npu_dit_fused_qkv_preamble_graph = None
@@ -2377,6 +2620,15 @@ class BatchedToken2Wav(nn.Module):
 
         _ensure_torchair_broadcast_alias()
         compiler_config = torchair.CompilerConfig()
+        if self._npu_dit_bsh_attention_enabled:
+            if self._npu_dit_bsh_preamble_graph is None:
+                self._npu_dit_bsh_preamble_graph = torch.compile(
+                    _dit_attention_preamble_bsh_from_modulation,
+                    backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                    fullgraph=True,
+                    dynamic=False,
+                )
+            return self._npu_dit_bsh_preamble_graph
         if self._npu_dit_fused_qkv_enabled:
             if self._npu_dit_fused_qkv_preamble_graph is None:
                 self._npu_dit_fused_qkv_preamble_graph = torch.compile(
@@ -3325,6 +3577,7 @@ class BatchedToken2Wav(nn.Module):
         old_att: torch.Tensor | None,
         *,
         cache_major: bool = False,
+        bsh_attention: bool = False,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         blocks = estimator.blocks
         depth = len(blocks)
@@ -3332,9 +3585,13 @@ class BatchedToken2Wav(nn.Module):
         chunk_size = int(x.shape[2])
         planar_att = BatchedToken2Wav._is_planar_att_cache(old_att)
         old_att_len = (
-            int(old_att.shape[-2])
-            if planar_att
-            else (int(old_att.shape[3]) if old_att is not None else 0)
+            0
+            if old_att is None
+            else (
+                int(old_att.shape[-2])
+                if planar_att or bsh_attention
+                else int(old_att.shape[3])
+            )
         )
         block0 = blocks[0]
         cnn_channels = int(block0.conv.in_channels + block0.conv.out_channels)
@@ -3346,7 +3603,15 @@ class BatchedToken2Wav(nn.Module):
             if cache_major
             else (depth, batch_size, cnn_channels, cnn_width)
         )
-        if planar_att:
+        if bsh_attention:
+            att_shape = (
+                depth,
+                2,
+                batch_size,
+                old_att_len + chunk_size,
+                heads * head_dim,
+            )
+        elif planar_att:
             att_shape = (
                 depth,
                 2,
@@ -3373,12 +3638,14 @@ class BatchedToken2Wav(nn.Module):
         old_att: torch.Tensor | None,
         *,
         cache_major: bool = False,
+        bsh_attention: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cnn_shape, att_shape = cls._estimator_buffer_shapes(
             estimator,
             x,
             old_att,
             cache_major=cache_major,
+            bsh_attention=bsh_attention,
         )
         return x.new_empty(cnn_shape), x.new_empty(att_shape)
 
@@ -3406,6 +3673,19 @@ class BatchedToken2Wav(nn.Module):
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         cache_major = self._is_cache_major_cnn(cnn_cache)
         planar_att = self._is_planar_att_cache(att_cache)
+        first_attention = estimator.blocks[0].attn
+        attention_hidden_size = int(first_attention.num_heads) * int(
+            first_attention.head_dim
+        )
+        bsh_attention = (
+            self._npu_dit_bsh_attention_enabled
+            and (
+                att_cache is None
+                or self._is_bsh_planar_att_cache(
+                    att_cache, attention_hidden_size
+                )
+            )
+        )
         if cnn_out is None or att_out is None:
             if cnn_out is not None or att_out is not None:
                 raise ValueError("cnn_out and att_out must be provided together")
@@ -3414,6 +3694,7 @@ class BatchedToken2Wav(nn.Module):
                 estimator_input,
                 att_cache,
                 cache_major=cache_major,
+                bsh_attention=bsh_attention,
             )
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
@@ -3434,6 +3715,7 @@ class BatchedToken2Wav(nn.Module):
                     if (
                         graph_width == self._npu_dit_mlp_graph_width
                         and not planar_att
+                        and not bsh_attention
                         and not cache_major
                         and isinstance(cnn_cache, torch.Tensor)
                         and isinstance(att_cache, torch.Tensor)
@@ -3480,6 +3762,7 @@ class BatchedToken2Wav(nn.Module):
                     if full_block_graph_fn is None and (
                         graph_width == self._npu_dit_mlp_graph_width
                         and not planar_att
+                        and not bsh_attention
                         and not cache_major
                         and cnn_cache is not None
                         and att_cache is not None
@@ -3609,9 +3892,35 @@ class BatchedToken2Wav(nn.Module):
                 )
         if cache_major:
             old_cnn = old_cnn.transpose(-2, -1).contiguous()
-            cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
+            cnn_out, att_out = self._estimator_buffers(
+                estimator,
+                estimator_input,
+                att_cache,
+                bsh_attention=bsh_attention,
+            )
         legacy_att_out = att_out
-        if planar_att:
+        if bsh_attention:
+            legacy_old_att = (
+                None
+                if att_cache is None
+                else self._legacy_att_cache_from_bsh_planar(
+                    att_cache,
+                    int(first_attention.num_heads),
+                    int(first_attention.head_dim),
+                )
+            )
+            _, legacy_att_shape = self._estimator_buffer_shapes(
+                estimator,
+                estimator_input,
+                legacy_old_att,
+            )
+            legacy_att_out = estimator_input.new_empty(legacy_att_shape)
+            old_att = (
+                legacy_old_att
+                if legacy_old_att is not None
+                else [None] * len(estimator.blocks)
+            )
+        elif planar_att:
             legacy_old_att = self._legacy_att_cache_from_planar(att_cache)
             _, legacy_att_shape = self._estimator_buffer_shapes(
                 estimator,
@@ -3629,7 +3938,9 @@ class BatchedToken2Wav(nn.Module):
             cnn_out,
             legacy_att_out,
         )
-        if planar_att:
+        if bsh_attention:
+            self._copy_legacy_att_cache_to_bsh_planar(att_out, legacy_att_out)
+        elif planar_att:
             self._copy_legacy_att_cache_to_planar(att_out, legacy_att_out)
         return result, cnn_out, att_out, False
 
@@ -3734,22 +4045,59 @@ class BatchedToken2Wav(nn.Module):
             block_att_cache = old_att[block_idx]
             block_att_output = att_out[block_idx]
             planar_att = self._is_planar_att_cache(block_att_cache)
+            bsh_attention = (
+                self._npu_dit_bsh_attention_enabled
+                and (
+                    block_att_cache is None
+                    or self._is_bsh_planar_att_cache(
+                        block_att_cache,
+                        int(block.attn.num_heads) * int(block.attn.head_dim),
+                    )
+                )
+            )
             if q is None or k is None or v is None:
                 legacy_att_cache = (
-                    self._legacy_att_cache_from_planar(block_att_cache)
-                    if planar_att
-                    else block_att_cache
+                    self._legacy_att_cache_from_bsh_planar(
+                        block_att_cache,
+                        int(block.attn.num_heads),
+                        int(block.attn.head_dim),
+                    )
+                    if bsh_attention and block_att_cache is not None
+                    else (
+                        self._legacy_att_cache_from_planar(block_att_cache)
+                        if planar_att
+                        else block_att_cache
+                    )
                 )
                 attention, new_att = block.attn.forward_chunk(
                     block.norm1(hidden) * (1 + scale_msa) + shift_msa,
                     legacy_att_cache,
                     None,
                 )
-                attention_cache_written = planar_att
-                if planar_att:
+                attention_cache_written = planar_att or bsh_attention
+                if bsh_attention:
+                    new_att = self._copy_legacy_att_cache_to_bsh_planar(
+                        block_att_output, new_att
+                    )
+                elif planar_att:
                     new_att = self._copy_legacy_att_cache_to_planar(
                         block_att_output, new_att
                     )
+            elif bsh_attention:
+                attention, new_att = self._attention_from_projected_qkv_bsh_planar(
+                    block.attn,
+                    q,
+                    k,
+                    v,
+                    block_att_cache,
+                    block_att_output,
+                )
+                attention_cache_written = True
+                if not self._npu_dit_bsh_attention_used:
+                    logger.info(
+                        "MiniCPM-o BSH planar K/V plus fused attention active"
+                    )
+                    self._npu_dit_bsh_attention_used = True
             elif planar_att:
                 attention, new_att = self._attention_from_projected_qkv_planar(
                     block.attn,
@@ -4075,6 +4423,52 @@ class BatchedToken2Wav(nn.Module):
         )
 
     @staticmethod
+    def _is_bsh_planar_att_cache(
+        cache: torch.Tensor | None,
+        hidden_size: int = 512,
+    ) -> bool:
+        """Whether cache uses ``[..., K/V, CFG, time, hidden]``."""
+        return (
+            isinstance(cache, torch.Tensor)
+            and cache.ndim in {4, 5, 6}
+            and int(cache.shape[-4]) == 2
+            and int(cache.shape[-1]) == hidden_size
+            and not BatchedToken2Wav._is_planar_att_cache(cache)
+        )
+
+    @staticmethod
+    def _legacy_att_cache_from_bsh_planar(
+        cache: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        """Convert sequence-major planar K/V to CosyVoice's packed BHSD cache."""
+        key = cache.select(-4, 0)
+        value = cache.select(-4, 1)
+
+        def to_bhsd(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.reshape(
+                *tensor.shape[:-1], num_heads, head_dim
+            ).transpose(-3, -2)
+
+        return torch.cat((to_bhsd(key), to_bhsd(value)), dim=-1)
+
+    @staticmethod
+    def _copy_legacy_att_cache_to_bsh_planar(
+        destination: torch.Tensor,
+        source: torch.Tensor,
+    ) -> torch.Tensor:
+        """Copy CosyVoice packed BHSD K/V into sequence-major planes."""
+        key, value = source.chunk(2, dim=-1)
+
+        def to_bsh(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.transpose(-3, -2).flatten(-2)
+
+        destination.select(-4, 0).copy_(to_bsh(key))
+        destination.select(-4, 1).copy_(to_bsh(value))
+        return destination
+
+    @staticmethod
     def _legacy_att_cache_from_planar(cache: torch.Tensor) -> torch.Tensor:
         if not BatchedToken2Wav._is_planar_att_cache(cache):
             return cache
@@ -4115,6 +4509,66 @@ class BatchedToken2Wav(nn.Module):
         hidden = F.scaled_dot_product_attention(q, output_k, output_v)
         batch_size, _, width, _ = hidden.shape
         hidden = hidden.transpose(1, 2).reshape(batch_size, width, -1)
+        hidden = attention_module.proj(hidden)
+        hidden = attention_module.proj_drop(hidden)
+        return hidden, output_cache
+
+    @staticmethod
+    def _attention_from_projected_qkv_bsh_planar(
+        attention_module: nn.Module,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        att_cache: torch.Tensor | None,
+        output_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append planar BSH K/V and run attention without BSH/BHSD transposes."""
+        output_k = output_cache.select(0, 0)
+        output_v = output_cache.select(0, 1)
+        if att_cache is None:
+            output_k.copy_(k)
+            output_v.copy_(v)
+        else:
+            cache_k = att_cache.select(0, 0)
+            cache_v = att_cache.select(0, 1)
+            torch.cat((k, cache_k), dim=1, out=output_k)
+            torch.cat((v, cache_v), dim=1, out=output_v)
+
+        batch, query_width, hidden_size = q.shape
+        num_heads = int(attention_module.num_heads)
+        head_dim = int(attention_module.head_dim)
+        if hidden_size != num_heads * head_dim:
+            raise ValueError(
+                "DiT BSH attention hidden size mismatch: "
+                f"hidden={hidden_size}, heads={num_heads}, head_dim={head_dim}"
+            )
+        if q.device.type == "npu":
+            import torch_npu
+
+            hidden = torch_npu.npu_fusion_attention(
+                query=q,
+                key=output_k,
+                value=output_v,
+                head_num=num_heads,
+                input_layout="BSH",
+                scale=head_dim**-0.5,
+                keep_prob=1.0,
+                pre_tockens=2147483647,
+                next_tockens=2147483647,
+                sparse_mode=0,
+            )[0]
+        else:
+            # Exact semantic fallback used by CPU tests and unsupported
+            # platforms. Production NPU execution takes the BSH FIA branch.
+            query = q.reshape(batch, query_width, num_heads, head_dim).transpose(1, 2)
+            key = output_k.reshape(
+                batch, output_k.shape[1], num_heads, head_dim
+            ).transpose(1, 2)
+            value = output_v.reshape(
+                batch, output_v.shape[1], num_heads, head_dim
+            ).transpose(1, 2)
+            hidden = F.scaled_dot_product_attention(query, key, value)
+            hidden = hidden.transpose(1, 2).reshape(batch, query_width, hidden_size)
         hidden = attention_module.proj(hidden)
         hidden = attention_module.proj_drop(hidden)
         return hidden, output_cache
@@ -4304,11 +4758,24 @@ class BatchedToken2Wav(nn.Module):
         if direct_cache_output:
             first_old_cnn = working_cnn_cache[0] if working_cnn_cache is not None else None
             first_old_att = att_cache[0] if att_cache is not None else None
+            first_attention = estimator.blocks[0].attn
+            bsh_attention = (
+                self._npu_dit_bsh_attention_enabled
+                and (
+                    first_old_att is None
+                    or self._is_bsh_planar_att_cache(
+                        first_old_att,
+                        int(first_attention.num_heads)
+                        * int(first_attention.head_dim),
+                    )
+                )
+            )
             cnn_shape, att_shape = self._estimator_buffer_shapes(
                 estimator,
                 mu_cfg,
                 first_old_att,
                 cache_major=self._is_cache_major_cnn(first_old_cnn),
+                bsh_attention=bsh_attention,
             )
             expected_cnn = (self.n_timesteps, *cnn_shape)
             expected_att = (self.n_timesteps, *att_shape)
@@ -4543,9 +5010,16 @@ class BatchedToken2Wav(nn.Module):
         cache: dict[str, torch.Tensor],
         batch_size: int,
     ) -> list[dict[str, torch.Tensor]]:
-        planar_att = self._is_planar_att_cache(cache.get("estimator_att_cache"))
+        estimator_att = cache.get("estimator_att_cache")
+        planar_att = self._is_planar_att_cache(estimator_att)
+        bsh_attention = (
+            self._npu_dit_bsh_attention_enabled
+            and self._is_bsh_planar_att_cache(estimator_att)
+        )
         if batch_size == 1 and (
-            self._npu_single_request_cache_passthrough_enabled or planar_att
+            self._npu_single_request_cache_passthrough_enabled
+            or planar_att
+            or bsh_attention
         ):
             if not self._npu_single_request_cache_passthrough_used:
                 logger.info("MiniCPM-o NPU single-request cache passthrough active")
@@ -4553,6 +5027,26 @@ class BatchedToken2Wav(nn.Module):
             return [{name: value.detach() for name, value in cache.items()}]
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
+            if bsh_attention:
+                estimator_att_cache = torch.cat(
+                    (
+                        cache["estimator_att_cache"][:, :, :, row : row + 1],
+                        cache["estimator_att_cache"][
+                            :, :, :, batch_size + row : batch_size + row + 1
+                        ],
+                    ),
+                    dim=3,
+                ).detach()
+            else:
+                estimator_att_cache = torch.cat(
+                    (
+                        cache["estimator_att_cache"][:, :, row : row + 1],
+                        cache["estimator_att_cache"][
+                            :, :, batch_size + row : batch_size + row + 1
+                        ],
+                    ),
+                    dim=2,
+                ).detach()
             result.append(
                 {
                     "conformer_cnn_cache": cache["conformer_cnn_cache"][row : row + 1].detach().clone(),
@@ -4564,20 +5058,16 @@ class BatchedToken2Wav(nn.Module):
                         ),
                         dim=2,
                     ).detach(),
-                    "estimator_att_cache": torch.cat(
-                        (
-                            cache["estimator_att_cache"][:, :, row : row + 1],
-                            cache["estimator_att_cache"][:, :, batch_size + row : batch_size + row + 1],
-                        ),
-                        dim=2,
-                    ).detach(),
+                    "estimator_att_cache": estimator_att_cache,
                 }
             )
         return result
 
     def _stack_flow_cache(self, states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
+        single_slabs = states[0].estimator_kv_slabs if len(states) == 1 else None
         if len(states) == 1 and (
             self._npu_single_request_cache_passthrough_enabled
+            or (single_slabs is not None and single_slabs.bsh_attention)
             or self._is_planar_att_cache(
                 states[0].flow_cache.get("estimator_att_cache")
             )
@@ -4586,7 +5076,28 @@ class BatchedToken2Wav(nn.Module):
         flows: list[dict[str, torch.Tensor]] = []
         for state in states:
             flow = state.flow_cache
-            if self._is_planar_att_cache(flow.get("estimator_att_cache")):
+            slabs = state.estimator_kv_slabs
+            if (
+                (slabs is not None and slabs.bsh_attention)
+                or self._is_bsh_planar_att_cache(
+                    flow.get("estimator_att_cache")
+                )
+            ):
+                flow = dict(flow)
+                attention = getattr(
+                    getattr(self.flow.decoder.estimator.blocks[0], "attn", None),
+                    "num_heads",
+                    8,
+                )
+                head_dim = getattr(
+                    getattr(self.flow.decoder.estimator.blocks[0], "attn", None),
+                    "head_dim",
+                    64,
+                )
+                flow["estimator_att_cache"] = self._legacy_att_cache_from_bsh_planar(
+                    flow["estimator_att_cache"], int(attention), int(head_dim)
+                )
+            elif self._is_planar_att_cache(flow.get("estimator_att_cache")):
                 flow = dict(flow)
                 flow["estimator_att_cache"] = (
                     self._legacy_att_cache_from_planar(
@@ -4612,9 +5123,24 @@ class BatchedToken2Wav(nn.Module):
         prompt_length: int,
         *,
         planar: bool = False,
+        bsh_attention: bool = False,
         cnn_cache_major: bool = False,
     ) -> FixedEstimatorKVSlabs | None:
-        if planar and not BatchedToken2Wav._is_planar_att_cache(cache):
+        if bsh_attention and not BatchedToken2Wav._is_bsh_planar_att_cache(cache):
+            if BatchedToken2Wav._is_planar_att_cache(cache):
+                key = cache.select(-5, 0)
+                value = cache.select(-5, 1)
+            else:
+                key, value = cache.chunk(2, dim=-1)
+            key = key.transpose(-3, -2).flatten(-2)
+            value = value.transpose(-3, -2).flatten(-2)
+            cache = torch.stack((key, value), dim=2).contiguous()
+            planar = True
+        elif (
+            not bsh_attention
+            and planar
+            and not BatchedToken2Wav._is_planar_att_cache(cache)
+        ):
             key, value = cache.chunk(2, dim=-1)
             cache = torch.stack((key, value), dim=2).contiguous()
         logical_length = int(cache.shape[-2])
@@ -4641,6 +5167,7 @@ class BatchedToken2Wav(nn.Module):
             logical_length=logical_length,
             active_cnn_bank=0,
             planar=planar,
+            bsh_attention=bsh_attention,
             cnn_cache_major=cnn_cache_major,
         )
 
@@ -4676,6 +5203,7 @@ class BatchedToken2Wav(nn.Module):
             logical_length=retained_length,
             active_cnn_bank=next_cnn_bank,
             planar=slabs.planar,
+            bsh_attention=slabs.bsh_attention,
             cnn_cache_major=slabs.cnn_cache_major,
         )
 
@@ -4721,6 +5249,7 @@ class BatchedToken2Wav(nn.Module):
                     row["estimator_cnn_cache"],
                     prompt_length,
                     planar=self._npu_cfm_planar_kv_slabs_enabled,
+                    bsh_attention=self._npu_dit_bsh_attention_enabled,
                     cnn_cache_major=(
                         self._npu_dit_cache_major_enabled
                         and row["estimator_cnn_cache"].device.type == "npu"
@@ -4862,10 +5391,11 @@ class BatchedToken2Wav(nn.Module):
             if not self._npu_cfm_fixed_kv_slabs_used:
                 logger.info(
                     "MiniCPM-o fixed estimator KV slabs active: retained=%d, "
-                    "append=%d, planar=%s, cnn_cache_major=%s",
+                    "append=%d, planar=%s, bsh_attention=%s, cnn_cache_major=%s",
                     int(fixed_slabs.retained.shape[-2]),
                     int(fixed_slabs.append.shape[-2]),
                     fixed_slabs.planar,
+                    fixed_slabs.bsh_attention,
                     fixed_slabs.cnn_cache_major,
                 )
                 self._npu_cfm_fixed_kv_slabs_used = True

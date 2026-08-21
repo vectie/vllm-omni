@@ -4316,3 +4316,105 @@ f6a443e5bee4043dfdc04c54a301ac7e2d98a3971df372906a4344f2bcd9eb65  fixed/bench_tt
 7ca1bbba1f4a7e7b0325c7934e958fbdbe3e612ede78200978245c0b18a7a89c  fixed-service.log
 a31a74e7dcc243fc0c9a1bfbcdfeedb8c19e4a505578eaf4bfe159afd5090691  graph-service.log
 ```
+
+### Planar fixed-address estimator K/V slabs
+
+The next cache-layout candidate keeps the accepted fixed-capacity ownership
+model, but replaces the packed last-dimension `[K | V]` representation with
+independent K and V planes:
+
+```text
+[six CFM steps, 16 blocks, K/V=2, CFG batch, heads, time, head dimension]
+```
+
+At each block boundary, the K and V histories are now independently
+contiguous and the projected current K/V tensors write directly into their
+final append planes. The SDPA inputs no longer depend on strided halves of a
+packed 128-wide cache. Logical length, prompt-plus-100 retention, the separate
+prompt-plus-150 output workspace, and the two CNN banks remain unchanged.
+The accepted split preamble/attention/Conv+MLP path stays graph-visible; the
+previously rejected full-block and full-stack graphs are intentionally not
+selected for planar state. Unsupported or batched cases convert to the exact
+legacy representation rather than widening the experimental boundary.
+
+The focused tests cover environment/config selection, projected-attention
+parity, four-chunk audio and cache parity, fixed storage addresses, and
+contiguous per-block K/V planes. The full MiniCPM-o model file completed
+107/107 tests; the deploy-profile selection test also passed. The live service
+logged both `contiguous planar K/V attention cache active` and
+`retained=402, append=452, planar=True`, with no attention-graph fallback.
+
+The hardware screen used two independent service processes for each side.
+Every process ran three warmups followed by the same first 12 shuffled English
+Seed-TTS rows at concurrency one, seed zero, temperature zero, and CFM6. All
+four measured runs completed 12/12 requests with zero failures, 100% streaming
+continuity, 1,804 input tokens, 183 output tokens, 1,252,800 waveform frames,
+and 52.20 seconds of audio. The table compares the arithmetic mean of the two
+runs per side. Lower is better except throughput.
+
+| Metric | Fixed slabs | Planar K/V slabs | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 20.128 s | 17.072 s | -15.18% |
+| Request throughput | 0.5962 req/s | 0.7029 req/s | +17.90% |
+| Mean / P99 E2E | 1,676.89 / 2,139.18 ms | 1,422.17 / 1,743.27 ms | -15.19% / -18.51% |
+| Mean / P99 TTFT | 360.73 / 505.40 ms | 331.95 / 463.75 ms | -7.98% / -8.24% |
+| Mean / P99 audio TTFP | 893.89 / 1,045.33 ms | 804.16 / 932.35 ms | -10.04% / -10.81% |
+| Mean / P99 whole-audio RTF | 0.391533 / 0.481192 | 0.335330 / 0.455460 | -14.35% / -5.35% |
+| Mean / median chunk RTF | 0.413277 / 0.256237 | 0.360917 / 0.185494 | -12.67% / -27.61% |
+| P99 chunk RTF | 1.252329 | 1.238023 | -1.14% |
+
+Repeatability was strong: fixed-slab durations were 20.209 and 20.047 seconds;
+planar durations were 17.075 and 17.069 seconds. Unlike the earlier isolated
+direct-output experiment, the producer and consumer now share the new layout
+through the complete steady attention boundary. This removes the strided
+packed-cache cost instead of adding another opaque custom-op boundary.
+
+The first 32-row stability attempt exposed one inherited fixed-slab limit that
+the 12-row screen did not reach. One final encoder flush produced 54 frames,
+requiring cache length 456 while the steady append slab intentionally ends at
+452. Raising the slab would waste steady-path HBM and change its static shape.
+The implementation now keeps the fixed 50-frame append region and uses a
+dynamically sized eager output only for an oversized tail. The returned state
+is then compacted into the same fixed retained slab. A regression test forces
+this overflow and verifies exact audio/cache parity. The corrected service
+logged `required=456, append=452`, took the eager tail path, and completed a
+32-row stability run with zero failures and 100% continuity.
+
+The corrected candidate then ran the cached 32-row Seed-TTS quality screen in
+explicit Hugging Face offline mode. It completed all 32 rows, preserved 4,801
+input tokens, 480 output tokens, 3,362,880 waveform frames, and 140.12 seconds
+of audio, and measured 44.301 seconds duration, 0.326667 mean whole-audio RTF,
+and 783.88 ms mean TTFP. Whisper-large-v3 WER was identical to the accepted
+homogeneous-BF16 result. WavLM-base-plus SIM changed by only -0.010 percentage
+points in the mean and -0.004 points in the median.
+
+| Accuracy metric | Accepted homogeneous BF16 | Planar K/V slabs | Accuracy change |
+| --- | ---: | ---: | ---: |
+| Mean / median WER | 0.016588 / 0 | 0.016588 / 0 | 0.000 pp |
+| Mean / median WavLM SIM | 0.844850 / 0.851195 | 0.844747 / 0.851154 | -0.010 pp / -0.004 pp |
+
+The planar profile is accepted as the next experimental speed profile. It is
+not silently enabled in the default 910C deployment yet. The local 32-row
+accuracy screen clears the 2-percentage-point gate, but the full official
+1,088-row Seed-TTS evaluation remains a release gate; cumulative Daily-Omni
+and Video-MME validation is still required before competition submission.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-planar-kv-20260821
+```
+
+Selected checksums:
+
+```text
+fb28e3abc6f6f51d1cc20e24594ec2f150fb4478075de729f096eab03a8b8710  fresh-control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-013340.json
+3cf583bc9d45295e7aa888a0c713e9a4801f60929bc23f3c784375500df4a92b  fresh-control-repeat/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-013534.json
+877c98e5593e4a92a424520cc8cdeaddf23ba5e2b245ddaff5a068ed9a12762c  planar/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-012632.json
+98816b6ef0e0a64a63c0d6be52e5975cd09c0443a940d90bcf6a18b7bbb00593  planar-repeat/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-014206.json
+b7f8111c0d5bf81512fb9c9e46228b917f58fce3c8fa17f11ac74ad9fc0cc608  planar-service.log
+a2e172276e4b2202813f2cfc6540d5ba914289016955752649db4a03940def50  planar-repeat-service.log
+f47a6d72dbe5987a0b37de3026b1a622e25005ccee416f51958825e7fd2d4d44  planar-quality32-fixed/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-020017.json
+db8e371ac3d5ad9897294a1b16b2ee90fb4c46542d6936de085d79c218ca44dd  planar-tail-fixed-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-015643.json
+5f3c3667b13ddf5bf393be6a6d266f254613fca0edd5230847d2807cdbd57ac7  planar-tail-fixed-service.log
+```

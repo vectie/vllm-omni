@@ -496,6 +496,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Cached immutable Stage 0 control-token embeddings | Shipped in the static-weight native-duplex profile; exact operator parity, representative operator sequence -61.35%, resident Stage-0 TTFT mean -8.45% |
 | Sticky fused-to-MATH Ascend SDPA adapter | Implemented, target proof required |
 | Exact-shape CFM graph replay | Implemented, opt-in; fixed width-50/cache-402 six-step graph with two output slots improved reverse-order duration 5.79%, mean whole-audio RTF 7.92%, and mean steady-chunk RTF 14.28%; full competition qualification pending |
+| Immutable six-step AdaLN modulation slabs | Rejected and removed; direct retention preserved TorchAir producer storage and passed 121/121 focused tests, but five-run medians regressed duration/E2E 6.60%, throughput 6.19%, mean whole-audio RTF 5.21%, and P99 E2E 30.11% because the external buffer boundary blocked more valuable graph-wide layout/scheduling optimization |
 | Exact output hash capture and deterministic JSON gate | Implemented |
 | Six- and eight-step CFM deploy profiles | Implemented; the CFM6 competition profile passed full Seed-TTS, Daily-Omni, and Video-MME gates |
 | Talker sliding repetition-frequency cache | Shipped; exact parity and full 1,088-row Seed-TTS WER/SIM gate passed |

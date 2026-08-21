@@ -4892,3 +4892,55 @@ Selected reverse-leg SHA-256 checksums are:
 02e77335a1e1e9bfa686daa043d5897df9b0837d514df7c223c451eba654d211  reverse-control-run3.json
 b15d7ef153ca306679f55333b63ec9cbe2b589b66984f12b9fabcdb112887347  reverse-control-run4.json
 ```
+
+## Immutable CFM AdaLN modulation slabs (rejected)
+
+Fixed six-step CFM uses the same timestep embeddings and loaded AdaLN
+parameters for every prompt and streamed chunk. This experiment computed the
+six-step, sixteen-block modulation tensor and final-layer modulation once,
+then retained those graph-produced buffers at stable addresses for subsequent
+steady CFM replays. The first implementation cloned the outputs and was
+rejected immediately because the clone discarded their profitable internal
+layout. A second implementation retained the one-shot TorchAir producer
+storage directly; focused tests passed 121/121 and serving logs proved that
+the immutable slabs were created before the two-slot CFM capture and reused
+during replay.
+
+The performance gate used five deterministic 12-request measurements per side
+at concurrency one. It included both process orders. One severe transient
+contention sample occurred on each side, so the table reports the robust
+five-run median rather than selecting or averaging favorable runs. Every run
+completed 12/12 with zero failures and the same aggregate structure: 1,784
+input tokens, 163 output tokens, 1,160,640 frames, and 48.36 seconds of audio.
+Lower is better except throughput.
+
+| Metric | Accepted static CFM graph | Immutable modulation slabs | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 15.5907 s | 16.6199 s | +6.60% |
+| Request throughput | 0.76969 req/s | 0.72203 req/s | -6.19% |
+| Audio throughput | 3.10184 audio-s/s | 2.90976 audio-s/s | -6.19% |
+| Mean / P99 E2E | 1,298.80 / 1,670.52 ms | 1,384.57 / 2,173.46 ms | +6.60% / +30.11% |
+| Mean / P99 TTFT | 298.31 / 392.03 ms | 310.48 / 389.11 ms | +4.08% / -0.74% |
+| Mean / P99 audio TTFP | 767.27 / 867.94 ms | 787.18 / 909.09 ms | +2.60% / +4.74% |
+| Mean / P99 whole-audio RTF | 0.320006 / 0.387786 | 0.336686 / 0.402147 | +5.21% / +3.70% |
+
+The stable external buffers remove repeated projection arithmetic, but they
+also freeze a producer-consumer boundary outside the complete static CFM
+executable. On this stack that boundary costs more in layout/scheduling than
+the saved AdaLN projection. The option, code, tests, and deploy profile were
+therefore fully removed. The accepted implementation continues to expose the
+projection inside the graph-visible six-step CFM path, where GE can optimize
+it together with downstream consumers.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-static-cfm-modulations-20260821
+```
+
+Median-duration representative SHA-256 checksums are:
+
+```text
+6ebf29aa06159dba5c1dd06b1ceda6ebe41f1c15188a87f5165a3e1e0cc0737e  accepted reverse-control-run2.json
+478ddafbece60b65cfe05dcc0389c0dd1c14728b4477d8dcd8806de8a8c78751  candidate candidate-v3-run4.json
+```

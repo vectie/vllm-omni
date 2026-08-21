@@ -4944,3 +4944,62 @@ Median-duration representative SHA-256 checksums are:
 6ebf29aa06159dba5c1dd06b1ceda6ebe41f1c15188a87f5165a3e1e0cc0737e  accepted reverse-control-run2.json
 478ddafbece60b65cfe05dcc0389c0dd1c14728b4477d8dcd8806de8a8c78751  candidate candidate-v3-run4.json
 ```
+
+## Complete six-step TorchAir/GE CFM executable (rejected)
+
+The fixed width-50/cache-402 BSH slabs made it possible to test the deepest
+remaining graph boundary: all six CFM steps and all sixteen DiT blocks in one
+graph-visible TorchAir/GE executable. Prompt and tail shapes stayed on the
+accepted eager/raw-graph path. The candidate was fail-closed and never
+replaced the accepted profile.
+
+The first graph dump identified a CANN 9.0 lowering bug at the DiT input
+projection. TorchAir represented the logical `[2,50,320]` activation and
+`[512,320]` weight as a generic rank-three `MatMul`; GE then treated sequence
+width 50 as K and rejected it against 320. Flattening the projection to an
+explicit `[100,320] x [320,512]` GEMM preserved the math and produced a valid
+optimized graph. The aliased-output variant then compiled and replayed once,
+but stopped publishing the streaming request because the fixed cache slabs
+were both mutated inputs and returned outputs.
+
+A graph-owned-output revision removed that alias. It completed streaming with
+100% continuity and zero underrun, proving the liveness diagnosis, but was far
+slower than the accepted raw graph. The original/optimized dumps shrank from
+21.36/34.82 MB with aliased slabs to 18.74/30.37 MB with graph-owned outputs.
+The first empty-kernel-cache build took roughly twelve minutes; after AscendC
+kernel caching, the first warmup still took 221.57 seconds.
+
+The post-compile smoke generated 3.12 seconds of audio. Lower is better.
+
+| Metric | Complete GE executable |
+| --- | ---: |
+| Request E2E | 48,097.61 ms |
+| Stage-2 wall time | 48,080.96 ms |
+| Whole-audio RTF | 15.416 |
+| TTFT | 765.44 ms |
+| Audio TTFP | 1,453.52 ms |
+| Prior post-compile warmup Stage 2 | 54,335.29 ms |
+
+This is not a marginal regression that merits a larger A/B: the monolith
+removed profitable kernel scheduling/concurrency and made a three-second clip
+take forty-eight seconds. The code, environment switch, tests, graph-dump
+setting, and deploy profile were fully removed, and the accepted raw
+two-slot CFM graph was restored.
+
+The graph dump nevertheless closes two unknowns. Fixed slabs do solve shape
+churn, and a graph-visible complete CFM model can compile once the input
+projection is made two-dimensional. The remaining limit is executable size
+and scheduling, not capture eligibility. Any retry must use a bounded
+partition--preferably one CFM step or a small contiguous block stripe--and
+must keep outputs graph-owned without Python clones or input/output aliasing.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-cfm-ge-20260821
+```
+
+The completed smoke result is
+`smoke-v6-graph-owned-output/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-142623.json`
+with SHA-256
+`9076989ace4133f009f4abab5e984f06b4a709528f64498f33c838748f13cbfc`.

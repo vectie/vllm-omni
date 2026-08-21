@@ -2517,6 +2517,34 @@ class TestPlatformOverrides:
         assert extra["npu_dit_cache_major"] is True
         assert extra["npu_dit_qkv_pack"] is True
 
+    def test_minicpmo_4_5_910c_fused_qkv_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_fused_qkv_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_compute_dtype"] == "bf16"
+        assert extra["npu_cfm_planar_kv_slabs"] is True
+        assert extra["npu_dit_fused_qkv"] is True
+
+    def test_minicpmo_4_5_910c_planar_cache_major_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_cache_major_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_wide_final_adaln"] is True
+        assert extra["npu_cfm_planar_kv_slabs"] is True
+        assert extra["npu_dit_cache_major"] is True
+
     def test_minicpmo_4_5_910c_attention_cache_output_candidate_is_explicit(self):
         deploy_path = Path(
             get_deploy_config_path(

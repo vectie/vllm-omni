@@ -51,6 +51,7 @@ _NPU_DIT_FUSED_CONV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_PACK"
 _NPU_DIT_CACHE_MAJOR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_CACHE_MAJOR"
 _NPU_DIT_POST_ATTN_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_POST_ATTN_GRAPH"
 _NPU_DIT_QKV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_QKV_PACK"
+_NPU_DIT_FUSED_QKV_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_QKV"
 _NPU_DIT_ATTN_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT"
 _NPU_CFM_STACKED_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT"
 _NPU_CFM_FIXED_KV_SLABS_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_FIXED_KV_SLABS"
@@ -411,6 +412,21 @@ def _npu_dit_qkv_pack_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_DIT_QKV_PACK_ENV}={raw!r}")
+
+
+def _npu_dit_fused_qkv_enabled(config_value: Any = None) -> bool:
+    env_value = os.environ.get(_NPU_DIT_FUSED_QKV_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_FUSED_QKV_ENV}={raw!r}")
 
 
 def _npu_dit_attn_cache_out_enabled(config_value: Any = None) -> bool:
@@ -780,6 +796,31 @@ def _dit_attention_preamble_from_modulation(
         k_norm_weight,
         k_norm_bias,
     )
+
+
+def _dit_attention_preamble_fused_qkv_from_modulation(
+    x: torch.Tensor,
+    modulation: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    qkv_bias: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_norm_bias: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project Q/K/V with one graph-visible GEMM and retain BHSD outputs."""
+    shift_msa = modulation[:, :, :512]
+    scale_msa = modulation[:, :, 512:1024]
+    hidden = F.layer_norm(x, (512,), eps=1e-6)
+    hidden = hidden * (1 + scale_msa) + shift_msa
+    width = x.shape[1]
+    qkv = F.linear(hidden, qkv_weight, qkv_bias).reshape(2, width, 3, 8, 64)
+    q = qkv[:, :, 0].transpose(1, 2)
+    k = qkv[:, :, 1].transpose(1, 2)
+    v = qkv[:, :, 2].transpose(1, 2)
+    q = F.layer_norm(q, (64,), q_norm_weight, q_norm_bias, 1e-5)
+    k = F.layer_norm(k, (64,), k_norm_weight, k_norm_bias, 1e-5)
+    return modulation, q, k, v
 
 
 def _dit_attention_preamble_qkv_pack(
@@ -1336,6 +1377,7 @@ def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
             slab.logical_length,
             slab.active_cnn_bank,
             slab.planar,
+            slab.cnn_cache_major,
         )
     )
     return flow, hift, slab_signature
@@ -1367,6 +1409,7 @@ class FixedEstimatorKVSlabs:
     logical_length: int
     active_cnn_bank: int
     planar: bool = False
+    cnn_cache_major: bool = False
 
 
 @dataclass(frozen=True)
@@ -1406,6 +1449,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_cache_major: Any = None,
         npu_dit_post_attn_graph: Any = None,
         npu_dit_qkv_pack: Any = None,
+        npu_dit_fused_qkv: Any = None,
         npu_dit_attn_cache_out: Any = None,
         npu_cfm_stacked_cache_out: Any = None,
         npu_cfm_fixed_kv_slabs: Any = None,
@@ -1475,6 +1519,7 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_preamble_graph_enabled = _npu_dit_preamble_graph_enabled(npu_dit_preamble_graph)
         self._npu_dit_preamble_graph: Any | None = None
         self._npu_dit_qkv_preamble_graph: Any | None = None
+        self._npu_dit_fused_qkv_preamble_graph: Any | None = None
         self._npu_dit_preamble_graph_disabled = False
         self._npu_dit_preamble_graph_disabled_widths: set[int] = set()
         self._npu_dit_preamble_graph_used = False
@@ -1559,6 +1604,8 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_post_attn_graph_used = False
         self._npu_dit_qkv_pack_enabled = _npu_dit_qkv_pack_enabled(npu_dit_qkv_pack)
         self._npu_dit_qkv_pack_used = False
+        self._npu_dit_fused_qkv_enabled = _npu_dit_fused_qkv_enabled(npu_dit_fused_qkv)
+        self._npu_dit_fused_qkv_used = False
         self._npu_dit_attn_cache_out_enabled = _npu_dit_attn_cache_out_enabled(
             npu_dit_attn_cache_out
         )
@@ -1659,6 +1706,13 @@ class BatchedToken2Wav(nn.Module):
             logger.warning(
                 "MiniCPM-o wide AdaLN requires the DiT preamble graph; disabling it"
             )
+        if self._npu_dit_fused_qkv_enabled and not self._npu_dit_wide_adaln_enabled:
+            self._npu_dit_fused_qkv_enabled = False
+            logger.warning(
+                "MiniCPM-o fused QKV requires wide AdaLN modulation; disabling it"
+            )
+        if self._npu_dit_fused_qkv_enabled:
+            self._npu_dit_qkv_pack_enabled = False
         if self._npu_dit_wide_final_adaln_enabled and not self._npu_dit_wide_adaln_enabled:
             self._npu_dit_wide_final_adaln_enabled = False
             logger.warning(
@@ -2194,6 +2248,33 @@ class BatchedToken2Wav(nn.Module):
                     "MiniCPM-o native QKV layout pack unavailable; using ordinary transposes",
                     exc_info=True,
                 )
+        if self._npu_dit_fused_qkv_enabled:
+            for estimator_block in blocks:
+                attention = estimator_block.attn
+                attention.register_buffer(
+                    "_minicpmo_fused_qkv_weight",
+                    torch.cat(
+                        (
+                            attention.to_q.weight.detach(),
+                            attention.to_k.weight.detach(),
+                            attention.to_v.weight.detach(),
+                        ),
+                        dim=0,
+                    ).contiguous(),
+                    persistent=False,
+                )
+                attention.register_buffer(
+                    "_minicpmo_fused_qkv_bias",
+                    torch.cat(
+                        (
+                            attention.to_q.bias.detach(),
+                            attention.to_k.bias.detach(),
+                            attention.to_v.bias.detach(),
+                        ),
+                        dim=0,
+                    ).contiguous(),
+                    persistent=False,
+                )
         for width in self._npu_dit_graph_widths:
             try:
                 graph_fn = self._get_npu_dit_preamble_graph(width)
@@ -2209,7 +2290,12 @@ class BatchedToken2Wav(nn.Module):
                         None if wide_modulations is None else wide_modulations[:, :, 0, :],
                     )
                 torch.npu.synchronize()
-                if self._npu_dit_qkv_pack_enabled and width == self._npu_dit_mlp_graph_width:
+                if self._npu_dit_fused_qkv_enabled:
+                    logger.info(
+                        "Compiled MiniCPM-o NPU DiT fused-QKV preamble graph for 2x%dx512, 8x64 heads",
+                        width,
+                    )
+                elif self._npu_dit_qkv_pack_enabled and width == self._npu_dit_mlp_graph_width:
                     logger.info(
                         "Compiled MiniCPM-o NPU DiT native-QKV preamble graph for 2x%dx512, 8x64 heads",
                         width,
@@ -2220,6 +2306,32 @@ class BatchedToken2Wav(nn.Module):
                         width,
                     )
             except Exception:
+                if self._npu_dit_fused_qkv_enabled:
+                    self._npu_dit_fused_qkv_enabled = False
+                    self._npu_dit_fused_qkv_preamble_graph = None
+                    logger.warning(
+                        "MiniCPM-o fused-QKV preamble compilation failed at width=%d; retrying ordinary projections",
+                        width,
+                        exc_info=True,
+                    )
+                    try:
+                        graph_fn = self._get_npu_dit_preamble_graph(width)
+                        with torch.inference_mode():
+                            self._call_npu_dit_preamble_graph(
+                                graph_fn,
+                                block,
+                                x,
+                                time_embedding,
+                                None if wide_modulations is None else wide_modulations[:, :, 0, :],
+                            )
+                        torch.npu.synchronize()
+                        continue
+                    except Exception:
+                        logger.warning(
+                            "MiniCPM-o ordinary-projection preamble retry failed at width=%d",
+                            width,
+                            exc_info=True,
+                        )
                 if self._npu_dit_qkv_pack_enabled and width == self._npu_dit_mlp_graph_width:
                     self._npu_dit_qkv_pack_enabled = False
                     self._npu_dit_qkv_preamble_graph = None
@@ -2250,7 +2362,8 @@ class BatchedToken2Wav(nn.Module):
                         )
                 self._npu_dit_preamble_graph_disabled_widths.add(width)
                 logger.warning(
-                    "MiniCPM-o NPU DiT preamble graph compilation failed at width=%d; using eager attention for that width",
+                    "MiniCPM-o NPU DiT preamble graph compilation failed at "
+                    "width=%d; using eager attention for that width",
                     width,
                     exc_info=True,
                 )
@@ -2264,6 +2377,15 @@ class BatchedToken2Wav(nn.Module):
 
         _ensure_torchair_broadcast_alias()
         compiler_config = torchair.CompilerConfig()
+        if self._npu_dit_fused_qkv_enabled:
+            if self._npu_dit_fused_qkv_preamble_graph is None:
+                self._npu_dit_fused_qkv_preamble_graph = torch.compile(
+                    _dit_attention_preamble_fused_qkv_from_modulation,
+                    backend=torchair.get_npu_backend(compiler_config=compiler_config),
+                    fullgraph=True,
+                    dynamic=False,
+                )
+            return self._npu_dit_fused_qkv_preamble_graph
         if self._npu_dit_qkv_pack_enabled and width == self._npu_dit_mlp_graph_width:
             if self._npu_dit_qkv_preamble_graph is None:
                 self._npu_dit_qkv_preamble_graph = torch.compile(
@@ -2294,6 +2416,20 @@ class BatchedToken2Wav(nn.Module):
         time_embedding: torch.Tensor,
         modulation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if graph_fn is self._npu_dit_fused_qkv_preamble_graph:
+            if modulation is None:
+                raise RuntimeError("MiniCPM-o fused-QKV preamble requires wide AdaLN modulation")
+            attention = block.attn
+            return graph_fn(
+                hidden,
+                modulation,
+                attention._minicpmo_fused_qkv_weight,
+                attention._minicpmo_fused_qkv_bias,
+                attention.q_norm.weight,
+                attention.q_norm.bias,
+                attention.k_norm.weight,
+                attention.k_norm.bias,
+            )
         attention_args = (
             block.attn.to_q.weight,
             block.attn.to_q.bias,
@@ -3405,7 +3541,12 @@ class BatchedToken2Wav(nn.Module):
                         )
                         self._npu_dit_mlp_graph_used = True
                     if preamble_graph_fn is not None:
-                        if (
+                        if self._npu_dit_fused_qkv_enabled and not self._npu_dit_fused_qkv_used:
+                            logger.info(
+                                "MiniCPM-o NPU DiT fused-QKV attention preamble graph replay active"
+                            )
+                            self._npu_dit_fused_qkv_used = True
+                        elif (
                             self._npu_dit_qkv_pack_enabled
                             and graph_width == self._npu_dit_mlp_graph_width
                             and not self._npu_dit_qkv_pack_used
@@ -4471,6 +4612,7 @@ class BatchedToken2Wav(nn.Module):
         prompt_length: int,
         *,
         planar: bool = False,
+        cnn_cache_major: bool = False,
     ) -> FixedEstimatorKVSlabs | None:
         if planar and not BatchedToken2Wav._is_planar_att_cache(cache):
             key, value = cache.chunk(2, dim=-1)
@@ -4488,6 +4630,8 @@ class BatchedToken2Wav(nn.Module):
         retained = cache.new_empty(retained_shape)
         append = cache.new_empty(append_shape)
         retained[..., :logical_length, :].copy_(cache)
+        if cnn_cache_major and not BatchedToken2Wav._is_cache_major_cnn(cnn_cache):
+            cnn_cache = cnn_cache.transpose(-2, -1).contiguous()
         cnn_banks = (cnn_cache.clone(), torch.empty_like(cnn_cache))
         return FixedEstimatorKVSlabs(
             retained=retained,
@@ -4497,6 +4641,7 @@ class BatchedToken2Wav(nn.Module):
             logical_length=logical_length,
             active_cnn_bank=0,
             planar=planar,
+            cnn_cache_major=cnn_cache_major,
         )
 
     @staticmethod
@@ -4517,6 +4662,10 @@ class BatchedToken2Wav(nn.Module):
             )
         next_cnn_bank = 1 - slabs.active_cnn_bank
         cnn_bank = slabs.cnn_banks[next_cnn_bank]
+        if slabs.cnn_cache_major != BatchedToken2Wav._is_cache_major_cnn(
+            cnn_output
+        ):
+            cnn_output = cnn_output.transpose(-2, -1).contiguous()
         if cnn_bank.data_ptr() != cnn_output.data_ptr():
             cnn_bank.copy_(cnn_output)
         return FixedEstimatorKVSlabs(
@@ -4527,6 +4676,7 @@ class BatchedToken2Wav(nn.Module):
             logical_length=retained_length,
             active_cnn_bank=next_cnn_bank,
             planar=slabs.planar,
+            cnn_cache_major=slabs.cnn_cache_major,
         )
 
     def setup_batch(
@@ -4571,6 +4721,10 @@ class BatchedToken2Wav(nn.Module):
                     row["estimator_cnn_cache"],
                     prompt_length,
                     planar=self._npu_cfm_planar_kv_slabs_enabled,
+                    cnn_cache_major=(
+                        self._npu_dit_cache_major_enabled
+                        and row["estimator_cnn_cache"].device.type == "npu"
+                    ),
                 )
                 if self._npu_cfm_fixed_kv_slabs_enabled and batch_size == 1
                 else None
@@ -4658,7 +4812,11 @@ class BatchedToken2Wav(nn.Module):
             if fixed_slabs is not None:
                 output_length = fixed_slabs.logical_length + int(hidden.shape[1])
                 append_capacity = int(fixed_slabs.append.shape[-2])
-                if output_length <= append_capacity:
+                fixed_output_layout_compatible = (
+                    not fixed_slabs.cnn_cache_major
+                    or int(hidden.shape[1]) == self._npu_dit_mlp_graph_width
+                )
+                if output_length <= append_capacity and fixed_output_layout_compatible:
                     att_output = fixed_slabs.append[..., :output_length, :]
                     cnn_output = fixed_slabs.cnn_banks[
                         1 - fixed_slabs.active_cnn_bank
@@ -4668,7 +4826,10 @@ class BatchedToken2Wav(nn.Module):
                         and fixed_slabs.logical_length
                         == fixed_slabs.prompt_length + 100
                     )
-                elif not self._npu_cfm_fixed_kv_tail_fallback_used:
+                elif (
+                    output_length > append_capacity
+                    and not self._npu_cfm_fixed_kv_tail_fallback_used
+                ):
                     logger.info(
                         "MiniCPM-o fixed estimator KV tail uses eager dynamic "
                         "output: required=%d, append=%d",
@@ -4700,10 +4861,12 @@ class BatchedToken2Wav(nn.Module):
             ]
             if not self._npu_cfm_fixed_kv_slabs_used:
                 logger.info(
-                    "MiniCPM-o fixed estimator KV slabs active: retained=%d, append=%d, planar=%s",
+                    "MiniCPM-o fixed estimator KV slabs active: retained=%d, "
+                    "append=%d, planar=%s, cnn_cache_major=%s",
                     int(fixed_slabs.retained.shape[-2]),
                     int(fixed_slabs.append.shape[-2]),
                     fixed_slabs.planar,
+                    fixed_slabs.cnn_cache_major,
                 )
                 self._npu_cfm_fixed_kv_slabs_used = True
         elif estimator_att.shape[-2] > prompt_len + 100:

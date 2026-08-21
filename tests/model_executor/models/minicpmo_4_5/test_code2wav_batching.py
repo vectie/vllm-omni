@@ -11,6 +11,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_attention_cache_length,
     _dit_attention_preamble,
     _dit_attention_preamble_from_modulation,
+    _dit_attention_preamble_fused_qkv_from_modulation,
     _dit_attention_preamble_qkv_pack,
     _dit_cache_major_conv_mlp_residual,
     _dit_cache_major_post_attention_conv_mlp_residual,
@@ -26,8 +27,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_mlp_residual,
     _dit_wide_adaln_steps,
     _dit_wide_adaln_steps_with_final,
-    _npu_cfm_integration_dtype,
     _npu_cfm_fixed_kv_slabs_enabled,
+    _npu_cfm_integration_dtype,
     _npu_cfm_planar_kv_slabs_enabled,
     _npu_cfm_stacked_cache_out_enabled,
     _npu_dit_attn_cache_out_enabled,
@@ -35,13 +36,14 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_compute_dtype,
     _npu_dit_conv_mlp_graph_enabled,
     _npu_dit_final_addcmul_enabled,
-    _npu_dit_fused_final_adaln_enabled,
     _npu_dit_full_block_cache_buckets,
     _npu_dit_full_block_graph_enabled,
     _npu_dit_full_stack_graph_enabled,
     _npu_dit_fused_conv_block_enabled,
     _npu_dit_fused_conv_linear_enabled,
     _npu_dit_fused_conv_pack_enabled,
+    _npu_dit_fused_final_adaln_enabled,
+    _npu_dit_fused_qkv_enabled,
     _npu_dit_graph_buckets,
     _npu_dit_last_block_final_euler_graph_enabled,
     _npu_dit_last_block_final_euler_perf_qualifies,
@@ -610,6 +612,48 @@ def test_dit_attention_preamble_qkv_pack_matches_standard_partition(monkeypatch)
 
     actual = _dit_attention_preamble_qkv_pack(*arguments)
     expected = _dit_attention_preamble(*arguments)
+
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("width", [20, 50, 302])
+def test_dit_attention_preamble_fused_qkv_matches_standard_partition(width: int):
+    torch.manual_seed(19)
+    x = torch.randn(2, width, 512)
+    modulation = torch.randn(2, 1, 9 * 512)
+    to_q = nn.Linear(512, 512)
+    to_k = nn.Linear(512, 512)
+    to_v = nn.Linear(512, 512)
+    q_norm = nn.LayerNorm(64)
+    k_norm = nn.LayerNorm(64)
+    qkv_weight = torch.cat((to_q.weight, to_k.weight, to_v.weight), dim=0)
+    qkv_bias = torch.cat((to_q.bias, to_k.bias, to_v.bias), dim=0)
+
+    actual = _dit_attention_preamble_fused_qkv_from_modulation(
+        x,
+        modulation,
+        qkv_weight,
+        qkv_bias,
+        q_norm.weight,
+        q_norm.bias,
+        k_norm.weight,
+        k_norm.bias,
+    )
+    expected = _dit_attention_preamble_from_modulation(
+        x,
+        modulation,
+        to_q.weight,
+        to_q.bias,
+        to_k.weight,
+        to_k.bias,
+        to_v.weight,
+        to_v.bias,
+        q_norm.weight,
+        q_norm.bias,
+        k_norm.weight,
+        k_norm.bias,
+    )
 
     for result, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
@@ -1519,6 +1563,18 @@ def test_npu_dit_qkv_pack_config_and_environment(monkeypatch):
         _npu_dit_qkv_pack_enabled()
 
 
+def test_npu_dit_fused_qkv_config_and_environment(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_QKV", raising=False)
+    assert _npu_dit_fused_qkv_enabled(True) is True
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_QKV", "off")
+    assert _npu_dit_fused_qkv_enabled(True) is False
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_QKV", "sometimes")
+    with pytest.raises(ValueError, match="NPU_DIT_FUSED_QKV"):
+        _npu_dit_fused_qkv_enabled()
+
+
 def test_npu_dit_attn_cache_out_config_and_environment(monkeypatch):
     monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT", raising=False)
     assert _npu_dit_attn_cache_out_enabled(True) is True
@@ -1787,6 +1843,34 @@ def test_fixed_estimator_kv_slabs_are_exact_and_keep_addresses():
         assert slabs.retained.data_ptr() == retained_address
         assert slabs.append.data_ptr() == append_address
         assert tuple(bank.data_ptr() for bank in slabs.cnn_banks) == cnn_addresses
+
+
+def test_fixed_estimator_slabs_keep_cnn_cache_major_across_eager_tail():
+    attention = torch.randn(6, 16, 2, 8, 4, 128)
+    cnn = torch.randn(6, 16, 2, 1024, 2)
+    slabs = BatchedToken2Wav._make_fixed_estimator_kv_slabs(
+        attention,
+        cnn,
+        4,
+        cnn_cache_major=True,
+    )
+
+    assert slabs is not None
+    assert slabs.cnn_cache_major is True
+    assert slabs.cnn_banks[0].shape[-2:] == (2, 1024)
+    torch.testing.assert_close(slabs.cnn_banks[0], cnn.transpose(-2, -1))
+
+    eager_tail_cnn = torch.randn_like(cnn)
+    advanced = BatchedToken2Wav._advance_fixed_estimator_kv_slabs(
+        slabs,
+        slabs.append[..., :5, :],
+        eager_tail_cnn,
+    )
+    assert advanced.cnn_cache_major is True
+    torch.testing.assert_close(
+        advanced.cnn_banks[advanced.active_cnn_bank],
+        eager_tail_cnn.transpose(-2, -1),
+    )
 
 
 def test_planar_estimator_kv_slabs_are_exact_and_keep_addresses():

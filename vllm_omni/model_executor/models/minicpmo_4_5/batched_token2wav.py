@@ -54,6 +54,7 @@ _NPU_DIT_QKV_PACK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_QKV_PACK"
 _NPU_DIT_ATTN_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT"
 _NPU_CFM_STACKED_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT"
 _NPU_CFM_FIXED_KV_SLABS_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_FIXED_KV_SLABS"
+_NPU_CFM_PLANAR_KV_SLABS_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_PLANAR_KV_SLABS"
 _NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH"
 )
@@ -143,6 +144,22 @@ def _npu_cfm_fixed_kv_slabs_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_CFM_FIXED_KV_SLABS_ENV}={raw!r}")
+
+
+def _npu_cfm_planar_kv_slabs_enabled(config_value: Any = None) -> bool:
+    """Resolve the opt-in contiguous K/V-plane cache representation."""
+    env_value = os.environ.get(_NPU_CFM_PLANAR_KV_SLABS_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_CFM_PLANAR_KV_SLABS_ENV}={raw!r}")
 
 
 def _npu_dit_mlp_graph_enabled(config_value: Any = None) -> bool:
@@ -1318,6 +1335,7 @@ def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
             slab.prompt_length,
             slab.logical_length,
             slab.active_cnn_bank,
+            slab.planar,
         )
     )
     return flow, hift, slab_signature
@@ -1348,6 +1366,7 @@ class FixedEstimatorKVSlabs:
     prompt_length: int
     logical_length: int
     active_cnn_bank: int
+    planar: bool = False
 
 
 @dataclass(frozen=True)
@@ -1390,6 +1409,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_attn_cache_out: Any = None,
         npu_cfm_stacked_cache_out: Any = None,
         npu_cfm_fixed_kv_slabs: Any = None,
+        npu_cfm_planar_kv_slabs: Any = None,
         npu_single_request_cache_passthrough: Any = None,
         npu_dit_fused_conv_block: Any = None,
         npu_dit_fused_conv_linear: Any = None,
@@ -1551,6 +1571,13 @@ class BatchedToken2Wav(nn.Module):
             npu_cfm_fixed_kv_slabs
         )
         self._npu_cfm_fixed_kv_slabs_used = False
+        self._npu_cfm_planar_kv_slabs_enabled = _npu_cfm_planar_kv_slabs_enabled(
+            npu_cfm_planar_kv_slabs
+        )
+        if self._npu_cfm_planar_kv_slabs_enabled:
+            self._npu_cfm_fixed_kv_slabs_enabled = True
+        self._npu_cfm_planar_kv_slabs_used = False
+        self._npu_cfm_fixed_kv_tail_fallback_used = False
         self._npu_single_request_cache_passthrough_enabled = (
             _npu_single_request_cache_passthrough_enabled(
                 npu_single_request_cache_passthrough
@@ -3167,18 +3194,39 @@ class BatchedToken2Wav(nn.Module):
         depth = len(blocks)
         batch_size = int(x.shape[0])
         chunk_size = int(x.shape[2])
-        old_att_len = int(old_att.shape[3]) if old_att is not None else 0
+        planar_att = BatchedToken2Wav._is_planar_att_cache(old_att)
+        old_att_len = (
+            int(old_att.shape[-2])
+            if planar_att
+            else (int(old_att.shape[3]) if old_att is not None else 0)
+        )
         block0 = blocks[0]
         cnn_channels = int(block0.conv.in_channels + block0.conv.out_channels)
         cnn_width = int(block0.conv.block[1].causal_padding[0])
         heads = int(block0.attn.num_heads)
-        att_width = int(block0.attn.head_dim * 2)
+        head_dim = int(block0.attn.head_dim)
         cnn_shape = (
             (depth, batch_size, cnn_width, cnn_channels)
             if cache_major
             else (depth, batch_size, cnn_channels, cnn_width)
         )
-        att_shape = (depth, batch_size, heads, old_att_len + chunk_size, att_width)
+        if planar_att:
+            att_shape = (
+                depth,
+                2,
+                batch_size,
+                heads,
+                old_att_len + chunk_size,
+                head_dim,
+            )
+        else:
+            att_shape = (
+                depth,
+                batch_size,
+                heads,
+                old_att_len + chunk_size,
+                head_dim * 2,
+            )
         return cnn_shape, att_shape
 
     @classmethod
@@ -3221,6 +3269,7 @@ class BatchedToken2Wav(nn.Module):
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         cache_major = self._is_cache_major_cnn(cnn_cache)
+        planar_att = self._is_planar_att_cache(att_cache)
         if cnn_out is None or att_out is None:
             if cnn_out is not None or att_out is not None:
                 raise ValueError("cnn_out and att_out must be provided together")
@@ -3248,6 +3297,7 @@ class BatchedToken2Wav(nn.Module):
                     full_stack_cache_length = _dit_attention_cache_length(att_cache)
                     if (
                         graph_width == self._npu_dit_mlp_graph_width
+                        and not planar_att
                         and not cache_major
                         and isinstance(cnn_cache, torch.Tensor)
                         and isinstance(att_cache, torch.Tensor)
@@ -3293,6 +3343,7 @@ class BatchedToken2Wav(nn.Module):
                     full_block_cache_length = _dit_attention_cache_length(att_cache)
                     if full_block_graph_fn is None and (
                         graph_width == self._npu_dit_mlp_graph_width
+                        and not planar_att
                         and not cache_major
                         and cnn_cache is not None
                         and att_cache is not None
@@ -3418,6 +3469,16 @@ class BatchedToken2Wav(nn.Module):
         if cache_major:
             old_cnn = old_cnn.transpose(-2, -1).contiguous()
             cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
+        legacy_att_out = att_out
+        if planar_att:
+            legacy_old_att = self._legacy_att_cache_from_planar(att_cache)
+            _, legacy_att_shape = self._estimator_buffer_shapes(
+                estimator,
+                estimator_input,
+                legacy_old_att,
+            )
+            legacy_att_out = estimator_input.new_empty(legacy_att_shape)
+            old_att = legacy_old_att
         result = estimator.blocks_forward_chunk(
             estimator_input,
             time_embedding,
@@ -3425,8 +3486,10 @@ class BatchedToken2Wav(nn.Module):
             old_cnn,
             old_att,
             cnn_out,
-            att_out,
+            legacy_att_out,
         )
+        if planar_att:
+            self._copy_legacy_att_cache_to_planar(att_out, legacy_att_out)
         return result, cnn_out, att_out, False
 
     @staticmethod
@@ -3527,16 +3590,43 @@ class BatchedToken2Wav(nn.Module):
                 gate_conv,
             ) = modulation.chunk(9, dim=-1)
 
+            block_att_cache = old_att[block_idx]
+            block_att_output = att_out[block_idx]
+            planar_att = self._is_planar_att_cache(block_att_cache)
             if q is None or k is None or v is None:
-                attention_cache_written = False
+                legacy_att_cache = (
+                    self._legacy_att_cache_from_planar(block_att_cache)
+                    if planar_att
+                    else block_att_cache
+                )
                 attention, new_att = block.attn.forward_chunk(
                     block.norm1(hidden) * (1 + scale_msa) + shift_msa,
-                    old_att[block_idx],
+                    legacy_att_cache,
                     None,
                 )
+                attention_cache_written = planar_att
+                if planar_att:
+                    new_att = self._copy_legacy_att_cache_to_planar(
+                        block_att_output, new_att
+                    )
+            elif planar_att:
+                attention, new_att = self._attention_from_projected_qkv_planar(
+                    block.attn,
+                    q,
+                    k,
+                    v,
+                    block_att_cache,
+                    block_att_output,
+                )
+                attention_cache_written = True
+                if not self._npu_cfm_planar_kv_slabs_used:
+                    logger.info(
+                        "MiniCPM-o contiguous planar K/V attention cache active"
+                    )
+                    self._npu_cfm_planar_kv_slabs_used = True
             else:
                 output_cache = (
-                    att_out[block_idx]
+                    block_att_output
                     if self._npu_dit_attn_cache_out_enabled
                     else None
                 )
@@ -3545,7 +3635,7 @@ class BatchedToken2Wav(nn.Module):
                     q,
                     k,
                     v,
-                    old_att[block_idx],
+                    block_att_cache,
                     output_cache=output_cache,
                 )
                 attention_cache_written = output_cache is not None
@@ -3834,6 +3924,60 @@ class BatchedToken2Wav(nn.Module):
         hidden = attention_module.proj_drop(hidden)
         return hidden, new_att_cache
 
+    @staticmethod
+    def _is_planar_att_cache(cache: torch.Tensor | None) -> bool:
+        """Whether cache uses ``[..., K/V, CFG, heads, time, head_dim]``."""
+        return (
+            isinstance(cache, torch.Tensor)
+            and cache.ndim in {5, 6, 7}
+            and int(cache.shape[-5]) == 2
+        )
+
+    @staticmethod
+    def _legacy_att_cache_from_planar(cache: torch.Tensor) -> torch.Tensor:
+        if not BatchedToken2Wav._is_planar_att_cache(cache):
+            return cache
+        key = cache.select(-5, 0)
+        value = cache.select(-5, 1)
+        return torch.cat((key, value), dim=-1)
+
+    @staticmethod
+    def _copy_legacy_att_cache_to_planar(
+        destination: torch.Tensor,
+        source: torch.Tensor,
+    ) -> torch.Tensor:
+        key, value = source.chunk(2, dim=-1)
+        destination.select(-5, 0).copy_(key)
+        destination.select(-5, 1).copy_(value)
+        return destination
+
+    @staticmethod
+    def _attention_from_projected_qkv_planar(
+        attention_module: nn.Module,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        att_cache: torch.Tensor | None,
+        output_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append and attend with independently contiguous K and V planes."""
+        output_k = output_cache.select(0, 0)
+        output_v = output_cache.select(0, 1)
+        if att_cache is None:
+            output_k.copy_(k)
+            output_v.copy_(v)
+        else:
+            cache_k = att_cache.select(0, 0)
+            cache_v = att_cache.select(0, 1)
+            torch.cat((k, cache_k), dim=2, out=output_k)
+            torch.cat((v, cache_v), dim=2, out=output_v)
+        hidden = F.scaled_dot_product_attention(q, output_k, output_v)
+        batch_size, _, width, _ = hidden.shape
+        hidden = hidden.transpose(1, 2).reshape(batch_size, width, -1)
+        hidden = attention_module.proj(hidden)
+        hidden = attention_module.proj_drop(hidden)
+        return hidden, output_cache
+
     def _estimator_time_embeddings(
         self,
         estimator: nn.Module,
@@ -3917,7 +4061,7 @@ class BatchedToken2Wav(nn.Module):
             if self._npu_dit_mixed_precision_enabled
             else mu.dtype
         )
-        offset = int(att_cache.shape[4]) if att_cache is not None else 0
+        offset = int(att_cache.shape[-2]) if att_cache is not None else 0
         end = offset + int(mu.shape[2])
         if end > int(decoder.rand_noise.shape[2]):
             raise RuntimeError(
@@ -4258,7 +4402,10 @@ class BatchedToken2Wav(nn.Module):
         cache: dict[str, torch.Tensor],
         batch_size: int,
     ) -> list[dict[str, torch.Tensor]]:
-        if self._npu_single_request_cache_passthrough_enabled and batch_size == 1:
+        planar_att = self._is_planar_att_cache(cache.get("estimator_att_cache"))
+        if batch_size == 1 and (
+            self._npu_single_request_cache_passthrough_enabled or planar_att
+        ):
             if not self._npu_single_request_cache_passthrough_used:
                 logger.info("MiniCPM-o NPU single-request cache passthrough active")
                 self._npu_single_request_cache_passthrough_used = True
@@ -4288,9 +4435,24 @@ class BatchedToken2Wav(nn.Module):
         return result
 
     def _stack_flow_cache(self, states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
-        if self._npu_single_request_cache_passthrough_enabled and len(states) == 1:
+        if len(states) == 1 and (
+            self._npu_single_request_cache_passthrough_enabled
+            or self._is_planar_att_cache(
+                states[0].flow_cache.get("estimator_att_cache")
+            )
+        ):
             return states[0].flow_cache
-        flows = [state.flow_cache for state in states]
+        flows: list[dict[str, torch.Tensor]] = []
+        for state in states:
+            flow = state.flow_cache
+            if self._is_planar_att_cache(flow.get("estimator_att_cache")):
+                flow = dict(flow)
+                flow["estimator_att_cache"] = (
+                    self._legacy_att_cache_from_planar(
+                        flow["estimator_att_cache"]
+                    )
+                )
+            flows.append(flow)
         conditional_cnn = [flow["estimator_cnn_cache"][:, :, 0:1] for flow in flows]
         unconditional_cnn = [flow["estimator_cnn_cache"][:, :, 1:2] for flow in flows]
         conditional_att = [flow["estimator_att_cache"][:, :, 0:1] for flow in flows]
@@ -4307,8 +4469,13 @@ class BatchedToken2Wav(nn.Module):
         cache: torch.Tensor,
         cnn_cache: torch.Tensor,
         prompt_length: int,
+        *,
+        planar: bool = False,
     ) -> FixedEstimatorKVSlabs | None:
-        logical_length = int(cache.shape[4])
+        if planar and not BatchedToken2Wav._is_planar_att_cache(cache):
+            key, value = cache.chunk(2, dim=-1)
+            cache = torch.stack((key, value), dim=2).contiguous()
+        logical_length = int(cache.shape[-2])
         if logical_length != prompt_length:
             logger.warning(
                 "MiniCPM-o fixed KV slabs disabled for request: prompt=%d, cache=%d",
@@ -4316,8 +4483,8 @@ class BatchedToken2Wav(nn.Module):
                 logical_length,
             )
             return None
-        retained_shape = (*cache.shape[:4], prompt_length + 100, cache.shape[5])
-        append_shape = (*cache.shape[:4], prompt_length + 150, cache.shape[5])
+        retained_shape = (*cache.shape[:-2], prompt_length + 100, cache.shape[-1])
+        append_shape = (*cache.shape[:-2], prompt_length + 150, cache.shape[-1])
         retained = cache.new_empty(retained_shape)
         append = cache.new_empty(append_shape)
         retained[..., :logical_length, :].copy_(cache)
@@ -4329,6 +4496,7 @@ class BatchedToken2Wav(nn.Module):
             prompt_length=prompt_length,
             logical_length=logical_length,
             active_cnn_bank=0,
+            planar=planar,
         )
 
     @staticmethod
@@ -4337,7 +4505,7 @@ class BatchedToken2Wav(nn.Module):
         att_output: torch.Tensor,
         cnn_output: torch.Tensor,
     ) -> FixedEstimatorKVSlabs:
-        output_length = int(att_output.shape[4])
+        output_length = int(att_output.shape[-2])
         retained_length = min(output_length, slabs.prompt_length + 100)
         if output_length <= retained_length:
             slabs.retained[..., :output_length, :].copy_(att_output)
@@ -4358,6 +4526,7 @@ class BatchedToken2Wav(nn.Module):
             prompt_length=slabs.prompt_length,
             logical_length=retained_length,
             active_cnn_bank=next_cnn_bank,
+            planar=slabs.planar,
         )
 
     def setup_batch(
@@ -4401,6 +4570,7 @@ class BatchedToken2Wav(nn.Module):
                     row["estimator_att_cache"],
                     row["estimator_cnn_cache"],
                     prompt_length,
+                    planar=self._npu_cfm_planar_kv_slabs_enabled,
                 )
                 if self._npu_cfm_fixed_kv_slabs_enabled and batch_size == 1
                 else None
@@ -4487,21 +4657,25 @@ class BatchedToken2Wav(nn.Module):
             steady_graph = False
             if fixed_slabs is not None:
                 output_length = fixed_slabs.logical_length + int(hidden.shape[1])
-                if output_length > int(fixed_slabs.append.shape[4]):
-                    raise RuntimeError(
-                        "MiniCPMO45Code2WavBatchError "
-                        f'{{"reason":"kv_slab_capacity","required":{output_length},'
-                        f'"available":{int(fixed_slabs.append.shape[4])}}}'
+                append_capacity = int(fixed_slabs.append.shape[-2])
+                if output_length <= append_capacity:
+                    att_output = fixed_slabs.append[..., :output_length, :]
+                    cnn_output = fixed_slabs.cnn_banks[
+                        1 - fixed_slabs.active_cnn_bank
+                    ]
+                    steady_graph = (
+                        int(hidden.shape[1]) == 50
+                        and fixed_slabs.logical_length
+                        == fixed_slabs.prompt_length + 100
                     )
-                att_output = fixed_slabs.append[..., :output_length, :]
-                cnn_output = fixed_slabs.cnn_banks[
-                    1 - fixed_slabs.active_cnn_bank
-                ]
-                steady_graph = (
-                    int(hidden.shape[1]) == 50
-                    and fixed_slabs.logical_length
-                    == fixed_slabs.prompt_length + 100
-                )
+                elif not self._npu_cfm_fixed_kv_tail_fallback_used:
+                    logger.info(
+                        "MiniCPM-o fixed estimator KV tail uses eager dynamic "
+                        "output: required=%d, append=%d",
+                        output_length,
+                        append_capacity,
+                    )
+                    self._npu_cfm_fixed_kv_tail_fallback_used = True
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
@@ -4526,15 +4700,16 @@ class BatchedToken2Wav(nn.Module):
             ]
             if not self._npu_cfm_fixed_kv_slabs_used:
                 logger.info(
-                    "MiniCPM-o fixed estimator KV slabs active: retained=%d, append=%d",
-                    int(fixed_slabs.retained.shape[4]),
-                    int(fixed_slabs.append.shape[4]),
+                    "MiniCPM-o fixed estimator KV slabs active: retained=%d, append=%d, planar=%s",
+                    int(fixed_slabs.retained.shape[-2]),
+                    int(fixed_slabs.append.shape[-2]),
+                    fixed_slabs.planar,
                 )
                 self._npu_cfm_fixed_kv_slabs_used = True
-        elif estimator_att.shape[4] > prompt_len + 100:
+        elif estimator_att.shape[-2] > prompt_len + 100:
             estimator_att = torch.cat(
                 (estimator_att[..., :prompt_len, :], estimator_att[..., -100:, :]),
-                dim=4,
+                dim=-2,
             )
         if conformer_att.shape[3] > prompt_len + 100:
             conformer_att = torch.cat(

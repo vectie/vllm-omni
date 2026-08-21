@@ -28,6 +28,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_wide_adaln_steps_with_final,
     _npu_cfm_integration_dtype,
     _npu_cfm_fixed_kv_slabs_enabled,
+    _npu_cfm_planar_kv_slabs_enabled,
     _npu_cfm_stacked_cache_out_enabled,
     _npu_dit_attn_cache_out_enabled,
     _npu_dit_cache_major_enabled,
@@ -643,6 +644,38 @@ def test_attention_from_projected_qkv_matches_cached_sdpa_math():
     torch.testing.assert_close(direct, expected, rtol=0, atol=0)
     torch.testing.assert_close(direct_cache, new_cache, rtol=0, atol=0)
     assert direct_cache is output_cache
+
+
+def test_planar_attention_from_projected_qkv_matches_legacy_cache_math():
+    torch.manual_seed(17)
+    attention = SimpleNamespace(proj=nn.Linear(512, 512), proj_drop=nn.Identity())
+    q = torch.randn(2, 8, 50, 64)
+    k = torch.randn(2, 8, 50, 64)
+    v = torch.randn(2, 8, 50, 64)
+    legacy_cache = torch.randn(2, 8, 7, 128)
+    cached_k, cached_v = legacy_cache.chunk(2, dim=-1)
+    planar_cache = torch.stack((cached_k, cached_v), dim=0).contiguous()
+    planar_output = torch.empty(2, 2, 8, 57, 64)
+
+    expected, expected_cache = BatchedToken2Wav._attention_from_projected_qkv(
+        attention, q, k, v, legacy_cache
+    )
+    actual, actual_cache = (
+        BatchedToken2Wav._attention_from_projected_qkv_planar(
+            attention, q, k, v, planar_cache, planar_output
+        )
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        BatchedToken2Wav._legacy_att_cache_from_planar(actual_cache),
+        expected_cache,
+        rtol=0,
+        atol=0,
+    )
+    assert actual_cache is planar_output
+    assert actual_cache.select(0, 0).is_contiguous()
+    assert actual_cache.select(0, 1).is_contiguous()
 
 
 def test_attention_from_projected_qkv_rejects_bad_output_cache_shape():
@@ -1526,6 +1559,24 @@ def test_npu_cfm_fixed_kv_slabs_config_and_environment(monkeypatch):
         _npu_cfm_fixed_kv_slabs_enabled()
 
 
+def test_npu_cfm_planar_kv_slabs_config_and_environment(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_PLANAR_KV_SLABS", raising=False
+    )
+    assert _npu_cfm_planar_kv_slabs_enabled(True) is True
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_PLANAR_KV_SLABS", "off"
+    )
+    assert _npu_cfm_planar_kv_slabs_enabled(True) is False
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_PLANAR_KV_SLABS", "sometimes"
+    )
+    with pytest.raises(ValueError, match="NPU_CFM_PLANAR_KV_SLABS"):
+        _npu_cfm_planar_kv_slabs_enabled()
+
+
 def test_npu_single_request_cache_passthrough_config_and_environment(monkeypatch):
     monkeypatch.delenv(
         "VLLM_OMNI_MINICPMO45_NPU_SINGLE_REQUEST_CACHE_PASSTHROUGH",
@@ -1736,6 +1787,106 @@ def test_fixed_estimator_kv_slabs_are_exact_and_keep_addresses():
         assert slabs.retained.data_ptr() == retained_address
         assert slabs.append.data_ptr() == append_address
         assert tuple(bank.data_ptr() for bank in slabs.cnn_banks) == cnn_addresses
+
+
+def test_planar_estimator_kv_slabs_are_exact_and_keep_addresses():
+    control = BatchedToken2Wav(_FakeToken2Wav())
+    candidate = BatchedToken2Wav(
+        _FakeToken2Wav(),
+        npu_cfm_planar_kv_slabs=True,
+    )
+    control_prompt = control.prepare_prompt("shared", "/fake/prompt.wav")
+    candidate_prompt = candidate.prepare_prompt("shared", "/fake/prompt.wav")
+    control_states = control.setup_batch(control_prompt, 1)
+    candidate_states = candidate.setup_batch(candidate_prompt, 1)
+    slabs = candidate_states[0].estimator_kv_slabs
+    assert slabs is not None
+    assert slabs.planar is True
+    assert slabs.retained.ndim == 7
+    assert slabs.retained[0, 0].select(0, 0).is_contiguous()
+    assert slabs.retained[0, 0].select(0, 1).is_contiguous()
+    retained_address = slabs.retained.data_ptr()
+    append_address = slabs.append.data_ptr()
+
+    for tokens, last_chunk in (
+        (torch.tensor([[10, 11]]), False),
+        (torch.tensor([[12, 13]]), False),
+        (torch.tensor([[14, 15]]), False),
+        (torch.tensor([[16]]), True),
+    ):
+        control_audio, control_states = control.decode_batch(
+            tokens, control_prompt, control_states, last_chunk=last_chunk
+        )
+        candidate_audio, candidate_states = candidate.decode_batch(
+            tokens, candidate_prompt, candidate_states, last_chunk=last_chunk
+        )
+        assert torch.equal(control_audio[0], candidate_audio[0])
+        for name in control_states[0].flow_cache:
+            candidate_value = candidate_states[0].flow_cache[name]
+            if name == "estimator_att_cache":
+                candidate_value = candidate._legacy_att_cache_from_planar(
+                    candidate_value
+                )
+            assert torch.equal(
+                control_states[0].flow_cache[name], candidate_value
+            )
+        slabs = candidate_states[0].estimator_kv_slabs
+        assert slabs is not None
+        assert slabs.retained.data_ptr() == retained_address
+        assert slabs.append.data_ptr() == append_address
+
+
+def test_planar_estimator_kv_slabs_use_exact_dynamic_tail_on_overflow():
+    control = BatchedToken2Wav(_FakeToken2Wav())
+    candidate = BatchedToken2Wav(
+        _FakeToken2Wav(),
+        npu_cfm_planar_kv_slabs=True,
+    )
+    control_prompt = control.prepare_prompt("shared", "/fake/prompt.wav")
+    candidate_prompt = candidate.prepare_prompt("shared", "/fake/prompt.wav")
+    control_states = control.setup_batch(control_prompt, 1)
+    candidate_state = candidate.setup_batch(candidate_prompt, 1)[0]
+    slabs = candidate_state.estimator_kv_slabs
+    assert slabs is not None
+    limited_slabs = type(slabs)(
+        retained=slabs.retained,
+        append=slabs.append[..., : slabs.logical_length, :],
+        cnn_banks=slabs.cnn_banks,
+        prompt_length=slabs.prompt_length,
+        logical_length=slabs.logical_length,
+        active_cnn_bank=slabs.active_cnn_bank,
+        planar=slabs.planar,
+    )
+    candidate_states = [
+        type(candidate_state)(
+            flow_cache=candidate_state.flow_cache,
+            hift_cache=candidate_state.hift_cache,
+            estimator_kv_slabs=limited_slabs,
+        )
+    ]
+
+    control_audio, control_states = control.decode_batch(
+        torch.tensor([[10, 11]]),
+        control_prompt,
+        control_states,
+        last_chunk=True,
+    )
+    candidate_audio, candidate_states = candidate.decode_batch(
+        torch.tensor([[10, 11]]),
+        candidate_prompt,
+        candidate_states,
+        last_chunk=True,
+    )
+
+    assert torch.equal(control_audio[0], candidate_audio[0])
+    assert candidate._npu_cfm_fixed_kv_tail_fallback_used is True
+    for name in control_states[0].flow_cache:
+        candidate_value = candidate_states[0].flow_cache[name]
+        if name == "estimator_att_cache":
+            candidate_value = candidate._legacy_att_cache_from_planar(
+                candidate_value
+            )
+        assert torch.equal(control_states[0].flow_cache[name], candidate_value)
 
 
 def test_fixed_estimator_kv_slabs_compact_exact_newest_first_history():

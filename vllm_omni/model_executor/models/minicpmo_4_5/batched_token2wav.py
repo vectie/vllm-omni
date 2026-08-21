@@ -56,6 +56,9 @@ _NPU_DIT_ATTN_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_ATTN_CACHE_OUT"
 _NPU_CFM_STACKED_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT"
 _NPU_CFM_FIXED_KV_SLABS_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_FIXED_KV_SLABS"
 _NPU_CFM_PLANAR_KV_SLABS_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_PLANAR_KV_SLABS"
+_NPU_CFM_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"
+_NPU_CFM_GRAPH_ATTN_MAX_ABS_DRIFT = 3.125e-2
+_NPU_CFM_GRAPH_ATTN_MEAN_ABS_DRIFT = 3.0e-3
 _NPU_DIT_BSH_ATTENTION_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_BSH_ATTENTION"
 _NPU_DIT_BSH_ATTENTION_MAX_ABS_DRIFT = 2.0e-2
 _NPU_DIT_BSH_ATTENTION_MEAN_ABS_DRIFT = 2.0e-3
@@ -148,6 +151,16 @@ def _npu_cfm_fixed_kv_slabs_enabled(config_value: Any = None) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid {_NPU_CFM_FIXED_KV_SLABS_ENV}={raw!r}")
+
+
+def _npu_cfm_graph_enabled() -> bool:
+    """Whether fixed-shape steady CFM NPUGraph capture is enabled."""
+    return os.environ.get(_NPU_CFM_GRAPH_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _npu_cfm_planar_kv_slabs_enabled(config_value: Any = None) -> bool:
@@ -1597,6 +1610,8 @@ class BatchedToken2Wav(nn.Module):
         self._cfg_workspace: dict[tuple[str, tuple[int, ...], torch.dtype, str, int | None], torch.Tensor] = {}
         self._npu_cfm_graphs: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
         self._npu_cfm_graph_disabled = False
+        self._npu_cfm_graph_capture_used = False
+        self._npu_cfm_graph_replay_used = False
         self._npu_dit_mlp_graph_enabled = _npu_dit_mlp_graph_enabled(npu_dit_mlp_graph)
         self._npu_dit_mlp_graph_width = _npu_dit_mlp_graph_width(npu_dit_mlp_graph_width)
         extra_graph_widths = _npu_dit_graph_buckets(npu_dit_graph_buckets)
@@ -2399,6 +2414,51 @@ class BatchedToken2Wav(nn.Module):
             )
         return max_abs_drift, mean_abs_drift
 
+    @staticmethod
+    def _validate_npu_cfm_graph_attention(
+        block: nn.Module,
+        candidate: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[float, float]:
+        """Gate the graph-capturable attention lowering against fused BSH attention."""
+        attention = block.attn
+        _, q, k, v = candidate
+        cache_width = 402
+        cache = q.new_zeros((2, q.shape[0], cache_width, q.shape[-1]))
+        fused_output = q.new_empty(
+            (2, q.shape[0], q.shape[1] + cache_width, q.shape[-1])
+        )
+        explicit_output = torch.empty_like(fused_output)
+        fused, _ = BatchedToken2Wav._attention_from_projected_qkv_bsh_planar(
+            attention,
+            q,
+            k,
+            v,
+            cache,
+            fused_output,
+        )
+        explicit, _ = BatchedToken2Wav._attention_from_projected_qkv_bsh_planar(
+            attention,
+            q,
+            k,
+            v,
+            cache,
+            explicit_output,
+            explicit_attention=True,
+        )
+        difference = (explicit.float() - fused.float()).abs()
+        max_abs_drift = float(difference.max().item())
+        mean_abs_drift = float(difference.mean().item())
+        if (
+            max_abs_drift > _NPU_CFM_GRAPH_ATTN_MAX_ABS_DRIFT
+            or mean_abs_drift > _NPU_CFM_GRAPH_ATTN_MEAN_ABS_DRIFT
+        ):
+            raise RuntimeError(
+                "CFM graph attention exceeded its loaded-checkpoint drift bound: "
+                f"max_abs_drift={max_abs_drift:.9g}, "
+                f"mean_abs_drift={mean_abs_drift:.9g}"
+            )
+        return max_abs_drift, mean_abs_drift
+
     def _warmup_npu_dit_preamble_graph(self) -> None:
         if not self._npu_dit_preamble_graph_enabled:
             return
@@ -2492,6 +2552,24 @@ class BatchedToken2Wav(nn.Module):
                                 result,
                             )
                         )
+                        if (
+                            _npu_cfm_graph_enabled()
+                            and width == self._npu_dit_mlp_graph_width
+                        ):
+                            try:
+                                graph_max_abs_drift, graph_mean_abs_drift = (
+                                    self._validate_npu_cfm_graph_attention(
+                                        block,
+                                        result,
+                                    )
+                                )
+                            except Exception:
+                                self._npu_cfm_graph_disabled = True
+                                logger.warning(
+                                    "MiniCPM-o explicit CFM graph attention "
+                                    "parity gate failed; retaining fused BSH eager path",
+                                    exc_info=True,
+                                )
                 torch.npu.synchronize()
                 if self._npu_dit_fused_qkv_enabled:
                     logger.info(
@@ -2507,6 +2585,18 @@ class BatchedToken2Wav(nn.Module):
                         max_abs_drift,
                         mean_abs_drift,
                     )
+                    if (
+                        _npu_cfm_graph_enabled()
+                        and not self._npu_cfm_graph_disabled
+                        and width == self._npu_dit_mlp_graph_width
+                    ):
+                        logger.info(
+                            "Validated MiniCPM-o graph-capturable explicit "
+                            "attention at cache=402; max_abs_drift=%.9g, "
+                            "mean_abs_drift=%.9g",
+                            graph_max_abs_drift,
+                            graph_mean_abs_drift,
+                        )
                 elif self._npu_dit_qkv_pack_enabled and width == self._npu_dit_mlp_graph_width:
                     logger.info(
                         "Compiled MiniCPM-o NPU DiT native-QKV preamble graph for 2x%dx512, 8x64 heads",
@@ -3667,6 +3757,7 @@ class BatchedToken2Wav(nn.Module):
         cfm_x: torch.Tensor | None = None,
         cfm_delta: torch.Tensor | None = None,
         cfm_cfg_rate: float | None = None,
+        flat_capture: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
@@ -3699,7 +3790,7 @@ class BatchedToken2Wav(nn.Module):
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
         graph_width = int(estimator_input.shape[2])
-        use_mlp_graph = (
+        use_mlp_graph = flat_capture or (
             self._npu_dit_mlp_graph_enabled
             and not self._npu_dit_mlp_graph_disabled
             and estimator_input.device.type == "npu"
@@ -3709,11 +3800,16 @@ class BatchedToken2Wav(nn.Module):
         )
         if use_mlp_graph:
             try:
-                graph_fn = self._get_npu_dit_mlp_graph()
+                graph_fn = (
+                    _dit_mlp_residual
+                    if flat_capture
+                    else self._get_npu_dit_mlp_graph()
+                )
                 if graph_fn is not None:
                     full_stack_cache_length = _dit_attention_cache_length(att_cache)
                     if (
-                        graph_width == self._npu_dit_mlp_graph_width
+                        not flat_capture
+                        and graph_width == self._npu_dit_mlp_graph_width
                         and not planar_att
                         and not bsh_attention
                         and not cache_major
@@ -3747,19 +3843,27 @@ class BatchedToken2Wav(nn.Module):
                                 full_stack_cache_length
                             )
                         return result, cnn_out, att_out, False
-                    preamble_graph_fn = None
-                    if (
+                    preamble_graph_fn = (
+                        _dit_attention_preamble_bsh_from_modulation
+                        if flat_capture and bsh_attention
+                        else None
+                    )
+                    if not flat_capture and (
                         self._npu_dit_preamble_graph_enabled
                         and not self._npu_dit_preamble_graph_disabled
                         and graph_width not in self._npu_dit_preamble_graph_disabled_widths
                     ):
                         preamble_graph_fn = self._get_npu_dit_preamble_graph(graph_width)
-                    conv_mlp_graph_fn = None
+                    conv_mlp_graph_fn = (
+                        _dit_fused_conv_mlp_residual
+                        if flat_capture and self._npu_dit_fused_conv_pack_enabled
+                        else None
+                    )
                     last_block_final_euler_graph_fn = None
                     conv_mlp_standard_weights = False
                     full_block_graph_fn = None
                     full_block_cache_length = _dit_attention_cache_length(att_cache)
-                    if full_block_graph_fn is None and (
+                    if not flat_capture and full_block_graph_fn is None and (
                         graph_width == self._npu_dit_mlp_graph_width
                         and not planar_att
                         and not bsh_attention
@@ -3771,7 +3875,7 @@ class BatchedToken2Wav(nn.Module):
                         and full_block_cache_length not in self._npu_dit_full_block_graph_disabled_lengths
                     ):
                         full_block_graph_fn = self._get_npu_dit_full_block_graph()
-                    if full_block_graph_fn is None and (
+                    if not flat_capture and full_block_graph_fn is None and (
                         graph_width == self._npu_dit_mlp_graph_width
                         and cnn_cache is not None
                         and att_cache is not None
@@ -3790,7 +3894,7 @@ class BatchedToken2Wav(nn.Module):
                             last_block_final_euler_graph_fn = (
                                 self._get_npu_dit_last_block_final_euler_graph()
                             )
-                    elif full_block_graph_fn is None and (
+                    elif not flat_capture and full_block_graph_fn is None and (
                         graph_width != self._npu_dit_mlp_graph_width
                         and self._npu_dit_prompt_conv_mlp_graph_enabled
                         and graph_width not in self._npu_dit_prompt_conv_mlp_graph_disabled_widths
@@ -3816,6 +3920,7 @@ class BatchedToken2Wav(nn.Module):
                         cfm_x,
                         cfm_delta,
                         cfm_cfg_rate,
+                        flat_capture,
                     )
                     if not self._npu_dit_mlp_graph_used:
                         logger.info(
@@ -3884,6 +3989,8 @@ class BatchedToken2Wav(nn.Module):
                         self._npu_dit_last_block_final_euler_graph_used = True
                     return result, cnn_out, att_out, cfm_updated
             except Exception:
+                if flat_capture:
+                    raise
                 self._npu_dit_mlp_graph_disabled_widths.add(graph_width)
                 logger.warning(
                     "MiniCPM-o NPU DiT graph execution failed at width=%d; using eager blocks for that width",
@@ -3973,6 +4080,7 @@ class BatchedToken2Wav(nn.Module):
         cfm_x: torch.Tensor | None = None,
         cfm_delta: torch.Tensor | None = None,
         cfm_cfg_rate: float | None = None,
+        flat_capture: bool = False,
     ) -> tuple[torch.Tensor, bool]:
         """Replay enabled shape-bucketed partitions with exact eager fallbacks."""
         hidden = estimator.in_proj(estimator_input.transpose(1, 2))
@@ -4091,6 +4199,7 @@ class BatchedToken2Wav(nn.Module):
                     v,
                     block_att_cache,
                     block_att_output,
+                    explicit_attention=flat_capture,
                 )
                 attention_cache_written = True
                 if not self._npu_dit_bsh_attention_used:
@@ -4298,6 +4407,14 @@ class BatchedToken2Wav(nn.Module):
             return hidden, True
         if precomputed_final_modulation is None:
             hidden = estimator.final_layer(hidden, time_embedding)
+        elif flat_capture:
+            final_layer = estimator.final_layer
+            hidden = _dit_final_from_modulation(
+                hidden,
+                precomputed_final_modulation,
+                final_layer.norm_final,
+                final_layer.linear,
+            )
         elif (
             self._npu_dit_fused_final_adaln_enabled
             and hidden.shape == (2, 50, 512)
@@ -4521,6 +4638,8 @@ class BatchedToken2Wav(nn.Module):
         v: torch.Tensor,
         att_cache: torch.Tensor | None,
         output_cache: torch.Tensor,
+        *,
+        explicit_attention: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Append planar BSH K/V and run attention without BSH/BHSD transposes."""
         output_k = output_cache.select(0, 0)
@@ -4542,7 +4661,27 @@ class BatchedToken2Wav(nn.Module):
                 "DiT BSH attention hidden size mismatch: "
                 f"hidden={hidden_size}, heads={num_heads}, head_dim={head_dim}"
             )
-        if q.device.type == "npu":
+        if explicit_attention:
+            # ``npu_fusion_attention`` launches an auxiliary stream and cannot
+            # be enclosed by raw NPUGraph on the competition CANN 9.0 image.
+            # Keep accumulation in FP32 so this graph-only lowering stays
+            # within the loaded-checkpoint parity gate above.
+            query = q.float().reshape(
+                batch, query_width, num_heads, head_dim
+            ).transpose(1, 2)
+            key = output_k.float().reshape(
+                batch, output_k.shape[1], num_heads, head_dim
+            ).transpose(1, 2)
+            value = output_v.float().reshape(
+                batch, output_v.shape[1], num_heads, head_dim
+            ).transpose(1, 2)
+            scores = torch.matmul(query, key.transpose(-2, -1)) * (head_dim**-0.5)
+            probabilities = torch.softmax(scores, dim=-1)
+            hidden = torch.matmul(probabilities, value)
+            hidden = hidden.transpose(1, 2).reshape(
+                batch, query_width, hidden_size
+            ).to(dtype=q.dtype)
+        elif q.device.type == "npu":
             import torch_npu
 
             hidden = torch_npu.npu_fusion_attention(
@@ -4642,6 +4781,7 @@ class BatchedToken2Wav(nn.Module):
         att_cache: torch.Tensor | None,
         cnn_output: torch.Tensor | None = None,
         att_output: torch.Tensor | None = None,
+        flat_capture: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         decoder = self.flow.decoder
         estimator = decoder.estimator
@@ -4703,7 +4843,21 @@ class BatchedToken2Wav(nn.Module):
         wide_modulation_steps: torch.Tensor | None = None
         final_modulation_steps: torch.Tensor | None = None
         if self._npu_dit_wide_adaln_enabled:
-            if self._npu_dit_wide_final_adaln_enabled:
+            if flat_capture and self._npu_dit_wide_final_adaln_enabled:
+                wide_modulation_steps, final_modulation_steps = (
+                    _dit_wide_adaln_steps_with_final(
+                        time_embeddings,
+                        self._npu_dit_wide_final_adaln_weight,
+                        self._npu_dit_wide_final_adaln_bias,
+                    )
+                )
+            elif flat_capture:
+                wide_modulation_steps = _dit_wide_adaln_steps(
+                    time_embeddings,
+                    self._npu_dit_wide_adaln_weight,
+                    self._npu_dit_wide_adaln_bias,
+                )
+            elif self._npu_dit_wide_final_adaln_enabled:
                 try:
                     wide_modulation_steps, final_modulation_steps = (
                         self._get_npu_dit_wide_final_adaln_steps_graph()(
@@ -4825,6 +4979,7 @@ class BatchedToken2Wav(nn.Module):
                 cfm_x=x,
                 cfm_delta=deltas[step],
                 cfm_cfg_rate=float(decoder.inference_cfg_rate),
+                flat_capture=flat_capture,
             )
             if cfm_updated:
                 x = estimate.to(dtype=integration_dtype)
@@ -4883,8 +5038,11 @@ class BatchedToken2Wav(nn.Module):
         att_output: torch.Tensor | None = None,
         steady_graph: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        enabled = os.environ.get("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH", "0").strip().lower()
-        if enabled not in {"1", "true", "yes", "on"} or mu.device.type != "npu" or self._npu_cfm_graph_disabled:
+        if (
+            not _npu_cfm_graph_enabled()
+            or mu.device.type != "npu"
+            or self._npu_cfm_graph_disabled
+        ):
             return self._decode_cfm_eager(
                 mu,
                 speakers,
@@ -4910,6 +5068,11 @@ class BatchedToken2Wav(nn.Module):
             )
 
         inputs = (mu, speakers, cond, cnn_cache, att_cache, cnn_output, att_output)
+        flat_capture = (
+            self._npu_cfm_fixed_kv_slabs_enabled
+            and self._npu_dit_bsh_attention_enabled
+            and steady_graph
+        )
         key = tuple(self._optional_tensor_signature(value) for value in inputs)
         entry = self._npu_cfm_graphs.get(key)
         slot_count = 2 if self._npu_cfm_fixed_kv_slabs_enabled else 1
@@ -4924,6 +5087,15 @@ class BatchedToken2Wav(nn.Module):
                 if static is not None and current is not None:
                     static.copy_(current)
             slot["graph"].replay()
+            if not self._npu_cfm_graph_replay_used:
+                logger.info(
+                    "MiniCPM-o NPU steady CFM graph replay active: "
+                    "slots=%d, mu=%s, attention_cache=%s",
+                    slot_count,
+                    tuple(mu.shape),
+                    None if att_cache is None else tuple(att_cache.shape),
+                )
+                self._npu_cfm_graph_replay_used = True
             if self._npu_cfm_fixed_kv_slabs_enabled:
                 return slot["outputs"]
             return tuple(output.clone() for output in slot["outputs"])
@@ -4964,10 +5136,14 @@ class BatchedToken2Wav(nn.Module):
                     att_cache=static_att,
                     cnn_output=static_cnn_output,
                     att_output=static_att_output,
+                    flat_capture=flat_capture,
                 )
             torch.npu.synchronize()
             graph = torch.npu.NPUGraph()
-            with torch.inference_mode(), torch.npu.graph(graph, pool=entry["pool"]):
+            with torch.inference_mode(), torch.npu.graph(
+                graph,
+                pool=entry["pool"],
+            ):
                 outputs = self._decode_cfm_eager(
                     static_mu,
                     static_speakers,
@@ -4976,12 +5152,23 @@ class BatchedToken2Wav(nn.Module):
                     att_cache=static_att,
                     cnn_output=static_cnn_output,
                     att_output=static_att_output,
+                    flat_capture=flat_capture,
                 )
             graph.replay()
-        except Exception:
+        except Exception as exc:
             self._npu_cfm_graph_disabled = True
             self._npu_cfm_graphs.clear()
-            logger.warning("MiniCPM-o NPU CFM graph capture failed; using eager Code2Wav", exc_info=True)
+            if flat_capture:
+                raise RuntimeError(
+                    "MiniCPM-o steady CFM NPUGraph capture failed; restart "
+                    "Stage 2 with VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH=0. "
+                    "A failed CANN capture can leave the allocator state "
+                    "unsafe for eager fallback in the current process."
+                ) from exc
+            logger.warning(
+                "MiniCPM-o NPU CFM graph capture failed; using eager Code2Wav",
+                exc_info=True,
+            )
             return self._decode_cfm_eager(
                 mu,
                 speakers,
@@ -4997,6 +5184,16 @@ class BatchedToken2Wav(nn.Module):
             "inputs": static_inputs,
             "outputs": outputs,
         })
+        if not self._npu_cfm_graph_capture_used:
+            logger.info(
+                "MiniCPM-o NPU steady CFM graph captured: "
+                "slot=%d/%d, mu=%s, attention_cache=%s",
+                len(entry["slots"]),
+                slot_count,
+                tuple(mu.shape),
+                None if att_cache is None else tuple(att_cache.shape),
+            )
+            self._npu_cfm_graph_capture_used = True
         entry["next_slot"] = len(entry["slots"]) % slot_count
         max_graphs = self._npu_cfm_graph_cache_limit()
         while len(self._npu_cfm_graphs) > max_graphs:

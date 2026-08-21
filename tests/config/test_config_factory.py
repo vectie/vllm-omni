@@ -2645,6 +2645,25 @@ class TestPlatformOverrides:
         assert extra["npu_dit_compute_dtype"] == "bf16"
         assert extra["npu_cfm_integration_dtype"] == "bf16"
 
+    def test_minicpmo_4_5_910c_bsh_cfm_graph_candidate_is_steady_only(self):
+        deploy_path = Path(_DEPLOY_DIR) / (
+            "minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_"
+            "bsh_attention_cfm_graph_experimental.yaml"
+        )
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(deploy_path), platform="npu"
+        )
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_cfm_fixed_kv_slabs"] is True
+        assert extra["npu_cfm_planar_kv_slabs"] is True
+        assert extra["npu_dit_bsh_attention"] is True
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE"] == "1"
+
     def test_minicpmo_4_5_910c_full_block_cache_buckets_are_explicit(self):
         deploy_path = Path(
             get_deploy_config_path(

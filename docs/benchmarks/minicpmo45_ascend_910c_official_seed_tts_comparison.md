@@ -4756,3 +4756,87 @@ The reusable hardware command is:
 python benchmarks/scripts/bench_minicpmo_dit_bsh_attention.py \
   --device 1 --width 50 --cache-length 402 --dtype bf16
 ```
+
+## Fixed-slab six-step CFM NPUGraph
+
+The fixed BSH slabs make the complete steady CFM invocation eligible for one
+static executable. The opt-in profile is
+`minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_bsh_attention_cfm_graph_experimental.yaml`.
+It captures only width 50 with the retained attention cache fixed at 402;
+prompt setup, cache fill, and tail widths stay on the accepted eager/graph
+partitions. Two graph and output-buffer slots share one memory pool, so replay
+does not clone the six-step output and its 16-block cache slabs.
+
+The competition CANN 9.0 image exposed two constraints that the earlier
+growing-cache full-loop prototype could not solve:
+
+- a TorchAir/GE executable cannot run inside a raw NPUGraph capture stream;
+  the steady capture therefore lowers the accepted partitions to their plain
+  graph-visible PyTorch operations instead of nesting compiled executables;
+- BSH `npu_fusion_attention` launches an auxiliary stream that does not join
+  the raw capture stream. The graph-only path uses explicit FP32
+  BMM-softmax-BMM attention, while ordinary eager execution retains the much
+  faster fused-attention operator.
+
+An isolated 910C probe proved that Linear and explicit attention capture and
+replay, while fused BSH attention fails `capture_end` with the same unjoined
+stream error seen in serving. The loaded MiniCPM-o checkpoint gate at the real
+`width=50/cache=402` shape measured only `3.05175781e-05` maximum and
+`6.89178705e-08` mean absolute drift between explicit graph attention and the
+fused BSH reference. Capture logs then confirmed two slots and steady replay
+with the physical cache shape `[6,16,2,2,402,512]`.
+
+The conservative reverse-order A/B used a fresh accepted-BSH control followed
+by a fresh graph candidate, two deterministic 12-row runs per side, two
+warmups, concurrency one, seed zero, and temperature zero. All 48 measured
+requests completed with identical aggregate text/audio structure, 100%
+continuity, and zero underrun. Lower is better except throughput.
+
+| Metric | Fresh BSH control | Static CFM graph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 18.3729 s | 17.3091 s | -5.79% |
+| Request throughput | 0.65314 req/s | 0.69328 req/s | +6.15% |
+| Audio throughput | 2.84116 audio-s/s | 3.01576 audio-s/s | +6.15% |
+| Mean / P99 E2E | 1,530.63 / 2,491.21 ms | 1,442.07 / 2,063.93 ms | -5.79% / -17.16% |
+| Mean / P99 TTFT | 355.76 / 751.51 ms | 347.43 / 552.09 ms | -2.34% / -26.54% |
+| Mean / P99 audio TTFP | 816.41 / 1,254.08 ms | 792.93 / 1,002.87 ms | -2.88% / -20.03% |
+| Mean / P99 whole-audio RTF | 0.351184 / 0.462322 | 0.323371 / 0.403746 | -7.92% / -12.67% |
+| Mean first-chunk RTF | 0.971920 | 0.943960 | -2.88% |
+| Mean / median steady-chunk RTF | 0.237246 / 0.164262 | 0.203359 / 0.135051 | -14.28% / -17.78% |
+| P99 steady-chunk RTF | 1.352178 | 1.221725 | -9.65% |
+
+The reverse leg is deliberately reported instead of the faster first
+candidate process, which measured 16.5548 seconds and 0.182333 mean
+steady-chunk RTF. This avoids claiming accelerator process-order drift as a
+kernel gain.
+
+A resident 32-row stability run completed 32/32 with the official small-gate
+signature: 4,801 input tokens, 480 output tokens, 3,362,880 frames, and 140.12
+seconds of audio. It measured 45.44 seconds duration, 1,419.16 ms mean E2E,
+326.92 ms mean TTFT, 769.96 ms mean TTFP, 0.33 displayed mean whole-audio RTF,
+100% continuity, and zero underrun.
+
+The matched 32-row offline quality gate reused the cached
+Whisper-large-v3/WavLM evaluation stack. WER was exactly unchanged from the
+accepted BSH control at `0.0165884463` mean and `0` median. Mean WavLM
+similarity moved from `0.845046923` to `0.844583588`, a `0.000463335`
+absolute reduction (`0.0463` percentage points); median similarity moved from
+`0.852045149` to `0.851352572`. This is far inside the competition's two-point
+regression limit. All 32 content and 32 similarity evaluations completed with
+zero request, ASR, or similarity failures. The quality run's latency is not
+reported as performance because local CPU ASR and similarity scoring competed
+with the server during that invocation.
+
+The profile remains experimental until the full 1,088-row Seed-TTS,
+Daily-Omni, and Video-MME release gates pass.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-bsh-cfm-graph-20260821
+```
+
+The quality result is
+`candidate-32-quality-offline-omp16/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-101625.json`
+with SHA-256
+`ba4cd70ede198e4ae6ddc718c9c9f13449a62ce62e4ce2599965d91a9c1ab43d`.

@@ -432,6 +432,31 @@ text and audio structure, exactly matched mean WER at 0.565030, and moved
 proxy SIM from 0.803156 to 0.803233. Keep this profile opt-in until full
 Seed-TTS, Daily-Omni, and Video-MME gates are rerun.
 
+The next fixed-slab profile captures the complete six-step steady CFM call as
+one raw NPUGraph. It is intentionally narrower than the rejected growing-cache
+prototype: only width 50 and retained cache 402 are captured, all input and
+output addresses are stable, and two pooled output slots replace replay-time
+cache clones. Prompt and tail execution remain eager.
+
+Raw capture cannot enclose the accepted TorchAir executables on CANN 9.0, so
+the capture path invokes their plain graph-visible operations. It also cannot
+enclose `npu_fusion_attention`, whose auxiliary stream fails to join the
+capture stream. Only the captured path substitutes explicit FP32
+BMM-softmax-BMM attention; normal execution keeps fused BSH attention. A
+loaded-checkpoint width-50/cache-402 gate limits this substitution and measured
+`3.05175781e-05` maximum / `6.89178705e-08` mean absolute drift on the target
+910C. Any gate failure disables the candidate before request-time capture.
+
+The conservative reverse-order two-run A/B improved duration and mean E2E
+5.79%, throughput 6.15%, mean whole-audio RTF 7.92%, and mean steady-chunk RTF
+14.28%. P99 E2E, TTFP, and steady-chunk RTF improved 17.16%, 20.03%, and
+9.65%. A 32-row stability gate preserved the exact token/frame/audio signature,
+100% continuity, and zero underrun. A matched 32-row quality gate held mean
+WER exactly at `0.0165884463`; mean WavLM similarity declined only `0.000463335`
+absolute (`0.0463` percentage points), well below the allowed two-point
+regression. The deploy profile remains opt-in pending the three complete
+competition accuracy suites.
+
 Opt-in experiments, one at a time:
 
 ```bash
@@ -470,7 +495,7 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | SHM event notification | Retained for 910C: 20.63 us mean dispatch cost, 14.26 us lower P99, and avoids the receive loop's up-to-1 ms polling fallback |
 | Cached immutable Stage 0 control-token embeddings | Shipped in the static-weight native-duplex profile; exact operator parity, representative operator sequence -61.35%, resident Stage-0 TTFT mean -8.45% |
 | Sticky fused-to-MATH Ascend SDPA adapter | Implemented, target proof required |
-| Exact-shape CFM graph replay | Implemented, off by default; full-loop capture rejected on measured 910C |
+| Exact-shape CFM graph replay | Implemented, opt-in; fixed width-50/cache-402 six-step graph with two output slots improved reverse-order duration 5.79%, mean whole-audio RTF 7.92%, and mean steady-chunk RTF 14.28%; full competition qualification pending |
 | Exact output hash capture and deterministic JSON gate | Implemented |
 | Six- and eight-step CFM deploy profiles | Implemented; the CFM6 competition profile passed full Seed-TTS, Daily-Omni, and Video-MME gates |
 | Talker sliding repetition-frequency cache | Shipped; exact parity and full 1,088-row Seed-TTS WER/SIM gate passed |

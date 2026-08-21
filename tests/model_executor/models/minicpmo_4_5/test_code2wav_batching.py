@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_wide_adaln_steps,
     _dit_wide_adaln_steps_with_final,
     _npu_cfm_fixed_kv_slabs_enabled,
+    _npu_cfm_graph_enabled,
     _npu_cfm_integration_dtype,
     _npu_cfm_planar_kv_slabs_enabled,
     _npu_cfm_stacked_cache_out_enabled,
@@ -803,8 +804,21 @@ def test_bsh_planar_attention_matches_legacy_cache_math():
             bsh_output,
         )
     )
+    explicit_output = torch.empty_like(bsh_output)
+    explicit, explicit_cache = (
+        BatchedToken2Wav._attention_from_projected_qkv_bsh_planar(
+            attention,
+            to_bsh(q_bhsd),
+            to_bsh(k_bhsd),
+            to_bsh(v_bhsd),
+            bsh_cache,
+            explicit_output,
+            explicit_attention=True,
+        )
+    )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(explicit, expected, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(
         BatchedToken2Wav._legacy_att_cache_from_bsh_planar(
             actual_cache, 8, 64
@@ -814,6 +828,7 @@ def test_bsh_planar_attention_matches_legacy_cache_math():
         atol=0,
     )
     assert actual_cache is bsh_output
+    assert explicit_cache is explicit_output
     assert actual_cache.select(0, 0).is_contiguous()
     assert actual_cache.select(0, 1).is_contiguous()
 
@@ -1817,6 +1832,15 @@ def test_invalid_npu_dit_mlp_graph_width_is_rejected(monkeypatch, value: str):
 def test_npu_cfm_graph_cache_limit_is_bounded(monkeypatch, value: str, expected: int):
     monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE", value)
     assert BatchedToken2Wav._npu_cfm_graph_cache_limit() == expected
+
+
+def test_npu_cfm_graph_env_is_explicit(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH", raising=False)
+    assert _npu_cfm_graph_enabled() is False
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH", "yes")
+    assert _npu_cfm_graph_enabled() is True
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH", "0")
+    assert _npu_cfm_graph_enabled() is False
 
 
 def test_fade_in_out_limits_overlap_to_available_previous_audio():

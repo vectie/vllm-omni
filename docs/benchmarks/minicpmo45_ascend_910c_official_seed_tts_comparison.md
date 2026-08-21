@@ -4418,3 +4418,102 @@ f47a6d72dbe5987a0b37de3026b1a622e25005ccee416f51958825e7fd2d4d44  planar-quality
 db8e371ac3d5ad9897294a1b16b2ee90fb4c46542d6936de085d79c218ca44dd  planar-tail-fixed-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-015643.json
 5f3c3667b13ddf5bf393be6a6d266f254613fca0edd5230847d2807cdbd57ac7  planar-tail-fixed-service.log
 ```
+
+## Post-planar layout trace and lower-layer screens
+
+A fresh Stage-2 Torch-NPU profile bracketed one warmed Seed-TTS request on
+the corrected homogeneous-BF16 planar profile. This replaces the older
+pre-planar operator ranking. The largest device families were:
+
+| Operator family | Calls | Device time | Share |
+| --- | ---: | ---: | ---: |
+| `MinicpmoCausalConvPack` | 576 | 30.630 ms | 11.11% |
+| `Transpose` | 3,160 | 29.114 ms | 10.56% |
+| `MatMulV2` | 3,506 | 25.624 ms | 9.30% |
+| `TransData` | 2,217 | 22.288 ms | 8.09% |
+| `LayerNormV3` | 2,545 | 21.449 ms | 7.78% |
+| `FlashAttentionScore` | 480 | 14.553 ms | 5.28% |
+
+Shape aggregation makes the layout budget concrete. The two causal-pack
+nodes each ran 288 times at about 53 us, consuming 30.63 ms together. The
+largest attention transpose, `[2,8,50,64]` to `[2,50,8,64]`, consumed 5.045
+ms. Four prompt-Conv weight conversions from `[512,512,1,3]` NCHW to
+`FRACTAL_Z` consumed 6.465 ms. Attention arithmetic is no longer the first
+target; causal history packing and producer-consumer layouts are.
+
+The graph-visible fused-QKV screen concatenates each block's immutable Q, K,
+and V weights once, then replaces three projections with one 1536-wide GEMM.
+It deliberately leaves reshape, transpose, normalization, cache append, and
+SDPA visible to GE instead of using the rejected opaque QKV custom op. BF16
+output was bit-exact on 910C. Ten alternating-order trials of 200 replays at
+`[2,50,512]` measured 117.617 us for the accepted three-GEMM graph and
+115.861 us for fused QKV: only 1.015x. This does not justify a serving cycle,
+so the feature remains an opt-in diagnostic through
+`minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_fused_qkv_experimental.yaml`.
+
+The prompt-Conv screen preformatted the two kernel-3 weights as true Ascend
+`FRACTAL_Z` tensors once, restoring `allow_internal_format=False` before graph
+compilation and replay. It was bit-exact but slower: width 20 changed from
+196.417 to 208.549 us (-5.82%), and width 302 changed from 281.503 to 302.668
+us (-6.99%). Removing the visible conversions does not compensate for the
+less profitable compiled layout, so no serving option was added.
+
+### Fixed planar slabs plus cache-major CNN state
+
+The older cache-major causal kernel is 2.31x faster in isolation, but it could
+not previously share the new fixed slabs: setup stored CNN state as
+`[batch,channels,taps]`, while steady replay requires
+`[batch,taps,channels]`, causing the fixed output shape to disagree. The slab
+implementation now records its CNN layout, converts once at setup, writes
+steady width-50 results directly into alternating cache-major banks, and
+converts exact eager prompt/tail output before compaction. Attention slabs
+remain planar and fixed-address. The behavior is opt-in through
+`minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_cache_major_experimental.yaml`.
+
+Focused exactness/layout tests and profile inheritance passed. The full
+Code2Wav file passed 112/112 tests and all 34 MiniCPM-o 910C deploy tests
+passed. The live service proved the intended path with all three messages:
+
+```text
+MiniCPM-o contiguous planar K/V attention cache active
+MiniCPM-o NPU cache-major Conv+MLP megagraph replay active
+MiniCPM-o fixed estimator KV slabs active: retained=402, append=452, planar=True, cnn_cache_major=True
+```
+
+The first 12-row fail-fast run completed 12/12 with zero failures, 100%
+continuity, and the accepted structural totals. It was decisively slower than
+the two-run planar mean, so no repeat or accuracy budget was spent. Lower is
+better except throughput.
+
+| Metric | Accepted planar mean | Planar + cache-major | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 17.072 s | 20.831 s | +22.02% |
+| Request throughput | 0.7029 req/s | 0.5761 req/s | -18.05% |
+| Mean E2E | 1,422.17 ms | 1,735.53 ms | +22.03% |
+| Mean TTFT | 331.95 ms | 352.25 ms | +6.12% |
+| Mean audio TTFP | 804.16 ms | 919.03 ms | +14.28% |
+| Mean whole-audio RTF | 0.335330 | 0.399066 | +19.00% |
+| Mean / median chunk RTF | 0.360917 / 0.185494 | 0.432204 / 0.259577 | +19.75% / +39.94% |
+| P99 chunk RTF | 1.238023 | 1.270002 | +2.58% |
+
+The isolated cache-major kernel win again reverses in the composed graph.
+This confirms that its boundary prevents more valuable scheduling/layout
+decisions; it remains diagnostic-only. The accepted planar profile is
+unchanged.
+
+Artifacts are under:
+
+```text
+/tmp/vllm-omni-profiles/minicpmo45/planar-kv-stage2
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-planar-layout-20260821
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-planar-cache-major-20260821
+```
+
+Selected checksums:
+
+```text
+7031808b2269efdb1caa5f7ff3e46385d11513bb4d890746b9f279981b1b71a7  op_statistic.csv
+b8d72588ba22a1720da0e8bb0eb5686e74fe560df0f588c0c69f8276a31672e3  kernel_details.csv
+9f1e4ec6f03ab9d9934b05341476cffeffe88bc3e2179c488948b3b797873a8c  candidate-run1.json
+ede7e84bca3b4759a83bfd07e2da7f80a354f55cdd1e9ef29f27b02254c58247  service.log
+```

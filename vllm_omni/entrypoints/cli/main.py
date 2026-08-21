@@ -3,7 +3,40 @@ CLI entry point for vLLM-Omni that intercepts vLLM commands.
 """
 
 import importlib.metadata
+import os
 import sys
+from collections.abc import Mapping, Sequence
+
+
+def _needs_ascend_benchmark_fast_exit(
+    argv: Sequence[str],
+    environ: Mapping[str, str],
+) -> bool:
+    """Return whether a completed benchmark should skip native teardown.
+
+    The Ascend A3 challenge image can abort in the torch-npu/ACL process
+    destructors after a short-lived CLI has already completed successfully.
+    Restrict the workaround to the benchmark subprocess; the long-running
+    server and all exception paths retain their normal lifecycle.
+    """
+    return (
+        len(argv) > 1
+        and argv[1] == "bench"
+        and bool(environ.get("ASCEND_HOME_PATH") or environ.get("ASCEND_TOOLKIT_HOME"))
+        and environ.get("VLLM_OMNI_DISABLE_ASCEND_BENCH_FAST_EXIT", "0").lower()
+        not in {"1", "true", "yes"}
+    )
+
+
+def _ascend_benchmark_fast_exit_if_needed() -> None:
+    if not _needs_ascend_benchmark_fast_exit(sys.argv, os.environ):
+        return
+    # Benchmark result files are written by the dispatcher. Flush terminal
+    # output explicitly because os._exit intentionally bypasses Python atexit
+    # handlers as well as the broken native destructors.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 def main():
@@ -18,8 +51,6 @@ def main():
         # Force colored logging even when piped (e.g. `| tee`).
         # Must be set before any vLLM import because the logger
         # formatter is configured at import time via _use_color().
-        import os
-
         if "VLLM_LOGGING_COLOR" not in os.environ:
             os.environ["VLLM_LOGGING_COLOR"] = "1"
 
@@ -70,6 +101,7 @@ def main():
 
         if hasattr(args, "dispatch_function"):
             args.dispatch_function(args)
+            _ascend_benchmark_fast_exit_if_needed()
         else:
             parser.print_help()
 

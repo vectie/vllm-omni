@@ -98,7 +98,17 @@ def register_omni_models_to_vllm():
     supported_archs = ModelRegistry.get_supported_archs()
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         if arch not in supported_archs:
-            ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+            if arch == "MiniCPMO45Code2Wav":
+                from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
+                    MiniCPMO45Code2Wav,
+                )
+
+                ModelRegistry.register_model(arch, MiniCPMO45Code2Wav)
+            else:
+                ModelRegistry.register_model(
+                    arch,
+                    f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}",
+                )
 
     # Register omni-specific reasoning parsers (e.g., step_audio).
     import vllm_omni.reasoning  # noqa: F401

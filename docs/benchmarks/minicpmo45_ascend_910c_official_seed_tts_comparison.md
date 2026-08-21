@@ -4517,3 +4517,97 @@ b8d72588ba22a1720da0e8bb0eb5686e74fe560df0f588c0c69f8276a31672e3  kernel_details
 9f1e4ec6f03ab9d9934b05341476cffeffe88bc3e2179c488948b3b797873a8c  candidate-run1.json
 ede7e84bca3b4759a83bfd07e2da7f80a354f55cdd1e9ef29f27b02254c58247  service.log
 ```
+
+### Vectorized channel-major causal cache access
+
+The rejected cache-major serving experiment showed that changing the public
+CNN-state layout destroys more graph-level optimization than its isolated
+kernel saves. The follow-up therefore keeps the accepted
+`[batch,channels,2]` layout and removes the scalar work *inside* the existing
+`MinicpmoCausalConvPack` boundary. On `ascend910_93`, the kernel now builds a
+byte-offset vector once, gathers both historical taps into UB with AscendC
+vector operations, and gathers the two final frames into an interleaved UB
+buffer before one aligned cache DMA. The public shapes, TorchAir converter,
+fixed planar slabs, and complete DiT graph boundary are unchanged.
+
+The first `DataCopyPad` write prototype was rejected because exact validation
+found a cache-layout mismatch. The retained gather implementation passed an
+independent Torch reference with zero tolerance for both packed history and
+returned cache. The reusable microbenchmark now checks that reference for
+both public cache layouts before timing, preventing two equally wrong kernels
+from validating each other.
+
+With 15 alternating trials of 1,000 launches, the original channel-major
+kernel measured 61.875 us median versus 27.037 us for its cache-major path.
+The vectorized kernel measured 19.841 us and 19.814 us respectively in the
+same screening session: the channel-major throughput cost fell 67.93%, and
+the two layouts became equivalent. A later reference-checked rerun while the
+full service and profiler exporter were resident measured 26.385 us versus
+26.257 us, again showing no material queued-throughput penalty. With one NPU
+synchronization after every launch, the retained vector kernel measured
+59.990 us for channel-major and 46.110 us for cache-major. The benchmark now
+reports both modes so independent-op throughput is not mistaken for serialized
+latency.
+
+Two independent serving measurements used the accepted planar profile, three
+warmups, the same first 12 shuffled English Seed-TTS rows, concurrency one,
+seed zero, temperature zero, and CFM6. Both completed 12/12 requests with zero
+failures, 100% continuity, 1,804 input tokens, 183 output tokens, 1,252,800
+waveform frames, and 52.20 seconds of audio. The candidate columns below are
+the arithmetic mean of both runs. Lower is better except throughput.
+
+| Metric | Accepted planar mean | Vectorized channel-major kernel | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 17.072 s | 16.737 s | -1.96% |
+| Request throughput | 0.7029 req/s | 0.7170 req/s | +2.01% |
+| Mean / P99 E2E | 1,422.17 / 1,743.27 ms | 1,394.34 / 1,730.34 ms | -1.96% / -0.74% |
+| Mean / P99 TTFT | 331.95 / 463.75 ms | 326.29 / 451.62 ms | -1.70% / -2.62% |
+| Mean / P99 audio TTFP | 804.16 / 932.35 ms | 800.04 / 926.80 ms | -0.51% / -0.60% |
+| Audio throughput | 3.057 audio-s/s | 3.119 audio-s/s | +2.03% |
+| Mean / median chunk RTF | 0.360917 / 0.185494 | 0.354065 / 0.179811 | -1.90% / -3.06% |
+| P99 chunk RTF | 1.238023 | 1.172903 | -5.26% |
+
+Candidate durations were 16.896 and 16.578 seconds. A fresh Stage-2 capture
+confirmed the expected 576 calls and exact graph boundary, but reported
+53.044 us per call—nearly the pre-change profiled value—despite the direct
+throughput A/B and repeated request-level improvement. These measurements are
+not interchangeable: the direct loop reports queued independent-op
+throughput, while the detailed profiler serializes and instruments the custom
+node. Its value is consistent with the new synchronized microbenchmark. The
+trace is therefore retained as a topology and per-call-latency check, while
+the two-run end-to-end screen remains the admission result.
+
+A follow-up tried to reduce serialized latency by creating gather offsets only
+on prefix-owning vector cores and by hoisting the identical write-offset table
+out of the batch loop. It was exact and improved the channel-major micro from
+19.372 to 18.748 us in queued mode (-3.22%) and from 59.990 to 54.680 us in
+serialized mode (-8.85%). However, two serving runs took 17.658 and 16.067
+seconds. Their 16.862-second mean was 0.75% slower than the retained vector
+kernel, while P99 E2E rose 6.75%, P99 audio TTFP rose 4.18%, and P99 chunk RTF
+rose 1.92%. This deeper hoist was therefore reverted. It is another concrete
+case where a better isolated custom-kernel number did not compose into a
+better request tail.
+
+Because the transformation is bit-exact, changes no model arithmetic, and
+preserves the qualified planar graph and tensor boundary, it inherits the
+planar candidate's 32-row WER/SIM result. It does not consume a new accuracy
+budget. Full 1,088-row Seed-TTS, Daily-Omni, and Video-MME remain release
+gates, as they are for the parent experimental profile.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-vector-cache-kernel-20260821
+/tmp/vllm-omni-profiles/minicpmo45/planar-kv-stage2
+```
+
+Selected checksums:
+
+```text
+6b631772cee6cf054c184a430ce10ced5d08fa40d22b0b166adc094c57b4f423  candidate-valid-run1.json
+c10f5fd1029f4620f246bc6e2876aea8318c0fa80c44da4d59c670bd5b0afa47  candidate-valid-run2.json
+4bcf5a2ac8fd886542d2d47c405b67a55234b0b0fd5218d5aa4750b720d14699  service.log
+b47bbbf1370d4c88ef3e8be8c020177754b9a187b150a1fe7d402e85aea0c5d4  op_statistic.csv
+3b0f665978b6d0ce6241fe2fa61cc751be7b7df0c39aacfb6fce563441c1f2e2  v3-valid-run1.json
+c5561b8a4f65a2c58a80cd0d6d43fc61d6756fef6c1742f3cd6f803f7e8d4f75  v3-valid-run2.json
+```

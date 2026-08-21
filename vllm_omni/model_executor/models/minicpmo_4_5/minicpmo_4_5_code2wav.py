@@ -31,9 +31,16 @@ logger = init_logger(__name__)
 _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV = "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
 
 
-def _resolve_token2wav_n_timesteps(extra: Mapping[str, Any]) -> int:
+def _resolve_token2wav_n_timesteps(
+    extra: Mapping[str, Any], *, is_npu: bool = False
+) -> int:
     env_value = os.environ.get(_MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV)
-    raw_value = env_value if env_value not in (None, "") else extra.get("token2wav_n_timesteps", 10)
+    platform_default = 6 if is_npu else 10
+    raw_value = (
+        env_value
+        if env_value not in (None, "")
+        else extra.get("token2wav_n_timesteps", platform_default)
+    )
     try:
         n_timesteps = int(raw_value)
     except (TypeError, ValueError) as exc:
@@ -777,7 +784,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
         use_float16 = bool(extra.get("token2wav_float16", False))
-        n_timesteps = _resolve_token2wav_n_timesteps(extra)
+        is_npu = current_omni_platform.is_npu()
+        n_timesteps = _resolve_token2wav_n_timesteps(extra, is_npu=is_npu)
         logger.info(
             "Initializing MiniCPM-o Code2Wav backend: token2wav_n_timesteps=%d, "
             "token2wav_float16=%s, platform=%s",
@@ -800,6 +808,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             torch.set_default_dtype(previous_dtype)
         self.backend = BatchedToken2Wav(
             token2wav,
-            npu_dit_mlp_graph=extra.get("npu_dit_mlp_graph"),
+            npu_dit_mlp_graph=extra.get("npu_dit_mlp_graph", is_npu),
             npu_dit_mlp_graph_width=extra.get("npu_dit_mlp_graph_width"),
         )

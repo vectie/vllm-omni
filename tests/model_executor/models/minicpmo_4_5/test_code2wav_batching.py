@@ -14,6 +14,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    _resolve_token2wav_n_timesteps,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -194,6 +195,33 @@ def _model():
     model = MiniCPMO45Code2Wav(vllm_config=_config())
     model.backend = backend
     return model, token2wav
+
+
+def test_code2wav_defaults_to_qualified_cfm6_on_npu(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS", raising=False
+    )
+
+    assert _resolve_token2wav_n_timesteps({}, is_npu=True) == 6
+    assert _resolve_token2wav_n_timesteps({}, is_npu=False) == 10
+
+
+def test_code2wav_explicit_step_count_overrides_platform_default(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS", raising=False
+    )
+
+    assert _resolve_token2wav_n_timesteps(
+        {"token2wav_n_timesteps": 8}, is_npu=True
+    ) == 8
+
+
+def test_code2wav_environment_overrides_explicit_and_platform_defaults(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS", "10")
+
+    assert _resolve_token2wav_n_timesteps(
+        {"token2wav_n_timesteps": 8}, is_npu=True
+    ) == 10
 
 
 def test_adapter_releases_unused_upstream_streaming_buffers():

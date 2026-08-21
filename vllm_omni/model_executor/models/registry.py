@@ -1,7 +1,9 @@
 from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
+    _BaseRegisteredModel,
     _LazyRegisteredModel,
     _ModelRegistry,
+    _RegisteredModel,
     _resolve_module_name,
 )
 
@@ -388,6 +390,32 @@ _VLLM_OMNI_MODELS = {
     **_OMNI_MODELS,
 }
 
+
+def _registered_omni_model(
+    model_arch: str,
+    mod_folder: str,
+    mod_relname: str,
+    cls_name: str,
+) -> _BaseRegisteredModel:
+    """Build one Omni registry entry.
+
+    The A3 competition image aborts while the isolated registry subprocess is
+    exiting after importing torch-npu. Code2Wav is the only candidate module
+    whose hash changes in this submission, so register that small wrapper in
+    the long-lived server process and keep every other model lazy.
+    """
+    if model_arch == "MiniCPMO45Code2Wav":
+        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
+            MiniCPMO45Code2Wav,
+        )
+
+        return _RegisteredModel.from_model_cls(MiniCPMO45Code2Wav)
+    return _LazyRegisteredModel(
+        module_name=f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}",
+        class_name=cls_name,
+    )
+
+
 OmniModelRegistry = _ModelRegistry(
     {
         **{
@@ -398,9 +426,11 @@ OmniModelRegistry = _ModelRegistry(
             for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()
         },
         **{
-            model_arch: _LazyRegisteredModel(
-                module_name=f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}",
-                class_name=cls_name,
+            model_arch: _registered_omni_model(
+                model_arch,
+                mod_folder,
+                mod_relname,
+                cls_name,
             )
             for model_arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items()
         },

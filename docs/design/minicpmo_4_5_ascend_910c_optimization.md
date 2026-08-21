@@ -523,5 +523,6 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | HiFT F0 frozen weights and linearized Conv1d | Rejected for promotion; frozen weights changed sign across two 200-iteration measurements (0.999x/1.019x), while window-pack plus Linear was 7.27% slower and introduced 0.026312 maximum absolute drift |
 | Broader cache-shape-bucketed DiT graph partitions | Stock SDPA operator gate rejected: fixed 384/512 cache widths were 8.1-12.8% slower before copy; retry only as part of a larger fused CANN boundary |
 | Native AscendC DiT causal-pack/cache kernel | Implemented, opt-in; FP16/FP32/BF16 state exact, Conv/cache boundary -28.7%, full BF16 Conv+MLP graph -5.37%, resident mean E2E -7.01% and per-chunk RTF -6.63%; official qualification pending |
+| BF16 AscendC causal Conv-to-Linear fusion | Rejected and removed; 1.0308x isolated gain, but two matched serving regimes reversed sign for TTFP and whole-audio RTF (initial +5.23%/+2.08%, later -2.93%/-3.35%), and the opaque boundary hid the producer-consumer chain from GE |
 | Contiguous-window causal-pack DMA | Rejected and removed; six dtype/layout cases were exact, but the production cache-major path improved only 0.77% (18.995 to 18.849 us) and channel-major regressed 0.35% |
 | Deployment-distribution distillation/LoRA | Research fallback, not serving baseline |

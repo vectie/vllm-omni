@@ -4840,3 +4840,55 @@ The quality result is
 `candidate-32-quality-offline-omp16/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-101625.json`
 with SHA-256
 `ba4cd70ede198e4ae6ddc718c9c9f13449a62ce62e4ce2599965d91a9c1ab43d`.
+
+## BF16 causal Conv-to-Linear custom-op integration (rejected)
+
+The next kernel experiment extended the native AscendC causal Conv-to-Linear
+operator to BF16 and substituted it for the graph-visible causal-pack plus
+Linear producer inside the accepted fixed-slab six-step CFM executable. The
+focused operator suite passed 128/128 direct NPU cases. An alternating
+15-trial exact-shape microbenchmark measured the ordinary pack-plus-Linear
+boundary at 60.458 us and the fused operator at 58.654 us, only a 1.0308x
+speedup.
+
+The serving gate used the accepted static-CFM graph as control. Each process
+received two warmups and two deterministic 12-request Seed-TTS runs at
+concurrency one. All 96 measured requests across the two A/B regimes
+completed with 100% streaming continuity, zero underrun, and the same
+aggregate structure: 1,784 input tokens, 163 output tokens, 1,160,640 audio
+frames, and 48.36 seconds of audio. The local dataset copy was incomplete, so
+this is a matched internal performance gate rather than an official
+1,088-row quality result. Lower is better except throughput.
+
+| Metric | Initial candidate vs control | Later candidate vs control |
+| --- | ---: | ---: |
+| Serving duration | -0.70% | -1.91% |
+| Request/audio throughput | +0.56% | +1.96% |
+| Mean / P99 E2E | -0.70% / -9.04% | -1.91% / -2.12% |
+| Mean / P99 TTFT | -9.06% / +0.82% | -1.53% / -6.41% |
+| Mean / P99 audio TTFP | +5.23% / +9.29% | -2.93% / -3.34% |
+| Mean / P99 whole-audio RTF | +2.08% / +5.39% | -3.35% / approximately 0% |
+
+The sign reversal in TTFP and whole-audio RTF, the low single-digit total
+effect, and the 3.08% isolated headroom fail the promotion gate. The opaque
+custom-op boundary also prevents GE from optimizing the producer-consumer
+chain across the pack and Linear. The BF16 extension, serving substitution,
+and experimental profile were therefore fully reverted in both forks. The
+accepted graph-visible causal-pack path remains in service; any retry must
+propagate one layout across the complete DiT producer-consumer chain or expose
+the fused implementation through a GE converter/decomposition.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-cfm-graph-conv-linear-bf16-20260821
+```
+
+Selected reverse-leg SHA-256 checksums are:
+
+```text
+1ce9f6916064941508f10e4be39dd0b878b917a62fd8b4f1cc70a4e9c1fc1ea4  reverse-candidate-run3.json
+5e696f059e90b787f8337dd9c1731a4f9ecc693ed295c40ebc646393ee2e09ca  reverse-candidate-run4.json
+02e77335a1e1e9bfa686daa043d5897df9b0837d514df7c223c451eba654d211  reverse-control-run3.json
+b15d7ef153ca306679f55333b63ec9cbe2b589b66984f12b9fabcdb112887347  reverse-control-run4.json
+```

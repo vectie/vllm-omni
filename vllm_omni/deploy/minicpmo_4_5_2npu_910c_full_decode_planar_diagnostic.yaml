@@ -1,0 +1,23 @@
+# Atlas 800I A3 / Ascend 910C full-decode isolation profile.
+#
+# This profile intentionally changes only the Stage-0/1 NPU graph mode from
+# the evaluator's MiniCPM-o 4.5 YAML.  The source-level Atlas A3 policy moves
+# Code2Wav to logical chip 1 and enables the fixed-planar CFM defaults.  Keep
+# this profile as an A/B diagnostic; the winning settings are promoted by the
+# source policy after the official-YAML run qualifies them.
+
+base_config: minicpmo_4_5.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_capture_sizes: [1, 2, 4]
+      - stage_id: 1
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_capture_sizes: [1, 2, 4]

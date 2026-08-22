@@ -259,6 +259,30 @@ def test_npu_optimized_defaults_activate_only_qualified_cfm6(monkeypatch) -> Non
     assert resolved == {"token2wav_n_timesteps": 6}
 
 
+def test_npu_dual_chip_planar_defaults_exclude_rejected_deep_paths(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_OPTIMIZED_DEFAULTS",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_PLANAR_DEFAULTS",
+        "1",
+    )
+    resolved = _with_npu_optimized_defaults({}, is_npu=True)
+
+    assert resolved["token2wav_n_timesteps"] == 6
+    assert resolved["npu_dit_compute_dtype"] == "bf16"
+    assert resolved["npu_cfm_integration_dtype"] == "bf16"
+    assert resolved["npu_cfm_fixed_kv_slabs"] is True
+    assert resolved["npu_cfm_planar_kv_slabs"] is True
+    assert resolved["npu_dit_mlp_graph_width"] == 50
+    assert resolved["npu_dit_graph_buckets"] == [20, 302]
+    assert "npu_dit_bsh_attention" not in resolved
+    assert "npu_cfm_graph" not in resolved
+
+
 def test_npu_aggressive_experiments_are_explicit_opt_in(monkeypatch) -> None:
     monkeypatch.delenv(
         "VLLM_OMNI_MINICPMO45_NPU_OPTIMIZED_DEFAULTS",

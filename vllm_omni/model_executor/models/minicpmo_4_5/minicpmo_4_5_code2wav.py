@@ -35,12 +35,38 @@ _MINICPMO45_NPU_OPTIMIZED_DEFAULTS_ENV = (
 _MINICPMO45_NPU_AGGRESSIVE_EXPERIMENTS_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_AGGRESSIVE_EXPERIMENTS"
 )
+_MINICPMO45_NPU_PLANAR_DEFAULTS_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_PLANAR_DEFAULTS"
+)
 
 _MINICPMO45_NPU_OPTIMIZED_DEFAULTS: dict[str, Any] = {
     # Six CFM steps passed the complete Chinese Seed-TTS quality gate. Keep
     # this in the source policy because the challenge harness supplies its own
     # deploy YAML and therefore cannot see candidate-only profiles.
     "token2wav_n_timesteps": 6,
+}
+
+# The Atlas A3 placement policy enables this bundle only for the Code2Wav
+# process after it has moved that stage onto the second logical 910C chip.
+# The complete producer/consumer layout matters: BF16 alone and isolated
+# custom-op boundaries were slower, while the fixed planar cache plus bounded
+# graph-visible partitions removed the dynamic-cache and TransData overhead.
+_MINICPMO45_NPU_PLANAR_DEFAULTS: dict[str, Any] = {
+    "npu_dit_mlp_graph": True,
+    "npu_dit_mlp_graph_width": 50,
+    "npu_dit_graph_buckets": [20, 302],
+    "npu_dit_preamble_graph": True,
+    "npu_dit_wide_adaln": True,
+    "npu_dit_wide_final_adaln": True,
+    "npu_dit_final_addcmul": True,
+    "npu_dit_conv_mlp_graph": True,
+    "npu_dit_prompt_conv_mlp_graph": True,
+    "npu_dit_fused_conv_pack": True,
+    "npu_single_request_cache_passthrough": True,
+    "npu_dit_compute_dtype": "bf16",
+    "npu_cfm_integration_dtype": "bf16",
+    "npu_cfm_fixed_kv_slabs": True,
+    "npu_cfm_planar_kv_slabs": True,
 }
 
 # These deeper Stage-2 paths are useful research controls, but the official
@@ -107,6 +133,15 @@ def _with_npu_optimized_defaults(
         return resolved
     for key, value in _MINICPMO45_NPU_OPTIMIZED_DEFAULTS.items():
         resolved.setdefault(key, value.copy() if isinstance(value, list) else value)
+    if _parse_npu_policy_switch(
+        _MINICPMO45_NPU_PLANAR_DEFAULTS_ENV,
+        default=False,
+    ):
+        for key, value in _MINICPMO45_NPU_PLANAR_DEFAULTS.items():
+            resolved.setdefault(
+                key,
+                value.copy() if isinstance(value, list) else value,
+            )
     if _parse_npu_policy_switch(
         _MINICPMO45_NPU_AGGRESSIVE_EXPERIMENTS_ENV,
         default=False,

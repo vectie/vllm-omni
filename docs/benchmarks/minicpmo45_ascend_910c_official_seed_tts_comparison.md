@@ -5003,3 +5003,87 @@ The completed smoke result is
 `smoke-v6-graph-owned-output/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-142623.json`
 with SHA-256
 `9076989ace4133f009f4abab5e984f06b4a709528f64498f33c838748f13cbfc`.
+
+## Evaluator-YAML dual-chip source policy
+
+The final submission integration revisited the organizer topology assumption.
+One allocated Atlas 800I A3 card exposes two logical 910C chips.  The untouched
+organizer YAML places every stage on logical device 0, so source policy now
+recognizes exactly that baseline on a two-device NPU host and applies the
+measured `[Thinker, Talker, Code2Wav] = [0, 0, 1]` placement.  Explicit
+placements and single-device hosts remain unchanged.
+
+The first source-policy run enabled the accepted BF16 fixed-planar partitions
+on Code2Wav but left the organizer's Stage-0/1 `PIECEWISE` graph mode intact.
+The service log proved every intended Stage-2 replay was active, yet mean RTF
+remained 0.382.  A single-variable restart changed only Thinker and Talker to
+`FULL_DECODE_ONLY` with capture sizes `[1,2,4]`; the first full 32-row run fell
+to 0.315 mean RTF.  This identified a producer-side integration loss rather
+than a failure of Stage-2 fusion.
+
+The source policy then reproduced the full-decode/fixed-planar path through
+the untouched organizer YAML, without private startup variables.  Its hot
+32-row result was:
+
+| Metric | Official-YAML planar source default |
+| --- | ---: |
+| Successful / failed | 32 / 0 |
+| Duration | 47.3773 s |
+| Mean / P99 E2E | 1,480.20 / 2,131.24 ms |
+| Mean / P99 TTFT | 340.09 / 483.82 ms |
+| Mean / P99 TTFP | 806.57 / 958.83 ms |
+| Mean / P99 whole-audio RTF | 0.307862 / 0.348755 |
+| Output tokens / audio frames | 559 / 3,737,280 |
+| Streaming continuity / underrun | 100% / 0 |
+
+An evaluator-shaped BSH-only follow-up improved mean TTFP to 801.50 ms but
+regressed mean RTF slightly, so BSH was not accepted on that isolated result.
+The deeper candidate then combined BSH with the existing two-slot fixed-address
+steady-CFM NPUGraph.  Logs confirmed two captures and subsequent replay at
+`mu=(1,80,50)` and cache shape `[6,16,2,2,402,512]`.  Prompt, cache fill, and
+tail shapes retained their existing fallback.
+
+Two independent hot measurements were stable on the mean metrics:
+
+| Metric | Planar base | BSH + steady CFM graph run 1 | Run 2 | Two-run graph average vs base |
+| --- | ---: | ---: | ---: | ---: |
+| Mean RTF | 0.307862 | 0.303975 | 0.304455 | -1.18% |
+| Mean E2E | 1,480.20 ms | 1,468.16 ms | 1,469.45 ms | -0.77% |
+| Mean TTFT | 340.09 ms | 336.82 ms | 340.82 ms | -0.37% |
+| Mean TTFP | 806.57 ms | 793.83 ms | 797.72 ms | -1.34% |
+| P99 RTF | 0.348755 | 0.360155 | 0.360562 | +3.33% |
+
+Lower is better.  All three runs completed the same 32 requests with the same
+559-token/3,737,280-frame output signature, 100% continuity, and zero underrun.
+These were explicit-profile isolation results, not yet a source-default gate.
+Their repeatable P99 regression also required caution.
+
+The decisive follow-up enabled the same BSH/static-graph combination through
+source policy while passing only the organizer's untouched YAML.  Logs proved
+that BSH compiled with zero drift, both fixed-address slots captured, and the
+steady graph replayed.  No second serving process held an NPU.  Nevertheless,
+the complete official entry measured 0.567 mean RTF, 2,734.98 ms E2E, 476.50
+ms TTFT, and 1,161.87 ms TTFP.  It completed 32/32 with the same output
+signature and continuity, so this is a performance integration failure rather
+than a liveness or output-length artifact.
+
+The submission default therefore retains the verified planar/full-decode
+source path at 0.307862 and leaves BSH/static CFM replay explicit opt-in.
+Relative to the earlier dual-chip CFM6 control at 0.379806 RTF, the accepted
+path reduces RTF by 18.94%, E2E by 19.13%, TTFT by 6.55%, and TTFP by 13.07%.
+It remains 3.87% above the reported 0.2964 leaderboard mark.
+
+The previously recorded paired 32-row gates show that the rejected paths were
+inside the accuracy budget: BSH preserved mean WER at 0.016588 and improved
+mean SIM by 0.030 percentage points; static CFM replay preserved the same WER
+and reduced mean SIM by 0.0463 percentage points.  Their rejection is based on
+the official-entry performance gate, not accuracy.
+
+Artifacts:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dual-source-default-final-official-yaml-20260822
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dual-full-decode-planar-bsh-20260822
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dual-bsh-cfm-graph-20260822
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dual-source-default-bsh-cfm-final-official-yaml-20260822
+```

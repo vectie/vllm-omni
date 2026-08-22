@@ -1159,6 +1159,14 @@ class TestDeployConfigLoading:
 
         assert changed
         assert [stage.devices for stage in deploy.stages] == ["0", "0", "1"]
+        assert deploy.stages[2].env == {
+            "VLLM_OMNI_MINICPMO45_NPU_PLANAR_DEFAULTS": "1",
+        }
+        for stage in deploy.stages[:2]:
+            assert stage.compilation_config == {
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [1, 2, 4],
+            }
 
     def test_minicpmo_a3_policy_preserves_single_chip_and_explicit_topology(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -1172,6 +1180,8 @@ class TestDeployConfigLoading:
             device_count=1,
         )
         assert [stage.devices for stage in single_chip.stages] == ["0", "0", "0"]
+        assert single_chip.stages[2].env is None
+        assert all(stage.compilation_config is None for stage in single_chip.stages)
 
         explicit = load_deploy_config(
             get_deploy_config_path(
@@ -1185,6 +1195,25 @@ class TestDeployConfigLoading:
             device_count=2,
         )
         assert [stage.devices for stage in explicit.stages] == ["0", "0", "1"]
+
+    def test_minicpmo_a3_policy_preserves_explicit_compile_mode(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml"))
+        deploy.stages[0].compilation_config = {"cudagraph_mode": "NONE"}
+
+        assert _apply_minicpmo45_a3_dual_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=2,
+        )
+
+        assert deploy.stages[0].compilation_config == {"cudagraph_mode": "NONE"}
+        assert deploy.stages[1].compilation_config == {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 2, 4],
+        }
 
     def test_load_minicpmo_910c_competition_topology(self):
         deploy_path = Path(

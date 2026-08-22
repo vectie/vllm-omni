@@ -1,0 +1,16 @@
+# Atlas 800I A3 / Ascend 910C planar CFM isolation profile.
+#
+# The historical planar profile inherits the HiFT weight-norm and width-58
+# F0 graph experiment through its base chain.  Disable both here so hardware
+# A/B measurements attribute any gain to the BF16 fixed-planar DiT cache path
+# rather than to the vocoder experiments.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_kv_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM: "0"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH: "0"

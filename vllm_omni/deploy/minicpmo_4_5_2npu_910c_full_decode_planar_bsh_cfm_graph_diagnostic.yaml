@@ -1,0 +1,16 @@
+# Atlas 800I A3 / Ascend 910C steady-CFM NPUGraph isolation profile.
+#
+# Extend the evaluator-shaped sequence-major candidate with the two-slot,
+# fixed-address six-step CFM capture. Prompt/cache-fill/tail shapes remain on
+# the normal eager/partitioned path; only width 50 with retained cache 402 is
+# eligible for replay.
+
+base_config: minicpmo_4_5_2npu_910c_full_decode_planar_bsh_diagnostic.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "1"

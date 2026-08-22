@@ -28,6 +28,10 @@ logger = init_logger(__name__)
 
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 _MINICPMO45_A3_DUAL_CHIP_ENV = "VLLM_OMNI_MINICPMO45_A3_DUAL_CHIP"
+_MINICPMO45_A3_PLANAR_DEFAULTS_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_PLANAR_DEFAULTS"
+)
+_MINICPMO45_A3_FULL_DECODE_CAPTURE_SIZES = [1, 2, 4]
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
@@ -840,10 +844,37 @@ def _apply_minicpmo45_a3_dual_chip_policy(
     if any(str(by_id[stage_id].devices) != "0" for stage_id in (0, 1, 2)):
         return False
 
-    by_id[2].devices = "1"
+    code2wav = by_id[2]
+    code2wav.devices = "1"
+    code2wav.env = dict(code2wav.env or {})
+    planar_policy = os.environ.get(_MINICPMO45_A3_PLANAR_DEFAULTS_ENV, "1")
+    code2wav.env.setdefault(_MINICPMO45_A3_PLANAR_DEFAULTS_ENV, planar_policy)
+
+    # Atlas A3 exposes the Code2Wav chip separately, so the two autoregressive
+    # stages no longer need PIECEWISE capture to coexist with DiT/HiFT on the
+    # same logical device.  FULL_DECODE_ONLY avoids the dynamic graph boundary
+    # on every Talker codec token.  Preserve any non-baseline compile mode an
+    # operator explicitly supplied.
+    full_decode_stages: list[int] = []
+    for stage_id in (0, 1):
+        stage = by_id[stage_id]
+        compilation = dict(stage.compilation_config or {})
+        mode = compilation.get("cudagraph_mode")
+        if mode not in (None, "PIECEWISE"):
+            continue
+        compilation["cudagraph_mode"] = "FULL_DECODE_ONLY"
+        compilation.setdefault(
+            "cudagraph_capture_sizes",
+            _MINICPMO45_A3_FULL_DECODE_CAPTURE_SIZES.copy(),
+        )
+        stage.compilation_config = compilation
+        full_decode_stages.append(stage_id)
     logger.info(
         "MiniCPM-o 4.5 Atlas A3 dual-chip placement active: "
-        "Thinker/Talker=0, Code2Wav=1"
+        "Thinker/Talker=0, Code2Wav=1, fixed-planar CFM policy=%s, "
+        "full-decode stages=%s",
+        code2wav.env[_MINICPMO45_A3_PLANAR_DEFAULTS_ENV],
+        full_decode_stages,
     )
     return True
 

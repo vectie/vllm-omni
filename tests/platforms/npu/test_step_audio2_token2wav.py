@@ -643,7 +643,7 @@ def test_hift_weight_norm_materialization_env_flag(
     assert module._env_flag_enabled(module._HIFT_MATERIALIZE_WEIGHT_NORM_ENV) is expected
 
 
-def test_qualified_hift_optimizations_default_on_with_opt_out(
+def test_hift_optimizations_default_off_with_explicit_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_patch_module(monkeypatch)
@@ -651,9 +651,9 @@ def test_qualified_hift_optimizations_default_on_with_opt_out(
     monkeypatch.delenv(module._HIFT_F0_GRAPH_ENV, raising=False)
     monkeypatch.delenv(module._HIFT_RESBLOCK_GRAPH_ENV, raising=False)
 
-    assert module._env_flag_enabled(module._HIFT_MATERIALIZE_WEIGHT_NORM_ENV)
-    assert module._env_flag_enabled(module._HIFT_F0_GRAPH_ENV)
+    assert not module._env_flag_enabled(module._HIFT_MATERIALIZE_WEIGHT_NORM_ENV)
+    assert not module._env_flag_enabled(module._HIFT_F0_GRAPH_ENV)
     assert not module._env_flag_enabled(module._HIFT_RESBLOCK_GRAPH_ENV)
 
-    monkeypatch.setenv(module._HIFT_F0_GRAPH_ENV, "0")
-    assert not module._env_flag_enabled(module._HIFT_F0_GRAPH_ENV)
+    monkeypatch.setenv(module._HIFT_F0_GRAPH_ENV, "1")
+    assert module._env_flag_enabled(module._HIFT_F0_GRAPH_ENV)

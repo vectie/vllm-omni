@@ -61,16 +61,10 @@ _HIFT_FIXED_ISTFT_GRAPH_MEL_WIDTH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_FIXED_IST
 _HIFT_RESIDENT_HARMONICS_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_RESIDENT_HARMONICS"
 _HIFT_SOURCE_NOISE_SCRATCH_ENV = "VLLM_OMNI_MINICPMO45_NPU_HIFT_SOURCE_NOISE_SCRATCH"
 
-# These two HiFT changes passed the same full Chinese Seed-TTS gate as the
-# source-level DiT defaults. Candidate deploy YAML is ignored by the official
-# evaluator, so enable them in the NPU adapter while retaining an explicit
-# environment-variable opt-out. More speculative HiFT graphs remain disabled.
-_HIFT_DEFAULT_ENABLED_FLAGS = frozenset(
-    {
-        _HIFT_MATERIALIZE_WEIGHT_NORM_ENV,
-        _HIFT_F0_GRAPH_ENV,
-    }
-)
+# The official one-device A/B showed that the larger Stage-2 bundle does not
+# improve end-to-end RTF. Retain every HiFT implementation as an explicit
+# experiment, but keep the evaluator path free of unqualified defaults.
+_HIFT_DEFAULT_ENABLED_FLAGS: frozenset[str] = frozenset()
 
 
 def _env_flag_enabled(name: str) -> bool:

@@ -32,12 +32,22 @@ _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV = "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMEST
 _MINICPMO45_NPU_OPTIMIZED_DEFAULTS_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_OPTIMIZED_DEFAULTS"
 )
+_MINICPMO45_NPU_AGGRESSIVE_EXPERIMENTS_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_AGGRESSIVE_EXPERIMENTS"
+)
 
 _MINICPMO45_NPU_OPTIMIZED_DEFAULTS: dict[str, Any] = {
     # Six CFM steps passed the complete Chinese Seed-TTS quality gate. Keep
     # this in the source policy because the challenge harness supplies its own
     # deploy YAML and therefore cannot see candidate-only profiles.
     "token2wav_n_timesteps": 6,
+}
+
+# These deeper Stage-2 paths are useful research controls, but the official
+# one-device A/B rejected the bundle (RTF 0.4166 versus 0.3960 for CFM6 alone)
+# and rejected BF16 in isolation (RTF 0.4950). Keep the implementations
+# available without silently slowing the evaluator's official deploy profile.
+_MINICPMO45_NPU_AGGRESSIVE_EXPERIMENTS: dict[str, Any] = {
     # Stable-width GE partitions and request-owned cache storage.
     "npu_dit_mlp_graph": True,
     "npu_dit_mlp_graph_width": 50,
@@ -53,8 +63,7 @@ _MINICPMO45_NPU_OPTIMIZED_DEFAULTS: dict[str, Any] = {
     # standard Conv+MLP partition without changing outputs.
     "npu_dit_fused_conv_pack": True,
     "npu_single_request_cache_passthrough": True,
-    # The DiT/CFM BF16 island, fixed planar slabs and BSH attention were
-    # qualified together. Prompt extraction and HiFT remain FP32.
+    # Prompt extraction and HiFT remain FP32 when this experiment is enabled.
     "npu_dit_compute_dtype": "bf16",
     "npu_cfm_integration_dtype": "bf16",
     "npu_cfm_fixed_kv_slabs": True,
@@ -63,18 +72,23 @@ _MINICPMO45_NPU_OPTIMIZED_DEFAULTS: dict[str, Any] = {
 }
 
 
-def _npu_optimized_defaults_enabled(*, is_npu: bool) -> bool:
-    """Enable the qualified challenge bundle on NPU unless explicitly disabled."""
-    raw = os.environ.get(_MINICPMO45_NPU_OPTIMIZED_DEFAULTS_ENV)
+def _parse_npu_policy_switch(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
     if raw in (None, ""):
-        return is_npu
+        return default
     normalized = raw.strip().lower()
     if normalized in {"1", "true", "yes", "on"}:
-        return is_npu
+        return True
     if normalized in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(
-        f"Invalid {_MINICPMO45_NPU_OPTIMIZED_DEFAULTS_ENV}={raw!r}"
+    raise ValueError(f"Invalid {name}={raw!r}")
+
+
+def _npu_optimized_defaults_enabled(*, is_npu: bool) -> bool:
+    """Enable only the accuracy- and one-device-performance-qualified policy."""
+    return is_npu and _parse_npu_policy_switch(
+        _MINICPMO45_NPU_OPTIMIZED_DEFAULTS_ENV,
+        default=True,
     )
 
 
@@ -93,6 +107,12 @@ def _with_npu_optimized_defaults(
         return resolved
     for key, value in _MINICPMO45_NPU_OPTIMIZED_DEFAULTS.items():
         resolved.setdefault(key, value.copy() if isinstance(value, list) else value)
+    if _parse_npu_policy_switch(
+        _MINICPMO45_NPU_AGGRESSIVE_EXPERIMENTS_ENV,
+        default=False,
+    ):
+        for key, value in _MINICPMO45_NPU_AGGRESSIVE_EXPERIMENTS.items():
+            resolved.setdefault(key, value.copy() if isinstance(value, list) else value)
     return resolved
 
 

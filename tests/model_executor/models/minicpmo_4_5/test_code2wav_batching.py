@@ -249,10 +249,24 @@ def test_token2wav_step_count_defaults_to_checkpoint_quality() -> None:
     assert _resolve_token2wav_n_timesteps({"token2wav_n_timesteps": 8}) == 8
 
 
-def test_npu_optimized_defaults_activate_complete_challenge_bundle(monkeypatch) -> None:
+def test_npu_optimized_defaults_activate_only_qualified_cfm6(monkeypatch) -> None:
     monkeypatch.delenv(
         "VLLM_OMNI_MINICPMO45_NPU_OPTIMIZED_DEFAULTS",
         raising=False,
+    )
+    resolved = _with_npu_optimized_defaults({}, is_npu=True)
+
+    assert resolved == {"token2wav_n_timesteps": 6}
+
+
+def test_npu_aggressive_experiments_are_explicit_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_OPTIMIZED_DEFAULTS",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_AGGRESSIVE_EXPERIMENTS",
+        "1",
     )
     resolved = _with_npu_optimized_defaults({}, is_npu=True)
 

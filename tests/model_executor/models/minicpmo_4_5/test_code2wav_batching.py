@@ -63,7 +63,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    _npu_optimized_defaults_enabled,
     _resolve_token2wav_n_timesteps,
+    _with_npu_optimized_defaults,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -245,6 +247,57 @@ def _model():
 def test_token2wav_step_count_defaults_to_checkpoint_quality() -> None:
     assert _resolve_token2wav_n_timesteps({}) == 10
     assert _resolve_token2wav_n_timesteps({"token2wav_n_timesteps": 8}) == 8
+
+
+def test_npu_optimized_defaults_activate_complete_challenge_bundle(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_OPTIMIZED_DEFAULTS",
+        raising=False,
+    )
+    resolved = _with_npu_optimized_defaults({}, is_npu=True)
+
+    assert resolved["token2wav_n_timesteps"] == 6
+    assert resolved["npu_dit_compute_dtype"] == "bf16"
+    assert resolved["npu_cfm_integration_dtype"] == "bf16"
+    assert resolved["npu_cfm_fixed_kv_slabs"] is True
+    assert resolved["npu_cfm_planar_kv_slabs"] is True
+    assert resolved["npu_dit_bsh_attention"] is True
+    assert resolved["npu_dit_fused_conv_pack"] is True
+
+
+def test_npu_optimized_defaults_preserve_explicit_config_and_cpu(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_OPTIMIZED_DEFAULTS",
+        raising=False,
+    )
+    explicit = {
+        "token2wav_n_timesteps": 8,
+        "npu_dit_compute_dtype": "fp32",
+        "npu_dit_bsh_attention": False,
+    }
+    resolved = _with_npu_optimized_defaults(explicit, is_npu=True)
+    assert resolved["token2wav_n_timesteps"] == 8
+    assert resolved["npu_dit_compute_dtype"] == "fp32"
+    assert resolved["npu_dit_bsh_attention"] is False
+    assert _with_npu_optimized_defaults({}, is_npu=False) == {}
+
+
+def test_npu_optimized_defaults_have_master_opt_out(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_OPTIMIZED_DEFAULTS",
+        "0",
+    )
+    assert _npu_optimized_defaults_enabled(is_npu=True) is False
+    assert _with_npu_optimized_defaults({}, is_npu=True) == {}
+
+
+def test_npu_optimized_defaults_reject_invalid_master_switch(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_OPTIMIZED_DEFAULTS",
+        "sometimes",
+    )
+    with pytest.raises(ValueError, match="NPU_OPTIMIZED_DEFAULTS"):
+        _npu_optimized_defaults_enabled(is_npu=True)
 
 
 def test_npu_dit_compute_dtype_config_and_environment(monkeypatch) -> None:

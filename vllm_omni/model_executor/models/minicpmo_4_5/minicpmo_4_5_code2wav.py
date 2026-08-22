@@ -29,6 +29,71 @@ from .batched_token2wav import (
 
 logger = init_logger(__name__)
 _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV = "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
+_MINICPMO45_NPU_OPTIMIZED_DEFAULTS_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_OPTIMIZED_DEFAULTS"
+)
+
+_MINICPMO45_NPU_OPTIMIZED_DEFAULTS: dict[str, Any] = {
+    # Six CFM steps passed the complete Chinese Seed-TTS quality gate. Keep
+    # this in the source policy because the challenge harness supplies its own
+    # deploy YAML and therefore cannot see candidate-only profiles.
+    "token2wav_n_timesteps": 6,
+    # Stable-width GE partitions and request-owned cache storage.
+    "npu_dit_mlp_graph": True,
+    "npu_dit_mlp_graph_width": 50,
+    "npu_dit_graph_buckets": [20, 302],
+    "npu_dit_preamble_graph": True,
+    "npu_dit_wide_adaln": True,
+    "npu_dit_wide_final_adaln": True,
+    "npu_dit_final_addcmul": True,
+    "npu_dit_conv_mlp_graph": True,
+    "npu_dit_prompt_conv_mlp_graph": True,
+    # The native causal pack is capability-probed. Official images without
+    # the companion vLLM-Ascend extension fall back to the graph-visible
+    # standard Conv+MLP partition without changing outputs.
+    "npu_dit_fused_conv_pack": True,
+    "npu_single_request_cache_passthrough": True,
+    # The DiT/CFM BF16 island, fixed planar slabs and BSH attention were
+    # qualified together. Prompt extraction and HiFT remain FP32.
+    "npu_dit_compute_dtype": "bf16",
+    "npu_cfm_integration_dtype": "bf16",
+    "npu_cfm_fixed_kv_slabs": True,
+    "npu_cfm_planar_kv_slabs": True,
+    "npu_dit_bsh_attention": True,
+}
+
+
+def _npu_optimized_defaults_enabled(*, is_npu: bool) -> bool:
+    """Enable the qualified challenge bundle on NPU unless explicitly disabled."""
+    raw = os.environ.get(_MINICPMO45_NPU_OPTIMIZED_DEFAULTS_ENV)
+    if raw in (None, ""):
+        return is_npu
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return is_npu
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid {_MINICPMO45_NPU_OPTIMIZED_DEFAULTS_ENV}={raw!r}"
+    )
+
+
+def _with_npu_optimized_defaults(
+    extra: Mapping[str, Any],
+    *,
+    is_npu: bool,
+) -> dict[str, Any]:
+    """Fill absent MiniCPM-o knobs with the accuracy-qualified NPU policy.
+
+    Explicit deploy-config values retain authority, and every leaf feature
+    still performs its own device/layout/parity capability checks.
+    """
+    resolved = dict(extra)
+    if not _npu_optimized_defaults_enabled(is_npu=is_npu):
+        return resolved
+    for key, value in _MINICPMO45_NPU_OPTIMIZED_DEFAULTS.items():
+        resolved.setdefault(key, value.copy() if isinstance(value, list) else value)
+    return resolved
 
 
 def _resolve_token2wav_n_timesteps(extra: Mapping[str, Any]) -> int:
@@ -755,7 +820,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         else:
             from stepaudio2.token2wav import Token2wav
 
-        extra = self._extra_config()
+        extra = _with_npu_optimized_defaults(
+            self._extra_config(),
+            is_npu=current_omni_platform.is_npu(),
+        )
         # Hub repo ids only need to become local directories once the vocoder
         # assets are actually read; unit tests construct this model with fake
         # paths and must not trigger a hub download (#5442).

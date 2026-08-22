@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 import re
 import warnings
 from collections.abc import Callable
@@ -26,6 +27,7 @@ from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationSchedul
 logger = init_logger(__name__)
 
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
+_MINICPMO45_A3_DUAL_CHIP_ENV = "VLLM_OMNI_MINICPMO45_A3_DUAL_CHIP"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
@@ -798,6 +800,54 @@ def _apply_platform_overrides(
     return deploy
 
 
+def _apply_minicpmo45_a3_dual_chip_policy(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+    *,
+    platform: str | None = None,
+    device_count: int | None = None,
+) -> bool:
+    """Give Code2Wav the second logical chip of a single Atlas A3 card.
+
+    The challenge scheduler allocates one physical A3 card, which exposes two
+    logical 910C chips.  Its baseline deploy YAML intentionally places all
+    three stages on logical device 0.  Candidate source is still allowed to
+    optimize parallel placement, so remap only stage 2 when the complete
+    baseline placement is present and two logical devices are actually
+    visible.  Explicit non-baseline placements always retain authority.
+    """
+    if pipeline.model_type != "minicpmo_4_5":
+        return False
+
+    raw = os.environ.get(_MINICPMO45_A3_DUAL_CHIP_ENV, "auto").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw not in {"", "auto", "1", "true", "yes", "on"}:
+        raise ValueError(f"Invalid {_MINICPMO45_A3_DUAL_CHIP_ENV}={raw!r}")
+
+    if platform is None:
+        from vllm_omni.platforms import current_omni_platform
+
+        platform = "npu" if current_omni_platform.is_npu() else None
+        if device_count is None and platform == "npu":
+            device_count = current_omni_platform.get_device_count()
+    if platform != "npu" or (device_count or 0) < 2:
+        return False
+
+    by_id = {stage.stage_id: stage for stage in deploy.stages}
+    if set(by_id) != {0, 1, 2}:
+        return False
+    if any(str(by_id[stage_id].devices) != "0" for stage_id in (0, 1, 2)):
+        return False
+
+    by_id[2].devices = "1"
+    logger.info(
+        "MiniCPM-o 4.5 Atlas A3 dual-chip placement active: "
+        "Thinker/Talker=0, Code2Wav=1"
+    )
+    return True
+
+
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
     StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
     StageExecutionType.LLM_GENERATION: (StageType.LLM, "generation"),
@@ -928,6 +978,7 @@ def merge_pipeline_deploy(
         cli_overrides = {}
 
     deploy = _apply_platform_overrides(deploy)
+    _apply_minicpmo45_a3_dual_chip_policy(pipeline, deploy)
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
 
     # async_chunk is irrelevant for single-stage pipelines, so we always disable it

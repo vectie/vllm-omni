@@ -27,6 +27,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     StageType,
+    _apply_minicpmo45_a3_dual_chip_policy,
     _apply_platform_overrides,
     _deep_merge_stage,
     _resolve_scheduler,
@@ -1144,6 +1145,47 @@ class TestResolveScheduler:
 
 
 class TestDeployConfigLoading:
+    def test_official_minicpmo_config_uses_both_chips_of_one_a3_card(self):
+        deploy = load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml"))
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+
+        changed = _apply_minicpmo45_a3_dual_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=2,
+        )
+
+        assert changed
+        assert [stage.devices for stage in deploy.stages] == ["0", "0", "1"]
+
+    def test_minicpmo_a3_policy_preserves_single_chip_and_explicit_topology(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+
+        single_chip = load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml"))
+        assert not _apply_minicpmo45_a3_dual_chip_policy(
+            pipeline,
+            single_chip,
+            platform="npu",
+            device_count=1,
+        )
+        assert [stage.devices for stage in single_chip.stages] == ["0", "0", "0"]
+
+        explicit = load_deploy_config(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml"
+            )
+        )
+        assert not _apply_minicpmo45_a3_dual_chip_policy(
+            pipeline,
+            explicit,
+            platform="npu",
+            device_count=2,
+        )
+        assert [stage.devices for stage in explicit.stages] == ["0", "0", "1"]
+
     def test_load_minicpmo_910c_competition_topology(self):
         deploy_path = Path(
             get_deploy_config_path(

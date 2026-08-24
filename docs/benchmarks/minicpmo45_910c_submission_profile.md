@@ -2,6 +2,12 @@
 
 Date: 2026-08-22
 
+> Superseded topology note (2026-08-24): the current competition evaluator
+> exposes one logical NPU, and the latest official submission measured 0.3761
+> RTF / 934.66 ms TTFP / 372.55 ms TTFT.  The dual-chip measurements below are
+> retained as historical A/B evidence, not as the active evaluator profile.
+> See `minicpmo45_single_chip_gap_analysis_20260824.md` for the current path.
+
 This branch is the evaluator-facing candidate. The organizer installs the
 candidate source but supplies its own deploy YAML, so the release policy must
 live in source rather than in a candidate-only profile.

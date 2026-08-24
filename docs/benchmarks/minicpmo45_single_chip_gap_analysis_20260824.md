@@ -209,6 +209,36 @@ Talker sampling fusion, canonical DiT layout propagation, then a static
 width-50 CFM executable.  The present evidence does not justify another opaque
 megakernel first.
 
+## Deliberately excluded pseudo-optimizations
+
+Two proposed switches are not present in the candidate because the current
+execution contract cannot make them a valid latency optimization:
+
+- **CFM(n+1)/HiFT(n) two-stream overlap.**  Stage 2 receives one codec chunk
+  per synchronous model invocation and must return that chunk's waveform
+  before the invocation completes.  CFM(n+1) does not exist yet at that
+  boundary. Returning an empty first result and publishing chunk n one call
+  later would manufacture overlap by adding one complete 25-code interval to
+  TTFP. Splitting a concurrency-one batch cannot create independent work
+  either. The existing three-stage executor already allows Talker(n+1) to run
+  while Code2Wav(n) runs; deeper CFM/HiFT overlap requires a deferred-output
+  Stage-2 API or two ready chunks in one call and must be designed with that
+  lifecycle rather than hidden behind two `torch.npu.Stream` objects.
+
+- **Whole-HiFT BF16.**  The loaded flashcosyvoice HiFT combines convolution,
+  F0/source generation, random noise, STFT/complex ISTFT and overlap-add in
+  one forward. Converting the module wholesale would move the precision
+  boundary through waveform phase and source state, while per-module hooks
+  would add casts and Python graph breaks around nearly every convolution.
+  The accepted homogeneous BF16 island therefore ends at the CFM mel output;
+  HiFT remains FP32 until a trace identifies a self-contained convolutional
+  region and a 910C build proves both complex-op support and Seed-TTS quality.
+
+These are architectural constraints, not missing environment flags. Enabling
+either without changing the lifecycle or proving the numerical boundary would
+make the submitted system slower or less accurate while appearing more
+"optimized" in configuration.
+
 ## Primary references
 
 - MiniCPM-o 4.5 official model source:

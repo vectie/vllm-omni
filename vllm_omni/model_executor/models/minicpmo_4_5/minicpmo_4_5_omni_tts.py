@@ -11,6 +11,7 @@ Pipeline:
   4. Continuously generate request-aligned discrete audio-code deltas
 """
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -44,6 +45,7 @@ _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
+_NPU_BOUNDED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_BOUNDED_CODEC_SAMPLER"
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
@@ -118,6 +120,52 @@ def _apply_top_k_top_p(
         threshold = torch.topk(filtered, keep, dim=-1).values[..., -1, None]
         filtered.masked_fill_(filtered < threshold, float("-inf"))
     return filtered
+
+
+def _bounded_top_k_top_p_candidates(
+    logits: torch.Tensor,
+    *,
+    top_k: int,
+    top_p: float | None,
+    min_tokens_to_keep: int = 3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply full-vocabulary top-p while sorting only final top-k candidates.
+
+    The checkpoint applies top-p before top-k.  Sorting all 6,562 codec logits
+    for that ordering is especially expensive in single-token Ascend decode.
+    Tokens outside the final top-k are discarded anyway: their aggregate
+    probability mass is sufficient to compute the exact top-p cutoff for the
+    retained candidates.  This reduces the sort and multinomial domains to 25
+    values with the checkpoint defaults while preserving the candidate
+    probabilities (apart from top-k boundary ties).
+    """
+    vocab_size = int(logits.shape[-1])
+    keep = min(vocab_size, max(int(top_k), min_tokens_to_keep))
+    candidate_logits, candidate_ids = torch.topk(logits, keep, dim=-1)
+    if top_p is None or not 0.0 < top_p < 1.0:
+        return candidate_logits, candidate_ids
+
+    max_logits = logits.amax(dim=-1, keepdim=True)
+    total_mass = torch.exp(logits - max_logits).sum(dim=-1, keepdim=True)
+    candidate_mass = torch.exp(candidate_logits - max_logits)
+    outside_mass = (total_mass - candidate_mass.sum(dim=-1, keepdim=True)).clamp_min_(0.0)
+
+    # topk returns descending values; top-p's released warper accumulates from
+    # the low-probability end and always retains at least the final three.
+    candidate_logits = candidate_logits.flip(-1)
+    candidate_ids = candidate_ids.flip(-1)
+    candidate_mass = candidate_mass.flip(-1)
+    cumulative = (outside_mass + candidate_mass.cumsum(dim=-1)) / total_mass
+    remove = cumulative <= (1.0 - float(top_p))
+    remove[..., -min_tokens_to_keep:] = False
+    return candidate_logits.masked_fill(remove, float("-inf")), candidate_ids
+
+
+def _env_enabled(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 class _MiniCPMTTSProjector(nn.Module):
@@ -452,20 +500,61 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         if step < min_tokens:
             logits[..., eos_id] = float("-inf")
-        logits = _apply_top_k_top_p(
-            logits,
-            top_k=self._codec_top_k,
-            top_p=self._codec_top_p,
-            min_tokens_to_keep=3,
+        bounded_sampler = (
+            logits.device.type == "npu"
+            and self._codec_top_k > 0
+            and self._codec_top_k < logits.shape[-1]
+            and _env_enabled(_NPU_BOUNDED_CODEC_SAMPLER_ENV, default=True)
         )
-        probabilities = torch.softmax(logits, dim=-1)
-        sampled = torch.multinomial(
-            probabilities,
-            num_samples=1,
-            generator=self._request_generator(request_id, probabilities.device),
-        ).reshape(())
+        if bounded_sampler:
+            candidate_logits, candidate_ids = _bounded_top_k_top_p_candidates(
+                logits,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                min_tokens_to_keep=3,
+            )
+            probabilities = torch.softmax(candidate_logits, dim=-1)
+            sampled_position = torch.multinomial(
+                probabilities,
+                num_samples=1,
+                generator=self._request_generator(request_id, probabilities.device),
+            )
+            sampled = candidate_ids.gather(-1, sampled_position).reshape(())
+        else:
+            logits = _apply_top_k_top_p(
+                logits,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                min_tokens_to_keep=3,
+            )
+            probabilities = torch.softmax(logits, dim=-1)
+            sampled = torch.multinomial(
+                probabilities,
+                num_samples=1,
+                generator=self._request_generator(request_id, probabilities.device),
+            ).reshape(())
         self._advance_repetition_frequencies(request_id, history, sampled, frequencies)
         return sampled
+
+    def _sampled_code_is_eos(
+        self,
+        sampled: torch.Tensor,
+        *,
+        step: int,
+        min_tokens: int,
+        reached_limit: bool,
+    ) -> bool:
+        """Synchronize the sampled code only when EOS can affect control flow.
+
+        ``_sample_audio_code`` masks EOS while ``step < min_tokens``.  Reading
+        the scalar back to Python in that interval therefore cannot change the
+        result, but on NPU it creates a full device/host synchronization after
+        every Talker token.  The max-token boundary is terminal regardless of
+        the sampled value and can skip the readback as well.
+        """
+        if reached_limit or step < min_tokens:
+            return False
+        return int(sampled.item()) == self._num_audio_tokens - 1
 
     def make_omni_output(
         self,
@@ -584,10 +673,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             step = int(state.get("step", 0))
             sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
-            sampled_id = int(sampled.item())
-            is_eos = sampled_id == self._num_audio_tokens - 1
-            state["step"] = int(state.get("step", 0)) + 1
+            min_tokens = int(state.get("min_tokens", self._codec_min_tokens))
+            state["step"] = step + 1
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
+            is_eos = self._sampled_code_is_eos(
+                sampled,
+                step=step,
+                min_tokens=min_tokens,
+                reached_limit=reached_limit,
+            )
             finished = is_eos or reached_limit
             state["finished"] = finished
             # MiniCPMTTS.generate_chunk consumes the boundary sample but

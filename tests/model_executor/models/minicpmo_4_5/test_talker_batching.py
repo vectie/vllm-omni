@@ -15,6 +15,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
     _apply_repetition_penalty,
     _apply_repetition_penalty_from_frequencies,
+    _apply_top_k_top_p,
+    _bounded_top_k_top_p_candidates,
     _max_audio_tokens,
     _restore_weight_norm_weight,
 )
@@ -118,6 +120,32 @@ def test_incremental_repetition_frequencies_match_sliding_window() -> None:
     assert torch.equal(talker._request_repetition_frequencies["req"], expected)
 
 
+def test_bounded_codec_candidates_match_full_warper_distribution() -> None:
+    generator = torch.Generator().manual_seed(7)
+    logits = torch.randn(2, 128, generator=generator)
+    expected_logits = _apply_top_k_top_p(
+        logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+    expected = torch.softmax(expected_logits, dim=-1)
+
+    candidate_logits, candidate_ids = _bounded_top_k_top_p_candidates(
+        logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+    actual = torch.zeros_like(expected).scatter(
+        -1,
+        candidate_ids,
+        torch.softmax(candidate_logits, dim=-1),
+    )
+
+    assert torch.allclose(actual, expected, atol=1e-7, rtol=1e-6)
+
+
 def test_weight_norm_restore_matches_checkpoint_parametrization_in_bfloat16() -> None:
     generator = torch.Generator().manual_seed(42)
     weight_v = torch.randn(8, 16, generator=generator, dtype=torch.bfloat16)
@@ -170,6 +198,34 @@ def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> N
     assert _routed(output, 0)["meta"]["finished"].item() is False
     assert set(output.multimodal_outputs["meta"]) == {"finished"}
     assert talker.compute_logits(output.text_hidden_states).argmax(dim=-1).tolist() == [0, 0]
+
+
+def test_pre_minimum_codec_steps_do_not_read_sample_back_to_host(mocker) -> None:
+    talker = _make_talker()
+
+    class NoHostReadbackSample:
+        def item(self):
+            raise AssertionError("pre-minimum codec sample must not be read by the host")
+
+        def reshape(self, *shape):
+            return torch.tensor(2).reshape(*shape)
+
+    mocker.patch.object(talker, "_sample_audio_code", return_value=NoHostReadbackSample())
+    info = {
+        "request_id": "req-no-sync",
+        "audio_state": {"step": 0, "min_tokens": 50},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+
+    assert info["audio_state"]["step"] == 1
+    assert _routed(output, 0)["codes"]["audio"].tolist() == [[2]]
+    assert _routed(output, 0)["meta"]["finished"].item() is False
 
 
 def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
@@ -272,7 +328,9 @@ def test_eos_is_terminal_once_and_never_enters_codec_history(mocker) -> None:
     sample = mocker.patch.object(talker, "_sample_audio_code", return_value=torch.tensor(7))
     info = {
         "request_id": "req-stop",
-        "audio_state": {"step": 3},
+        # The real sampler masks EOS before min_tokens. This test injects EOS
+        # directly, so make the request eligible for the host-side EOS check.
+        "audio_state": {"step": 3, "min_tokens": 0},
         "audio_codes": {"accumulated": torch.tensor([4, 5])},
     }
 

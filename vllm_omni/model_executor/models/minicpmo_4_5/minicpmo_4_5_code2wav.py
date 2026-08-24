@@ -1234,4 +1234,5 @@ class MiniCPMO45Code2Wav(nn.Module):
             npu_dit_fused_conv_linear=extra.get("npu_dit_fused_conv_linear"),
             npu_dit_compute_dtype=extra.get("npu_dit_compute_dtype"),
             npu_cfm_integration_dtype=extra.get("npu_cfm_integration_dtype"),
+            npu_dit_dynamic_w8a8=extra.get("npu_dit_dynamic_w8a8"),
         )

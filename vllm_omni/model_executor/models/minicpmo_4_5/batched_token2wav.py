@@ -69,6 +69,7 @@ _NPU_DIT_FUSED_CONV_BLOCK_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_BLOCK"
 _NPU_DIT_FUSED_CONV_LINEAR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR"
 _NPU_DIT_COMPUTE_DTYPE_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_COMPUTE_DTYPE"
 _NPU_CFM_INTEGRATION_DTYPE_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_INTEGRATION_DTYPE"
+_NPU_DIT_DYNAMIC_W8A8_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_DYNAMIC_W8A8"
 logger = logging.getLogger(__name__)
 
 
@@ -135,6 +136,22 @@ def _npu_cfm_integration_dtype(config_value: Any = None) -> torch.dtype:
         f"Invalid {_NPU_CFM_INTEGRATION_DTYPE_ENV}={raw!r}; "
         "expected fp32 or bf16"
     )
+
+
+def _npu_dit_dynamic_w8a8_enabled(config_value: Any = None) -> bool:
+    """Resolve selective per-channel-weight/per-token-activation DiT W8A8."""
+    env_value = os.environ.get(_NPU_DIT_DYNAMIC_W8A8_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_DIT_DYNAMIC_W8A8_ENV}={raw!r}")
 
 
 def _npu_cfm_fixed_kv_slabs_enabled(config_value: Any = None) -> bool:
@@ -629,6 +646,49 @@ def _dit_mlp_residual(
     hidden = F.gelu(hidden, approximate="tanh")
     hidden = F.linear(hidden, fc2_weight, fc2_bias)
     return x + gate * hidden
+
+
+def _quantize_dynamic_w8a8_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[out,in]`` weights per output channel for Ascend Cube.
+
+    ``npu_quant_matmul`` consumes its weight as ``[in,out]``.  Keeping the
+    transposed INT8 tensor persistent avoids a transpose/format conversion in
+    every one of the 96 steady DiT block evaluations per audio chunk.
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"Dynamic W8A8 requires a matrix, got shape={tuple(weight.shape)}")
+    source = weight.detach().to(dtype=torch.float32)
+    scale = source.abs().amax(dim=1).clamp_min(torch.finfo(torch.float32).tiny) / 127.0
+    quantized = torch.round(source / scale[:, None]).clamp_(-127, 127).to(torch.int8)
+    return quantized.transpose(0, 1).contiguous(), scale.contiguous()
+
+
+def _npu_dynamic_w8a8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """Graph-visible Ascend dynamic-W8A8 linear with FP32/BF16 output."""
+    # The registered NPU op defaults to INT8. Calling the dispatcher directly
+    # keeps the operation visible to TorchAir instead of tracing through the
+    # Python convenience wrapper.
+    quantized_x, pertoken_scale = torch.ops.npu.npu_dynamic_quant(x)
+    restore_middle_axis = pertoken_scale.dim() == 2
+    if restore_middle_axis:
+        quantized_x = quantized_x.squeeze(dim=1)
+        pertoken_scale = pertoken_scale.squeeze(dim=1)
+    output = torch.ops.npu.npu_quant_matmul(
+        quantized_x,
+        weight,
+        weight_scale,
+        pertoken_scale=pertoken_scale,
+        bias=bias,
+        output_dtype=x.dtype,
+    )
+    return output.unsqueeze(dim=1) if restore_middle_axis else output
 
 
 def _dit_wide_adaln(
@@ -1157,6 +1217,67 @@ def _dit_cache_major_conv_mlp_residual(
     return hidden, torch.cat((new_cache1, new_cache2), dim=2)
 
 
+def _dit_cache_major_conv_dynamic_w8a8_mlp_residual(
+    hidden: torch.Tensor,
+    conv_input: torch.Tensor,
+    cnn_cache: torch.Tensor,
+    gate_conv: torch.Tensor,
+    shift_mlp: torch.Tensor,
+    scale_mlp: torch.Tensor,
+    gate_mlp: torch.Tensor,
+    conv1_flat_weight: torch.Tensor,
+    conv1_bias: torch.Tensor,
+    conv_norm_weight: torch.Tensor,
+    conv_norm_bias: torch.Tensor,
+    conv2_flat_weight: torch.Tensor,
+    conv2_bias: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc1_scale: torch.Tensor,
+    fc1_bias: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    fc2_scale: torch.Tensor,
+    fc2_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Canonical cache-major Conv plus selective dynamic-W8A8 MLP graph.
+
+    Convolution, normalization and residual arithmetic remain in the model's
+    native precision.  Only the two Cube-dominant MLP projections use INT8,
+    with per-token activation scales and persistent per-channel weight scales.
+    """
+    cache1, cache2 = cnn_cache.split((512, 512), dim=2)
+    packed, new_cache1 = torch.ops._C_ascend.npu_minicpmo_causal_conv_pack(
+        conv_input,
+        cache1,
+    )
+    convolution = F.linear(packed, conv1_flat_weight, conv1_bias).reshape(
+        conv_input.shape
+    )
+    convolution = F.layer_norm(
+        convolution,
+        (512,),
+        conv_norm_weight,
+        conv_norm_bias,
+        1e-5,
+    )
+    convolution = F.mish(convolution)
+    packed, new_cache2 = torch.ops._C_ascend.npu_minicpmo_causal_conv_pack(
+        convolution,
+        cache2,
+    )
+    convolution = F.linear(packed, conv2_flat_weight, conv2_bias).reshape(
+        conv_input.shape
+    )
+    hidden = hidden + gate_conv * convolution
+
+    mlp = F.layer_norm(hidden, (512,), eps=1e-6)
+    mlp = mlp * (1 + scale_mlp) + shift_mlp
+    mlp = _npu_dynamic_w8a8_linear(mlp, fc1_weight, fc1_scale, fc1_bias)
+    mlp = F.gelu(mlp, approximate="tanh")
+    mlp = _npu_dynamic_w8a8_linear(mlp, fc2_weight, fc2_scale, fc2_bias)
+    hidden = hidden + gate_mlp * mlp
+    return hidden, torch.cat((new_cache1, new_cache2), dim=2)
+
+
 def _dit_cache_major_post_attention_conv_mlp_residual(
     hidden: torch.Tensor,
     attention: torch.Tensor,
@@ -1563,6 +1684,7 @@ class BatchedToken2Wav(nn.Module):
         npu_dit_fused_conv_linear: Any = None,
         npu_dit_compute_dtype: Any = None,
         npu_cfm_integration_dtype: Any = None,
+        npu_dit_dynamic_w8a8: Any = None,
     ):
         super().__init__()
         self._token2wav = token2wav
@@ -1749,6 +1871,10 @@ class BatchedToken2Wav(nn.Module):
         self._npu_dit_fused_conv_block_used = False
         self._npu_dit_fused_conv_linear_enabled = _npu_dit_fused_conv_linear_enabled(npu_dit_fused_conv_linear)
         self._npu_dit_fused_conv_linear_used = False
+        self._npu_dit_dynamic_w8a8_enabled = _npu_dit_dynamic_w8a8_enabled(
+            npu_dit_dynamic_w8a8
+        )
+        self._npu_dit_dynamic_w8a8_used = False
         requested_dit_dtype = _npu_dit_compute_dtype(npu_dit_compute_dtype)
         requested_integration_dtype = _npu_cfm_integration_dtype(
             npu_cfm_integration_dtype
@@ -1876,6 +2002,35 @@ class BatchedToken2Wav(nn.Module):
             logger.warning(
                 "MiniCPM-o NPU post-attention graph requires cache-major Conv+MLP; disabling it"
             )
+        if self._npu_dit_dynamic_w8a8_enabled and not (
+            isinstance(estimator, nn.Module)
+            and isinstance(estimator_parameter, torch.Tensor)
+            and estimator_parameter.device.type == "npu"
+            and self._npu_dit_conv_mlp_graph_enabled
+            and self._npu_dit_fused_conv_pack_enabled
+            and self._npu_dit_cache_major_enabled
+            and not self._npu_dit_post_attn_graph_enabled
+            and not self._npu_dit_fused_conv_linear_enabled
+        ):
+            self._npu_dit_dynamic_w8a8_enabled = False
+            logger.warning(
+                "MiniCPM-o selective dynamic W8A8 requires the NPU "
+                "cache-major causal-pack Conv+MLP graph; disabling it"
+            )
+        if self._npu_dit_dynamic_w8a8_enabled:
+            # The last-block fusion has a different argument contract. Keep
+            # the quantized candidate confined to one canonical graph rather
+            # than silently falling back to FP32 in the sixteenth block.
+            self._npu_dit_last_block_final_euler_graph_enabled = False
+            try:
+                self._prepare_npu_dit_dynamic_w8a8_weights(estimator)
+            except Exception:
+                self._npu_dit_dynamic_w8a8_enabled = False
+                logger.warning(
+                    "MiniCPM-o selective dynamic W8A8 weight preparation failed; "
+                    "retaining FP32 DiT MLP weights",
+                    exc_info=True,
+                )
         if self._npu_dit_last_block_final_euler_graph_enabled and not (
             self._npu_dit_conv_mlp_graph_enabled
             and self._npu_dit_fused_conv_pack_enabled
@@ -1908,6 +2063,41 @@ class BatchedToken2Wav(nn.Module):
         self._warmup_npu_dit_prompt_conv_mlp_graphs()
         self._warmup_npu_dit_full_block_graphs()
         self._warmup_npu_dit_full_stack_graphs()
+
+    @staticmethod
+    def _prepare_npu_dit_dynamic_w8a8_weights(estimator: nn.Module) -> None:
+        blocks = getattr(estimator, "blocks", None)
+        if not blocks:
+            raise ValueError("MiniCPM-o DiT estimator has no blocks")
+        for block in blocks:
+            mlp = block.mlp
+            for name in ("fc1", "fc2"):
+                linear = getattr(mlp, name)
+                if not isinstance(linear, nn.Linear) or linear.bias is None:
+                    raise ValueError(f"MiniCPM-o DiT {name} is not a biased Linear")
+                quantized, scale = _quantize_dynamic_w8a8_weight(linear.weight)
+                mlp.register_buffer(
+                    f"_minicpmo_w8a8_{name}_weight",
+                    quantized,
+                    persistent=False,
+                )
+                mlp.register_buffer(
+                    f"_minicpmo_w8a8_{name}_scale",
+                    scale,
+                    persistent=False,
+                )
+
+    @staticmethod
+    def _dit_dynamic_w8a8_mlp_args(block: nn.Module) -> tuple[torch.Tensor, ...]:
+        mlp = block.mlp
+        return (
+            mlp._minicpmo_w8a8_fc1_weight,
+            mlp._minicpmo_w8a8_fc1_scale,
+            mlp.fc1.bias,
+            mlp._minicpmo_w8a8_fc2_weight,
+            mlp._minicpmo_w8a8_fc2_scale,
+            mlp.fc2.bias,
+        )
 
     def _warmup_npu_dit_mlp_graph(self) -> None:
         """Compile the fixed-width post-convolution partition during startup."""
@@ -2930,7 +3120,7 @@ class BatchedToken2Wav(nn.Module):
                         block.mlp.fc2.bias,
                     )
                 else:
-                    graph_fn(
+                    common_args = (
                         hidden,
                         hidden,
                         cnn_cache,
@@ -2944,11 +3134,20 @@ class BatchedToken2Wav(nn.Module):
                         conv_norm.bias,
                         self._dit_conv_graph_weight(conv2),
                         conv2.bias,
-                        block.mlp.fc1.weight,
-                        block.mlp.fc1.bias,
-                        block.mlp.fc2.weight,
-                        block.mlp.fc2.bias,
                     )
+                    if self._npu_dit_dynamic_w8a8_enabled:
+                        graph_fn(
+                            *common_args,
+                            *self._dit_dynamic_w8a8_mlp_args(block),
+                        )
+                    else:
+                        graph_fn(
+                            *common_args,
+                            block.mlp.fc1.weight,
+                            block.mlp.fc1.bias,
+                            block.mlp.fc2.weight,
+                            block.mlp.fc2.bias,
+                        )
             torch.npu.synchronize()
             if self._npu_dit_post_attn_graph_enabled:
                 logger.info(
@@ -2973,7 +3172,9 @@ class BatchedToken2Wav(nn.Module):
 
             _ensure_torchair_broadcast_alias()
             compiler_config = torchair.CompilerConfig()
-            if self._npu_dit_fused_conv_linear_enabled:
+            if self._npu_dit_dynamic_w8a8_enabled:
+                graph_partition = _dit_cache_major_conv_dynamic_w8a8_mlp_residual
+            elif self._npu_dit_fused_conv_linear_enabled:
                 graph_partition = _dit_fused_conv_linear_mlp_residual
             elif self._npu_dit_post_attn_graph_enabled:
                 graph_partition = _dit_cache_major_post_attention_conv_mlp_residual
@@ -4380,7 +4581,7 @@ class BatchedToken2Wav(nn.Module):
                             block.mlp.fc2.bias,
                         )
                 else:
-                    hidden, new_cnn = conv_mlp_graph_fn(
+                    common_args = (
                         hidden,
                         conv_input,
                         block_cnn_cache,
@@ -4394,11 +4595,25 @@ class BatchedToken2Wav(nn.Module):
                         conv_norm.bias,
                         conv2_weight,
                         conv2.bias,
-                        block.mlp.fc1.weight,
-                        block.mlp.fc1.bias,
-                        block.mlp.fc2.weight,
-                        block.mlp.fc2.bias,
                     )
+                    if self._npu_dit_dynamic_w8a8_enabled:
+                        hidden, new_cnn = conv_mlp_graph_fn(
+                            *common_args,
+                            *self._dit_dynamic_w8a8_mlp_args(block),
+                        )
+                        if not self._npu_dit_dynamic_w8a8_used:
+                            logger.info(
+                                "MiniCPM-o selective dynamic W8A8 DiT MLP graph active"
+                            )
+                            self._npu_dit_dynamic_w8a8_used = True
+                    else:
+                        hidden, new_cnn = conv_mlp_graph_fn(
+                            *common_args,
+                            block.mlp.fc1.weight,
+                            block.mlp.fc1.bias,
+                            block.mlp.fc2.weight,
+                            block.mlp.fc2.bias,
+                        )
             cnn_out[block_idx].copy_(new_cnn)
             if not attention_cache_written:
                 att_out[block_idx, :, :, : new_att.shape[2], :].copy_(new_att)

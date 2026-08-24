@@ -130,6 +130,11 @@ These changes are implemented but have **not** yet been assigned a 910C speedup:
    - `minicpmo_4_5_1npu_910c_cfm6_canonical_cfm_graph_experimental.yaml`
      captures only the steady width-50/cache-402 CFM call with one graph key
      and two persistent output slots.
+   - `minicpmo_4_5_1npu_910c_cfm6_canonical_w8a8_mlp_experimental.yaml`
+     keeps the same FP32 quality boundary around attention, normalization,
+     Conv, CFG/Euler and HiFT, but changes the 32 DiT MLP weight matrices to
+     persistent per-output-channel INT8 and quantizes MLP activations per
+     token inside the GE graph.
 
    These are qualification profiles, not promoted defaults.  The first 910C
    session must compare each one against the cumulative prefix candidate and

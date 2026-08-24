@@ -22,6 +22,7 @@ def _load_profile(name: str):
         "minicpmo_4_5_1npu_910c_cfm6_canonical_layout_experimental.yaml",
         "minicpmo_4_5_1npu_910c_cfm6_canonical_qkv_dma_experimental.yaml",
         "minicpmo_4_5_1npu_910c_cfm6_canonical_cfm_graph_experimental.yaml",
+        "minicpmo_4_5_1npu_910c_cfm6_canonical_w8a8_mlp_experimental.yaml",
     ],
 )
 def test_single_chip_profiles_keep_all_stages_on_device_zero(name):
@@ -73,3 +74,15 @@ def test_single_chip_cfm_graph_has_one_static_graph_entry():
     assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
     assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE"] == "1"
 
+
+def test_single_chip_w8a8_candidate_quantizes_only_dit_mlp():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_910c_cfm6_canonical_w8a8_mlp_experimental.yaml"
+    )
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+
+    assert extra["npu_dit_dynamic_w8a8"] is True
+    assert "npu_dit_compute_dtype" not in extra
+    assert extra["npu_dit_cache_major"] is True
+    assert extra["npu_dit_conv_mlp_graph"] is True
+    assert extra["npu_cfm_planar_kv_slabs"] is True

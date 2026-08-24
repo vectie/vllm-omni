@@ -32,6 +32,8 @@ _MINICPMO45_A3_PLANAR_DEFAULTS_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_PLANAR_DEFAULTS"
 )
 _MINICPMO45_A3_FULL_DECODE_CAPTURE_SIZES = [1, 2, 4]
+_MINICPMO45_SINGLE_CHIP_POLICY_ENV = "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_POLICY"
+_MINICPMO45_SINGLE_CHIP_CAPTURE_SIZES = [1]
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
@@ -237,6 +239,10 @@ class StagePipelineConfig:
     custom_process_next_stage_input_func: str | None = None
     # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
+    # Optional destination-stage hook that enriches the orchestrator's
+    # pre-submitted async request. The framework owns the prepare lifecycle;
+    # models use this narrow hook only to attach model-specific conditioning.
+    async_chunk_prewarm_input_func: str | None = None
     sync_process_input_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
@@ -879,6 +885,82 @@ def _apply_minicpmo45_a3_dual_chip_policy(
     return True
 
 
+def _apply_minicpmo45_single_chip_policy(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+    *,
+    platform: str | None = None,
+    device_count: int | None = None,
+) -> bool:
+    """Remove avoidable host gaps from the official one-chip NPU topology.
+
+    The competition's current evaluator exposes one logical NPU, so the A3
+    two-chip placement policy above does not run.  Keep all three stages on
+    the organizer's explicit device 0, but use a batch-one decode graph for
+    the two autoregressive producers and wake the shared-memory consumer with
+    an event instead of the one-millisecond polling fallback.
+
+    This policy intentionally does not enable the BF16/fixed-planar Stage-2
+    bundle: that bundle regressed the prior colocated one-device A/B.  Explicit
+    placements, compile modes, connector choices, and connector values retain
+    authority.
+    """
+    if pipeline.model_type != "minicpmo_4_5":
+        return False
+
+    raw = os.environ.get(_MINICPMO45_SINGLE_CHIP_POLICY_ENV, "auto").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw not in {"", "auto", "1", "true", "yes", "on"}:
+        raise ValueError(f"Invalid {_MINICPMO45_SINGLE_CHIP_POLICY_ENV}={raw!r}")
+
+    if platform is None:
+        from vllm_omni.platforms import current_omni_platform
+
+        platform = "npu" if current_omni_platform.is_npu() else None
+        if device_count is None and platform == "npu":
+            device_count = current_omni_platform.get_device_count()
+    if platform != "npu" or device_count != 1:
+        return False
+
+    by_id = {stage.stage_id: stage for stage in deploy.stages}
+    if set(by_id) != {0, 1, 2}:
+        return False
+    if any(str(by_id[stage_id].devices) != "0" for stage_id in (0, 1, 2)):
+        return False
+
+    changed: list[str] = []
+    for stage_id in (0, 1):
+        stage = by_id[stage_id]
+        compilation = dict(stage.compilation_config or {})
+        mode = compilation.get("cudagraph_mode")
+        if mode not in (None, "PIECEWISE"):
+            continue
+        compilation["cudagraph_mode"] = "FULL_DECODE_ONLY"
+        compilation.setdefault(
+            "cudagraph_capture_sizes",
+            _MINICPMO45_SINGLE_CHIP_CAPTURE_SIZES.copy(),
+        )
+        stage.compilation_config = compilation
+        changed.append(f"stage-{stage_id}-decode-graph")
+
+    connectors = deploy.connectors
+    if isinstance(connectors, dict):
+        connector = connectors.get("connector_of_shared_memory")
+        if isinstance(connector, dict) and connector.get("name") == "SharedMemoryConnector":
+            extra = connector.setdefault("extra", {})
+            if isinstance(extra, dict) and "shm_event_notifications" not in extra:
+                extra["shm_event_notifications"] = True
+                changed.append("shm-events")
+
+    if changed:
+        logger.info(
+            "MiniCPM-o 4.5 single-chip NPU producer policy active: %s",
+            changed,
+        )
+    return bool(changed)
+
+
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
     StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
     StageExecutionType.LLM_GENERATION: (StageType.LLM, "generation"),
@@ -945,6 +1027,8 @@ def _build_engine_args(
         engine_args["engine_output_type"] = ps.engine_output_type
     if next_stage_proc:
         engine_args["custom_process_next_stage_input_func"] = next_stage_proc
+    if ps.async_chunk_prewarm_input_func:
+        engine_args["async_chunk_prewarm_input_func"] = ps.async_chunk_prewarm_input_func
     # Subdirectory indirections from StagePipelineConfig (structural, not
     # deployment knobs).  Deploy YAML ``engine_extras`` can still override
     # these per-stage if needed.
@@ -1010,6 +1094,7 @@ def merge_pipeline_deploy(
 
     deploy = _apply_platform_overrides(deploy)
     _apply_minicpmo45_a3_dual_chip_policy(pipeline, deploy)
+    _apply_minicpmo45_single_chip_policy(pipeline, deploy)
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
 
     # async_chunk is irrelevant for single-stage pipelines, so we always disable it

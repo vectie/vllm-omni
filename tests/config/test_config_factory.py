@@ -28,6 +28,7 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
     StageType,
     _apply_minicpmo45_a3_dual_chip_policy,
+    _apply_minicpmo45_single_chip_policy,
     _apply_platform_overrides,
     _deep_merge_stage,
     _resolve_scheduler,
@@ -1195,6 +1196,55 @@ class TestDeployConfigLoading:
             device_count=2,
         )
         assert [stage.devices for stage in explicit.stages] == ["0", "0", "1"]
+
+    def test_minicpmo_single_chip_policy_graphs_producers_and_enables_events(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert [stage.devices for stage in deploy.stages] == ["0", "0", "0"]
+        for stage in deploy.stages[:2]:
+            assert stage.compilation_config == {
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [1],
+            }
+        connector = deploy.connectors["connector_of_shared_memory"]
+        assert connector["extra"]["shm_event_notifications"] is True
+        assert deploy.stages[2].env is None
+
+    def test_minicpmo_single_chip_policy_preserves_explicit_authority(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+        deploy.stages[0].compilation_config = {"cudagraph_mode": "NONE"}
+        deploy.connectors["connector_of_shared_memory"]["extra"]["shm_event_notifications"] = False
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert deploy.stages[0].compilation_config == {"cudagraph_mode": "NONE"}
+        assert deploy.stages[1].compilation_config == {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1],
+        }
+        assert deploy.connectors["connector_of_shared_memory"]["extra"]["shm_event_notifications"] is False
 
     def test_minicpmo_a3_policy_preserves_explicit_compile_mode(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")

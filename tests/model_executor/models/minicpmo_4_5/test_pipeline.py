@@ -131,6 +131,9 @@ class TestPipelineTopology:
         assert code2wav.final_output_type == "audio"
         assert code2wav.engine_output_type == "audio"
         assert code2wav.model_arch == "MiniCPMO45Code2Wav"
+        assert code2wav.async_chunk_prewarm_input_func == (
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.prepare_code2wav_request"
+        )
         assert code2wav.sync_process_input_func == (
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_token_only"
         )
@@ -161,6 +164,7 @@ class TestDeployTopology:
         assert connector["extra"]["connector_get_max_wait"] == 300
         expected_processor = "tts2code2wav_async_chunk" if deploy.async_chunk else "tts2code2wav_full_payload"
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
+        assert stages[2].yaml_engine_args["async_chunk_prewarm_input_func"].endswith("prepare_code2wav_request")
         if filename == "minicpmo_4_5.yaml":
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
@@ -197,6 +201,9 @@ class TestDeployTopology:
         )
         assert code2wav.sync_process_input_func == (
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_token_only"
+        )
+        assert code2wav.async_chunk_prewarm_input_func == (
+            "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.prepare_code2wav_request"
         )
 
 

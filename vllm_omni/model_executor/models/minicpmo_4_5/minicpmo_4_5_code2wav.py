@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -37,6 +38,9 @@ _MINICPMO45_NPU_AGGRESSIVE_EXPERIMENTS_ENV = (
 )
 _MINICPMO45_NPU_PLANAR_DEFAULTS_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_PLANAR_DEFAULTS"
+)
+_MINICPMO45_CODE2WAV_PROMPT_PREWARM_ENV = (
+    "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_PREWARM"
 )
 
 _MINICPMO45_NPU_OPTIMIZED_DEFAULTS: dict[str, Any] = {
@@ -219,10 +223,15 @@ def _carries_stage_payload(info: Mapping[str, Any], meta: Mapping[str, Any]) -> 
 
 @dataclass(frozen=True)
 class _RequestState:
+    lifecycle_generation: int
     cache_epoch: int
-    chunk_seq: int
+    # ``None`` is the explicit prepared-but-not-started phase. It replaces
+    # the old negative chunk sentinel while keeping real stream positions
+    # non-negative and directly comparable.
+    chunk_seq: int | None
     prompt_cache_id: str
     prompt_wav: str
+    prompt_fingerprint: str
     token2wav: BatchedToken2WavState
 
 
@@ -230,6 +239,7 @@ class _RequestState:
 class _RuntimePrompt:
     cache_id: str
     path: str
+    fingerprint: str
     owners: set[str]
 
 
@@ -240,8 +250,11 @@ class _WorkItem:
     request_id: str
     cache_epoch: int
     chunk_seq: int
+    lifecycle_event: str
+    lifecycle_generation: int
     prompt_cache_id: str
     prompt_wav: str
+    prompt_fingerprint: str
     last_chunk: bool
     tokens: torch.Tensor
     previous: _RequestState | None
@@ -253,6 +266,7 @@ class _WorkItem:
     segment_end: bool
     turn_end: bool
     has_payload: bool = True
+    discarded: bool = False
 
 
 class MiniCPMO45Code2Wav(nn.Module):
@@ -279,8 +293,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._model_revision = getattr(vllm_config.model_config, "revision", None)
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
+        self._terminal_state_ids: OrderedDict[str, None] = OrderedDict()
         self._runtime_prompts: dict[str, _RuntimePrompt] = {}
         self._request_prompt_keys: dict[str, str] = {}
+        self._prompt_fingerprints: dict[
+            tuple[str, str], tuple[tuple[int, int] | None, str]
+        ] = {}
         self._runtime_prompt_dir = tempfile.TemporaryDirectory(
             prefix="minicpmo45-runtime-prompts-",
         )
@@ -288,8 +306,20 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
+        self._terminal_state_limit = int(extra.get("code2wav_terminal_state_limit", 4096))
+        if self._terminal_state_limit < 1:
+            raise ValueError("MiniCPM-o Code2Wav code2wav_terminal_state_limit must be >= 1")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
+        from vllm_omni.platforms import current_omni_platform
+
+        prewarm_value = os.environ.get(_MINICPMO45_CODE2WAV_PROMPT_PREWARM_ENV, "1")
+        self._prompt_prewarm_enabled = current_omni_platform.is_npu() and prewarm_value.strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
 
     @property
     def _default_prompt_wav(self) -> str:
@@ -311,6 +341,50 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     def compute_logits(self, hidden_states: Any, sampling_metadata: Any = None) -> None:
         return None
+
+    def _mark_terminal(self, state_id: str) -> None:
+        self._terminal_state_ids[state_id] = None
+        self._terminal_state_ids.move_to_end(state_id)
+        while len(self._terminal_state_ids) > self._terminal_state_limit:
+            self._terminal_state_ids.popitem(last=False)
+
+    def _prompt_fingerprint(self, cache_id: str, prompt_wav: str) -> str:
+        """Fingerprint every conditioning input used to build prompt state."""
+        key = (cache_id, prompt_wav)
+        path = Path(prompt_wav)
+        if path.is_file():
+            stat = path.stat()
+            file_signature: tuple[int, int] | None = (
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+            )
+        else:
+            file_signature = None
+        cached = self._prompt_fingerprints.get(key)
+        if cached is not None and cached[0] == file_signature:
+            return cached[1]
+
+        digest = sha256()
+        digest.update(cache_id.encode())
+        digest.update(b"\0")
+        if path.is_file():
+            with path.open("rb") as source:
+                while block := source.read(1024 * 1024):
+                    digest.update(block)
+        else:
+            # Unit/dummy configurations may intentionally use a synthetic
+            # path. Include it in the identity without forcing filesystem I/O.
+            digest.update(prompt_wav.encode())
+        fingerprint = digest.hexdigest()
+        self._prompt_fingerprints[key] = (file_signature, fingerprint)
+        return fingerprint
+
+    @staticmethod
+    def _qualified_prompt_cache_id(cache_id: str, fingerprint: str) -> str:
+        # The backend cache is keyed by (id, path). Qualifying the logical id
+        # makes content identity part of that key without changing file paths.
+        suffix = fingerprint[:16]
+        return cache_id if cache_id.endswith(f"-{suffix}") else f"{cache_id}-{suffix}"
 
     def _materialize_runtime_prompt(
         self,
@@ -334,7 +408,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         path = str(Path(self._runtime_prompt_dir.name) / f"minicpmo45_ref_{cache_key[:24]}_{sample_rate_hz}.wav")
         entry = self._runtime_prompts.get(cache_key)
         if entry is None:
-            entry = _RuntimePrompt(cache_id=cache_id, path=path, owners=set())
+            entry = _RuntimePrompt(
+                cache_id=cache_id,
+                path=path,
+                fingerprint=cache_key,
+                owners=set(),
+            )
             self._runtime_prompts[cache_key] = entry
         prompt_path = Path(entry.path)
         if not prompt_path.is_file():
@@ -363,28 +442,56 @@ class MiniCPMO45Code2Wav(nn.Module):
         info: Mapping[str, Any],
         meta: Mapping[str, Any],
         previous: _RequestState | None,
-    ) -> tuple[str, str, str | None]:
+    ) -> tuple[str, str, str | None, str]:
         codes = info.get("codes")
         ref_audio = codes.get("ref") if isinstance(codes, Mapping) else None
+        previous_runtime_key = self._request_prompt_keys.get(state_id)
+        if (
+            ref_audio is not None
+            and previous is not None
+            and previous.chunk_seq is None
+            and previous_runtime_key is not None
+        ):
+            # The explicit prepare event already content-addressed and
+            # materialized this request's exact reference. Older producers may
+            # repeat the waveform on chunk 0; do not force another D2H copy,
+            # SHA-256 pass and temporary-file lookup on the first-packet path.
+            return (
+                previous.prompt_cache_id,
+                previous.prompt_wav,
+                previous_runtime_key,
+                previous.prompt_fingerprint,
+            )
         if ref_audio is not None:
             cache_key, entry = self._materialize_runtime_prompt(
                 ref_audio,
                 meta.get("ref_audio_sr"),
             )
-            return entry.cache_id, entry.path, cache_key
+            return entry.cache_id, entry.path, cache_key, entry.fingerprint
 
         if previous is not None:
-            return previous.prompt_cache_id, previous.prompt_wav, self._request_prompt_keys.get(state_id)
+            return (
+                previous.prompt_cache_id,
+                previous.prompt_wav,
+                self._request_prompt_keys.get(state_id),
+                previous.prompt_fingerprint,
+            )
 
-        cache_key = self._request_prompt_keys.get(state_id)
+        cache_key = previous_runtime_key
         entry = self._runtime_prompts.get(cache_key) if cache_key is not None else None
         if entry is not None:
-            return entry.cache_id, entry.path, cache_key
+            return entry.cache_id, entry.path, cache_key, entry.fingerprint
 
+        logical_cache_id = str(
+            _scalar(meta.get("prompt_cache_id"), self._default_prompt_id)
+        )
+        prompt_wav = str(_scalar(meta.get("prompt_wav"), self._default_prompt_wav))
+        fingerprint = self._prompt_fingerprint(logical_cache_id, prompt_wav)
         return (
-            str(_scalar(meta.get("prompt_cache_id"), self._default_prompt_id)),
-            str(_scalar(meta.get("prompt_wav"), self._default_prompt_wav)),
+            self._qualified_prompt_cache_id(logical_cache_id, fingerprint),
+            prompt_wav,
             None,
+            fingerprint,
         )
 
     def _release_request_prompt(self, state_id: str) -> None:
@@ -451,25 +558,63 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not isinstance(meta, Mapping):
             meta = info
         request_id = str(_scalar(meta.get("request_id"), _scalar(info.get("request_id"), "")))
-        if not _carries_stage_payload(info, meta):
-            # The producer attached nothing to this step, only the bookkeeping
-            # the runner stamps on every request. The stage was scheduled on
-            # the placeholder prompt that async-chunk pre-warm submits before
-            # the first codec window arrives: those tokens are reserved slots,
-            # not codec data, and one bogus frame is shorter than the vocoder's
-            # lookahead window. Such a step carries no producer metadata at
-            # all, so it cannot be held to the payload contract below either.
+        has_payload = _carries_stage_payload(info, meta)
+        raw_event = _scalar(meta.get("lifecycle_event"), "") if has_payload else ""
+        lifecycle_event = str(raw_event or "")
+        if lifecycle_event not in {"", "prepare", "chunk", "finish"}:
+            raise _batch_error(
+                "invalid_lifecycle_event",
+                request_id=request_id or state_id,
+                lifecycle_event=lifecycle_event,
+            )
+
+        if state_id in self._terminal_state_ids:
+            # The engine has already completed or aborted this request. An
+            # upstream chunk may still have been in flight, but it must never
+            # recreate prompt, codec or graph-slot state.
             return _WorkItem(
                 output_index=index,
                 state_id=state_id,
                 request_id=request_id or state_id,
                 cache_epoch=0,
                 chunk_seq=0,
-                prompt_cache_id=self._default_prompt_id,
-                prompt_wav=self._default_prompt_wav,
+                lifecycle_event=lifecycle_event or "chunk",
+                lifecycle_generation=0,
+                prompt_cache_id="",
+                prompt_wav="",
+                prompt_fingerprint="",
                 last_chunk=False,
                 tokens=segment.new_empty(0, dtype=torch.long),
                 previous=None,
+                runtime_prompt_key=None,
+                duplex_epoch=-1,
+                duplex_turn_id=-1,
+                segment_text_utf8=torch.empty(0, dtype=torch.uint8),
+                tts_is_last_chunk=False,
+                segment_end=False,
+                turn_end=False,
+                has_payload=has_payload,
+                discarded=True,
+            )
+
+        if not has_payload:
+            # Backward-compatible no-op for an older orchestrator that
+            # pre-submits only reserved prompt tokens. Prewarming itself now
+            # requires the explicit lifecycle event above.
+            return _WorkItem(
+                output_index=index,
+                state_id=state_id,
+                request_id=request_id or state_id,
+                cache_epoch=0,
+                chunk_seq=0,
+                lifecycle_event="noop",
+                lifecycle_generation=0,
+                prompt_cache_id="",
+                prompt_wav="",
+                prompt_fingerprint="",
+                last_chunk=False,
+                tokens=segment.new_empty(0, dtype=torch.long),
+                previous=self._states.get(state_id),
                 runtime_prompt_key=None,
                 duplex_epoch=-1,
                 duplex_turn_id=-1,
@@ -483,19 +628,38 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise _batch_error("missing_request_id", output_index=index)
         cache_epoch = int(_scalar(meta.get("cache_epoch"), 0))
         chunk_seq = int(_scalar(meta.get("chunk_seq"), 0))
-        if cache_epoch < 0 or chunk_seq < 0:
+        lifecycle_generation = int(
+            _scalar(meta.get("lifecycle_generation"), cache_epoch)
+        )
+        if cache_epoch < 0 or chunk_seq < 0 or lifecycle_generation < 0:
             raise _batch_error(
                 "negative_stream_position",
                 request_id=request_id,
                 cache_epoch=cache_epoch,
                 chunk_seq=chunk_seq,
+                lifecycle_generation=lifecycle_generation,
             )
+        if lifecycle_generation != cache_epoch:
+            raise _batch_error(
+                "lifecycle_generation_mismatch",
+                request_id=request_id,
+                cache_epoch=cache_epoch,
+                lifecycle_generation=lifecycle_generation,
+            )
+        is_prepare = lifecycle_event == "prepare"
         last_chunk = bool(_scalar(meta.get("last_chunk"), False))
+        if lifecycle_event == "finish" and not last_chunk:
+            raise _batch_error(
+                "finish_event_requires_last_chunk",
+                request_id=request_id,
+            )
+        if not lifecycle_event:
+            lifecycle_event = "finish" if last_chunk else "chunk"
         tts_is_last_chunk = bool(_scalar(meta.get("tts_is_last_chunk"), False))
         codes = info.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else None
-        tokens = _codec_tensor(audio, segment)
-        if int(_scalar(meta.get("code_flat_numel"), tokens.numel())) == 0:
+        tokens = segment.new_empty(0, dtype=torch.long) if is_prepare else _codec_tensor(audio, segment)
+        if is_prepare or int(_scalar(meta.get("code_flat_numel"), tokens.numel())) == 0:
             # The generation scheduler reserves one placeholder token for an
             # empty terminal or segment-boundary chunk. The producer's
             # explicit length is the authority, so do not decode that
@@ -503,22 +667,22 @@ class MiniCPMO45Code2Wav(nn.Module):
             tokens = segment.new_empty(0, dtype=torch.long)
         previous = self._states.get(state_id)
         if previous is None:
-            if chunk_seq != 0:
+            if not is_prepare and chunk_seq != 0:
                 raise _batch_error(
                     "missing_state_for_chunk",
                     request_id=request_id,
                     cache_epoch=cache_epoch,
                     chunk_seq=chunk_seq,
                 )
-        elif cache_epoch < previous.cache_epoch:
+        elif lifecycle_generation < previous.lifecycle_generation:
             raise _batch_error(
                 "stale_cache_epoch",
                 request_id=request_id,
-                expected=previous.cache_epoch,
-                actual=cache_epoch,
+                expected=previous.lifecycle_generation,
+                actual=lifecycle_generation,
             )
-        elif cache_epoch > previous.cache_epoch:
-            if chunk_seq != 0:
+        elif lifecycle_generation > previous.lifecycle_generation:
+            if not is_prepare and chunk_seq != 0:
                 raise _batch_error(
                     "new_epoch_requires_first_chunk",
                     request_id=request_id,
@@ -526,19 +690,56 @@ class MiniCPMO45Code2Wav(nn.Module):
                     chunk_seq=chunk_seq,
                 )
             previous = None
-        elif chunk_seq != previous.chunk_seq + 1:
+        elif not is_prepare and previous.chunk_seq is None and chunk_seq != 0:
+            raise _batch_error(
+                "prepared_state_requires_first_chunk",
+                request_id=request_id,
+                cache_epoch=cache_epoch,
+                chunk_seq=chunk_seq,
+            )
+        elif (
+            not is_prepare
+            and previous.chunk_seq is not None
+            and chunk_seq != previous.chunk_seq + 1
+        ):
             raise _batch_error(
                 "stale_or_reordered_chunk",
                 request_id=request_id,
                 expected=previous.chunk_seq + 1,
                 actual=chunk_seq,
             )
-        prompt_cache_id, prompt_wav, runtime_prompt_key = self._resolve_prompt(
+        (
+            prompt_cache_id,
+            prompt_wav,
+            runtime_prompt_key,
+            prompt_fingerprint,
+        ) = self._resolve_prompt(
             state_id,
             info,
             meta,
             previous,
         )
+        supplied_fingerprint = _scalar(meta.get("prompt_fingerprint"), None)
+        if supplied_fingerprint is not None and str(supplied_fingerprint) != prompt_fingerprint:
+            raise _batch_error(
+                "prompt_fingerprint_mismatch",
+                request_id=request_id,
+                expected=prompt_fingerprint,
+                actual=str(supplied_fingerprint),
+            )
+        if previous is not None and prompt_fingerprint != previous.prompt_fingerprint:
+            if previous.chunk_seq is None:
+                # An older caller may prepare before it can provide the exact
+                # reference. Replacing a prepared state is safe; changing an
+                # already-streaming voice is not.
+                previous = None
+            else:
+                raise _batch_error(
+                    "prompt_changed_midstream",
+                    request_id=request_id,
+                    expected=previous.prompt_fingerprint,
+                    actual=prompt_fingerprint,
+                )
         if previous is not None and prompt_cache_id != previous.prompt_cache_id:
             raise _batch_error(
                 "prompt_changed_midstream",
@@ -562,8 +763,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             request_id=request_id,
             cache_epoch=cache_epoch,
             chunk_seq=chunk_seq,
+            lifecycle_event=lifecycle_event,
+            lifecycle_generation=lifecycle_generation,
             prompt_cache_id=prompt_cache_id,
             prompt_wav=prompt_wav,
+            prompt_fingerprint=prompt_fingerprint,
             last_chunk=last_chunk,
             tokens=tokens,
             previous=previous,
@@ -586,11 +790,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         return (
             item.prompt_cache_id,
             item.prompt_wav,
+            item.prompt_fingerprint,
             int(item.tokens.numel()),
             cache_signature,
             item.last_chunk,
             item.tts_is_last_chunk,
-            item.cache_epoch,
+            item.lifecycle_generation,
         )
 
     @torch.inference_mode()
@@ -673,15 +878,40 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._prune_unowned_runtime_prompts()
             raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
-        sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
-        segment_markers = [
-            item for item in items if not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
+        prewarm_items = [
+            item
+            for item in items
+            if self._prompt_prewarm_enabled
+            and item.lifecycle_event == "prepare"
+            and item.previous is None
+            and not item.discarded
         ]
-        compute_items = [item for item in items if item.tokens.numel() > 0]
+        sentinels = [
+            item
+            for item in items
+            if item.last_chunk and item.tokens.numel() == 0 and not item.discarded
+        ]
+        segment_markers = [
+            item
+            for item in items
+            if not item.last_chunk
+            and item.tts_is_last_chunk
+            and item.tokens.numel() == 0
+            and item.lifecycle_event != "prepare"
+            and not item.discarded
+        ]
+        compute_items = [
+            item for item in items if item.tokens.numel() > 0 and not item.discarded
+        ]
         invalid_empty = [
             item.request_id
             for item in items
-            if item.has_payload and not item.last_chunk and not item.tts_is_last_chunk and item.tokens.numel() == 0
+            if item.has_payload
+            and item.lifecycle_event not in {"prepare", "noop"}
+            and not item.last_chunk
+            and not item.tts_is_last_chunk
+            and item.tokens.numel() == 0
+            and not item.discarded
         ]
         if invalid_empty:
             self._prune_unowned_runtime_prompts()
@@ -708,24 +938,66 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
 
         pending: dict[str, _RequestState | None] = {item.state_id: None for item in sentinels}
+        prewarm_buckets: dict[tuple[str, str, str], list[_WorkItem]] = {}
+        for item in prewarm_items:
+            prewarm_buckets.setdefault(
+                (
+                    item.prompt_cache_id,
+                    item.prompt_wav,
+                    item.prompt_fingerprint,
+                ),
+                [],
+            ).append(item)
+        for bucket in prewarm_buckets.values():
+            try:
+                features = self.backend.prepare_prompt(
+                    bucket[0].prompt_cache_id,
+                    bucket[0].prompt_wav,
+                )
+                states = self.backend.setup_batch(features, len(bucket))
+            except Exception as exc:
+                if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
+                    raise
+                raise _batch_error(
+                    "prompt_prewarm_failed",
+                    request_ids=[item.request_id for item in bucket],
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                ) from exc
+            for item, state in zip(bucket, states, strict=True):
+                pending[item.state_id] = _RequestState(
+                    lifecycle_generation=item.lifecycle_generation,
+                    cache_epoch=item.cache_epoch,
+                    chunk_seq=None,
+                    prompt_cache_id=item.prompt_cache_id,
+                    prompt_wav=item.prompt_wav,
+                    prompt_fingerprint=item.prompt_fingerprint,
+                    token2wav=state,
+                )
         pending.update(
             {
                 item.state_id: _RequestState(
+                    lifecycle_generation=item.lifecycle_generation,
                     cache_epoch=item.cache_epoch,
                     chunk_seq=item.chunk_seq,
                     prompt_cache_id=item.prompt_cache_id,
                     prompt_wav=item.prompt_wav,
+                    prompt_fingerprint=item.prompt_fingerprint,
                     token2wav=item.previous.token2wav,
                 )
                 for item in segment_markers
                 if item.previous is not None
             }
         )
-        initial_marker_buckets: dict[tuple[str, str], list[_WorkItem]] = {}
+        initial_marker_buckets: dict[tuple[str, str, str], list[_WorkItem]] = {}
         for item in segment_markers:
             if item.previous is None:
                 initial_marker_buckets.setdefault(
-                    (item.prompt_cache_id, item.prompt_wav),
+                    (
+                        item.prompt_cache_id,
+                        item.prompt_wav,
+                        item.prompt_fingerprint,
+                    ),
                     [],
                 ).append(item)
         for bucket in initial_marker_buckets.values():
@@ -754,10 +1026,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             for item, state in zip(bucket, states, strict=True):
                 pending[item.state_id] = _RequestState(
+                    lifecycle_generation=item.lifecycle_generation,
                     cache_epoch=item.cache_epoch,
                     chunk_seq=item.chunk_seq,
                     prompt_cache_id=item.prompt_cache_id,
                     prompt_wav=item.prompt_wav,
+                    prompt_fingerprint=item.prompt_fingerprint,
                     token2wav=state,
                 )
         for bucket in buckets.values():
@@ -802,20 +1076,33 @@ class MiniCPMO45Code2Wav(nn.Module):
                     None
                     if item.last_chunk
                     else _RequestState(
+                        lifecycle_generation=item.lifecycle_generation,
                         cache_epoch=item.cache_epoch,
                         chunk_seq=item.chunk_seq,
                         prompt_cache_id=item.prompt_cache_id,
                         prompt_wav=item.prompt_wav,
+                        prompt_fingerprint=item.prompt_fingerprint,
                         token2wav=next_state,
                     )
                 )
 
-        self._commit_runtime_prompt_owners(items)
         for request_id, state in pending.items():
             if state is None:
                 self._states.pop(request_id, None)
             else:
                 self._states[request_id] = state
+        self._commit_runtime_prompt_owners(
+            [
+                item
+                for item in items
+                if not item.discarded
+                and (
+                    item.lifecycle_event != "prepare"
+                    or item.state_id in self._states
+                )
+            ]
+        )
+        self._prune_unowned_runtime_prompts()
         sample_rate_tensor = torch.as_tensor(sample_rate, dtype=torch.int32)
         return OmniOutput(
             text_hidden_states=None,
@@ -837,6 +1124,7 @@ class MiniCPMO45Code2Wav(nn.Module):
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:
             state_id = str(request_id)
+            self._mark_terminal(state_id)
             self._states.pop(state_id, None)
             self._release_request_prompt(state_id)
 

@@ -2579,6 +2579,120 @@ def test_prewarm_placeholder_step_emits_silence_without_touching_state(info):
     assert token2wav.hift.calls == []
 
 
+def test_npu_prepare_event_builds_state_and_first_chunk_reuses_it(mocker):
+    model, _ = _model()
+    model._prompt_prewarm_enabled = True
+    setup = mocker.spy(model.backend, "setup_batch")
+    prepare = {
+        "meta": {
+            "request_id": "a",
+            "lifecycle_event": "prepare",
+            "lifecycle_generation": 0,
+        }
+    }
+
+    output = _forward(model, [prepare], request_ids=["a"])
+
+    assert output.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert model._states["a"].chunk_seq is None
+    assert setup.call_count == 1
+
+    first = _forward(model, [_info("a", 0, [1, 2])], request_ids=["a"])
+
+    assert first.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert model._states["a"].chunk_seq == 0
+    assert setup.call_count == 1
+
+
+def test_prepare_event_carries_exact_reference_and_avoids_default_prompt_setup(mocker):
+    model, _ = _model()
+    model._prompt_prewarm_enabled = True
+    setup = mocker.spy(model.backend, "setup_batch")
+    materialize = mocker.spy(model, "_materialize_runtime_prompt")
+    reference = torch.linspace(-0.1, 0.1, 160)
+    prepare = {
+        "codes": {"ref": reference},
+        "meta": {
+            "request_id": "voice-a",
+            "lifecycle_event": "prepare",
+            "lifecycle_generation": 0,
+            "ref_audio_sr": 16000,
+        },
+    }
+
+    _forward(model, [prepare], request_ids=["voice-a"])
+
+    state = model._states["voice-a"]
+    assert state.chunk_seq is None
+    assert state.prompt_cache_id.startswith("runtime-ref-")
+    prompt_key = model._request_prompt_keys["voice-a"]
+    assert model._runtime_prompts[prompt_key].fingerprint == prompt_key
+    assert setup.call_count == 1
+
+    first = _info("voice-a", 0, [1, 2])
+    first["codes"]["ref"] = reference
+    first["meta"].pop("prompt_cache_id")
+    first["meta"]["ref_audio_sr"] = 16000
+    _forward(model, [first], request_ids=["voice-a"])
+
+    assert model._states["voice-a"].chunk_seq == 0
+    assert model._request_prompt_keys["voice-a"] == prompt_key
+    assert setup.call_count == 1
+    assert materialize.call_count == 1
+
+
+def test_prompt_cache_id_includes_prompt_content_fingerprint(tmp_path):
+    model, _ = _model()
+    prompt_path = tmp_path / "voice.wav"
+    prompt_path.write_bytes(b"first-prompt")
+    first = _info("a", 0, [1, 2])
+    first["meta"]["prompt_wav"] = str(prompt_path)
+    _forward(model, [first], request_ids=["a"])
+    first_cache_id = model._states["a"].prompt_cache_id
+
+    prompt_path.write_bytes(b"second-prompt-with-different-content")
+    second = _info("b", 0, [3, 4])
+    second["meta"]["prompt_wav"] = str(prompt_path)
+    _forward(model, [second], request_ids=["b"])
+
+    assert model._states["b"].prompt_cache_id != first_cache_id
+
+
+def test_finished_request_tombstone_drops_late_first_chunk_without_recreating_state():
+    model, token2wav = _model()
+    _forward(model, [_info("external-a", 0, [1, 2])], request_ids=["internal-a"])
+    model.on_requests_finished(["internal-a"])
+    hift_calls = list(token2wav.hift.calls)
+
+    output = _forward(
+        model,
+        [_info("external-a", 0, [3, 4])],
+        request_ids=["internal-a"],
+    )
+
+    assert output.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert "internal-a" not in model._states
+    assert token2wav.hift.calls == hift_calls
+
+
+def test_finished_request_tombstones_are_bounded_oldest_first():
+    model, _ = _model()
+    model._terminal_state_limit = 2
+
+    model.on_requests_finished(["a", "b", "c"])
+
+    assert list(model._terminal_state_ids) == ["b", "c"]
+
+
+def test_lifecycle_generation_must_match_cache_epoch():
+    model, _ = _model()
+    info = _info("a", 0, [1, 2], cache_epoch=1)
+    info["meta"]["lifecycle_generation"] = 0
+
+    with pytest.raises(RuntimeError, match="lifecycle_generation_mismatch"):
+        _forward(model, [info])
+
+
 def test_metadata_only_payload_still_decodes_codec_from_prompt_tokens():
     # The connector strips 1-D codec tensors out of additional_information and
     # leaves them in the prompt tokens, so a real chunk reaches the model as

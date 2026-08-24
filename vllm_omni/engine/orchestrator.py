@@ -12,9 +12,11 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
 import janus
@@ -73,6 +75,15 @@ if TYPE_CHECKING:
         DuplexSessionRuntimeState,
     )
     from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+
+
+@cache
+def _resolve_async_chunk_prewarm_hook(path: str) -> Callable[..., dict[str, Any]]:
+    module_path, function_name = path.rsplit(".", 1)
+    function = getattr(importlib.import_module(module_path), function_name)
+    if not callable(function):
+        raise TypeError(f"async_chunk_prewarm_input_func is not callable: {path}")
+    return function
 
 
 def _build_terminal_empty_output(
@@ -2119,8 +2130,6 @@ class Orchestrator:
                     },
                 )
             else:
-                import copy
-
                 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 
                 try:
@@ -2130,19 +2139,70 @@ class Orchestrator:
 
                 original_prompt = req_state.prompt
                 if isinstance(original_prompt, dict):
-                    base_input = copy.deepcopy(original_prompt)
+                    # Copy only containers the prepare hook may mutate. A deep
+                    # copy of the complete multimodal prompt duplicates the
+                    # reference waveform just before ``multi_modal_data`` is
+                    # removed, adding pure host bandwidth and allocator work
+                    # to every first-packet path.
+                    base_input = dict(original_prompt)
+                    original_info = original_prompt.get("additional_information")
+                    if isinstance(original_info, dict):
+                        copied_info = dict(original_info)
+                        for nested_key in ("codes", "meta"):
+                            nested = original_info.get(nested_key)
+                            if isinstance(nested, dict):
+                                copied_info[nested_key] = dict(nested)
+                        base_input["additional_information"] = copied_info
                 else:
                     base_input = {}
 
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
+                model_config = next_pool.stage_vllm_config.model_config
+                prewarm_hook_path = getattr(
+                    model_config,
+                    "async_chunk_prewarm_input_func",
+                    None,
+                )
+                if prewarm_hook_path:
+                    try:
+                        prewarm_hook = _resolve_async_chunk_prewarm_hook(str(prewarm_hook_path))
+                        enriched = prewarm_hook(
+                            base_input,
+                            original_prompt,
+                            stage0_request,
+                        )
+                        if not isinstance(enriched, dict):
+                            raise TypeError("async chunk prewarm hook must return a prompt dict")
+                        base_input = enriched
+                    except Exception:
+                        # Prewarming is optional. Do not fail the user request
+                        # when model-specific conditioning cannot be prepared.
+                        logger.exception(
+                            "[Orchestrator] async_chunk prepare hook failed for req=%s stage=%d; skipping pre-submit",
+                            request_id,
+                            next_stage_id,
+                        )
+                        req_state.stage_submit_ts.pop(next_stage_id, None)
+                        continue
+
+                prepare_info = base_input.get("additional_information")
+                if not isinstance(prepare_info, dict):
+                    prepare_info = {}
+                prepare_meta = prepare_info.get("meta")
+                if not isinstance(prepare_meta, dict):
+                    prepare_meta = {}
+                prepare_meta["lifecycle_event"] = "prepare"
+                prepare_meta.setdefault("lifecycle_generation", 0)
+                prepare_info["meta"] = prepare_meta
+                base_input["additional_information"] = prepare_info
                 downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
                     params=params,
-                    model_config=next_pool.stage_vllm_config.model_config,
+                    model_config=model_config,
                     resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id

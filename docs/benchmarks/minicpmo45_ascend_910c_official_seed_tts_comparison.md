@@ -5417,3 +5417,70 @@ the evaluator weights are available.
 790eb64835f4e42d99963e14b2769d1578184d734bf9e3c45b1fe4f758199d92  inverse-cdf-run1.json
 c94bc10eaa9d99645fe43c46182e4b11985464d6edc68165b6ae7f3e76f49b7d  inverse-cdf-run2.json
 ```
+
+## First-packet scheduling and prompt-cache solver reduction
+
+The inverse-CDF profile still waited for 25 Talker codec codes before starting
+Code2Wav. Separating the initial bridge threshold from the steady 25-code
+chunk and setting it to ten reuses the already compiled width-20 DiT graph.
+It does not alter the sampled codec sequence or steady chunk policy. On the
+official ten-request English wrapper it reduced mean/P99 TTFP from
+609.48/623.52 ms to 467.16/479.53 ms after the additional solver changes
+below, with 100% streaming continuity.
+
+Stage timing exposed a larger hidden first-path cost. Seed-TTS uses a different
+reference waveform for each request. Stage 2 runs the widest (~302-frame) CFM6
+path before the first live packet only to populate the prompt estimator K/V
+caches; its synthesized prompt mel is discarded. The new experimental policy
+uses two cosine-schedule evaluations for this cache prefill, expands the two
+cache states back into the fixed six-slot ABI, uses four evaluations for only
+the first 120 ms live packet, and returns every subsequent chunk to CFM6.
+Speaker embedding, prompt mel extraction, codec sampling, and all steady audio
+remain unchanged.
+
+| Candidate | Mean RTF | Mean TTFP | P99 TTFP | TTFT | Continuity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 10-code first packet, CFM6 (10 requests) | 0.323 | 609.48 ms | 623.52 ms | 81.23 ms P99 | 100% |
+| 10-code first packet, prompt CFM2 / first CFM4 (1 request) | 0.308 | 458.22 ms | 458.22 ms | 80.49 ms | 100% |
+| 10-code first packet, prompt CFM2 / first CFM4 (10 requests) | 0.317 | 467.16 ms | 479.53 ms | 77.59 ms mean | 100% |
+| 10-code first packet, prompt CFM1 / first CFM1 (1 request) | 0.319 | 364.00 ms | 364.00 ms | 77.60 ms | 100% |
+| 10-code first packet, prompt CFM1 / first CFM1 (10 requests) | 0.318 | 356.87 ms | 365.81 ms | 78.46 ms mean | 100% |
+
+Lower is better. The ten-request prompt-CFM2 candidate generated 54.00 seconds
+and 1,296,000 frames. Compared with the structurally matched first-packet CFM6
+run, mean TTFP improved 23.35% while mean whole-audio RTF remained within run
+variance. Compared with the earlier inverse-CDF two-run mean near 750 ms, TTFP
+improved about 37.7%.
+
+The minimum-solver ceiling experiment reduced both the discarded prompt-cache
+prefill and only the first 120 ms live packet to one evaluation. Its official
+ten-request run generated the same 54.00 seconds / 1,296,000 frames with 100%
+continuity. Mean TTFP improved 41.45% versus the 609.48 ms first-packet CFM6
+control and about 52.4% versus the earlier ~750 ms inverse-CDF runs. Mean RTF
+remained 0.318. This is the current fastest measured TTFP profile, but it has a
+strictly larger quality risk than prompt CFM2 / first CFM4 and must not become
+the submission default without the complete accuracy gate.
+
+An even smaller five-code first packet is the HiFT continuity lower bound:
+five new codes plus three left-context codes become ten mel frames after the
+encoder; HiFT retains eight mel frames / 3,840 samples and can publish one real
+40 ms packet. Eager width-10 execution was stable and measured 566.04 ms TTFP,
+but it was not faster than graph-backed width 20 because launch overhead
+dominated. Adding width 10 to the captured graph buckets is rejected on this A2
+stack: startup compilation succeeds, but first replay aborts the Stage-2
+process with CANN `tiling offset out of range`. The submission must not enable
+that graph bucket.
+
+Prompt CFM2 and first-packet CFM4 approximate cache states and therefore remain
+accuracy-gated experiments. They require paired official WER/SIM, Daily-Omni,
+and Video-MME validation before replacing the submission profile.
+
+```text
+/tmp/lunanexa-bench/talker-low-ttfp-i10-official10/
+/tmp/lunanexa-bench/talker-low-ttfp-prompt2-cfm4-smoke/
+/tmp/lunanexa-bench/talker-low-ttfp-prompt2-cfm4-official10/
+/tmp/lunanexa-bench/talker-low-ttfp-prompt1-cfm1-smoke/
+/tmp/lunanexa-bench/talker-low-ttfp-prompt1-cfm1-official10/
+/tmp/lunanexa-bench/talker-low-ttfp-i5-eager-cfm4-smoke/
+/tmp/minicpmo-low-ttfp-prompt2-cfm4.log
+```

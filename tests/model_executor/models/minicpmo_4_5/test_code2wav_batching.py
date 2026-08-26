@@ -18,6 +18,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_attention_preamble_from_modulation,
     _dit_attention_preamble_fused_qkv_from_modulation,
     _dit_attention_preamble_qkv_pack,
+    _dit_cache_major_conv_dynamic_w8a8_mlp_residual,
     _dit_cache_major_conv_mlp_residual,
     _dit_cache_major_post_attention_conv_mlp_residual,
     _dit_conv_mlp_residual,
@@ -27,6 +28,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_final_from_modulation_addcmul,
     _dit_flat_capture_conv_mlp_partition,
     _dit_fused_conv_block_mlp_residual,
+    _dit_fused_conv_dynamic_w8a8_mlp_residual,
     _dit_fused_conv_linear_mlp_residual,
     _dit_fused_conv_mlp_residual,
     _dit_fused_full_block,
@@ -198,6 +200,27 @@ def test_flat_capture_preserves_cache_major_conv_partition():
             post_attention=False,
         )
         is None
+    )
+
+
+def test_flat_capture_embeds_dynamic_w8a8_without_changing_cache_abi():
+    assert (
+        _dit_flat_capture_conv_mlp_partition(
+            fused_conv_pack=True,
+            cache_major=False,
+            post_attention=False,
+            dynamic_w8a8=True,
+        )
+        is _dit_fused_conv_dynamic_w8a8_mlp_residual
+    )
+    assert (
+        _dit_flat_capture_conv_mlp_partition(
+            fused_conv_pack=True,
+            cache_major=True,
+            post_attention=False,
+            dynamic_w8a8=True,
+        )
+        is _dit_cache_major_conv_dynamic_w8a8_mlp_residual
     )
 
 

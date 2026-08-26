@@ -5180,3 +5180,240 @@ seconds of continuous audio, and the following two hot requests completed 2/2
 with 77.38 ms mean TTFT, 8.28 seconds of generated audio, and 100% streaming
 continuity. Runtime logs confirmed `slots=2` and `NPU CFM graph replay active`;
 the model API remained healthy with HTTP 200.
+
+## Partial-CFG batch-one screen
+
+A deeper work-reduction candidate evaluated classifier-free guidance only in
+the first two of the six CFM solver steps. The first two steps retained the
+existing conditional/unconditional batch of two; the remaining four executed
+the conditional branch as batch one. Fixed cache addresses and the public
+cache ABI were preserved by slicing only the compute view and mirroring the
+conditional result into the unused half. A matching Ascend causal-pack kernel
+variant accepted batch one, and partial guidance was restricted to the static
+width-50/cache-402 steady path so prompt, cache-fill, tail, and first-packet
+arithmetic remained unchanged.
+
+The candidate completed every request with 100% streaming continuity. It did
+not improve device throughput. Comparisons below use runs with exactly the same
+1,160,640 output frames and 48.36 seconds of generated audio, excluding the
+separate Talker tail-length variation:
+
+| Metric | Full-CFG repeat | Partial-CFG repeat mean | Change |
+| --- | ---: | ---: | ---: |
+| Whole-audio RTF | 0.361909 | 0.376188 | +3.95% |
+| Steady-chunk RTF | 0.390668 | 0.406805 | +4.13% |
+| Mean request duration | 17.2881 s | 18.0161 s | +4.21% |
+| Audio TTFP | 0.763214 s | 0.767365 s | +0.54% |
+
+Lower is better. The one-shot structurally matched comparison agreed with the
+repeats: steady-only partial CFG measured 0.346920 whole-audio RTF versus
+0.339104 for full CFG, a 2.30% regression. The batch-one path halves the
+logical MLP/attention rows for four solver steps, but these small matrices no
+longer fill the A2 Cube efficiently; launch and layout costs become a larger
+fraction of the step. Therefore the partial-CFG selector and batch-one kernel
+are rejected rather than promoted, and no quality gate is claimed for them.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/full-cfg-reverse-control/full-cfg-reverse-control.json
+/tmp/lunanexa-bench/full-cfg-reverse-control-repeat/full-cfg-reverse-control-repeat.json
+/tmp/lunanexa-bench/partial-cfg2-steady/partial-cfg2-steady.json
+/tmp/lunanexa-bench/partial-cfg2-steady-repeat/partial-cfg2-steady-repeat.json
+/tmp/lunanexa-bench/partial-cfg2-steady-repeat2/partial-cfg2-steady-repeat2.json
+```
+
+## A2 selective dynamic-W8A8 DiT MLP screen
+
+The selective dynamic-W8A8 experiment keeps attention probabilities,
+normalization, CFG/Euler integration, and HiFT on their higher-precision paths,
+while quantizing the two MLP matrix multiplications in each DiT block. An A2
+runtime ABI issue was fixed before measurement: `npu_quant_matmul` requires a
+one-dimensional per-token scale, so a BSH activation is flattened to
+`[batch * time, hidden]` before dynamic quantization and reshaped after the
+Cube matmul. Four focused tests passed, including the exact scale and output
+shape contract.
+
+The current CANN 8.5.0 image could not capture the raw outer steady-CFM graph
+with the W8A8-compatible configuration; the first request failed during graph
+capture. A follow-up disabled W8A8 while preserving cache-major state and the
+outer graph; its first real TTS request still terminated the StageEngine
+processes during capture, without a Python exception. This isolates the unsafe
+boundary to cache-major/flat-capture rather than INT8 arithmetic itself. The
+crash-only diagnostic profiles were removed. A matched
+no-outer-graph comparison completed 10/10 requests on each path with the same
+1,746 input tokens, 1,048,320 output frames, 43.68 seconds of generated audio,
+and 100% streaming continuity:
+
+| Metric | Matched BF16 control | Dynamic-W8A8 MLP | Change |
+| --- | ---: | ---: | ---: |
+| Whole-audio RTF | 0.413941 | 0.409697 | -1.03% |
+| Mean raw chunk RTF | 0.440199 | 0.432284 | -1.80% |
+| Total run duration | 17.2473 s | 17.1671 s | -0.47% |
+| Text TTFT | 77.24 ms | 75.95 ms | -1.67% |
+| Audio TTFP | 759.03 ms | 810.59 ms | +6.79% |
+
+Lower is better. Dynamic W8A8 slightly reduces steady arithmetic time, but it
+regresses first-packet latency and both no-outer paths are materially slower
+than the retained outer-CFM-graph profile. It is therefore not a submission
+default and does not proceed to the three-suite accuracy gate. The generic A2
+scale-ABI fix remains useful for explicit future W8A8 candidates; the
+performance profile remains experimental.
+
+The follow-up kept the retained channel-major Conv-cache ABI and embedded
+`npu_dynamic_quant` plus `npu_quant_matmul` directly inside the raw steady-CFM
+capture. It introduced neither a nested GE executable nor the cache-major
+layout. Runtime logs confirmed both `NPU CFM graph captured`/replay and the
+selective W8A8 path. A matched official-wrapper comparison used exactly the
+same 1,746 input tokens, 1,048,320 audio frames, 43.68 seconds of generated
+audio, two warmups, and ten measured requests:
+
+| Metric | BF16 outer graph | Channel-major W8A8 outer graph | Change |
+| --- | ---: | ---: | ---: |
+| Whole-audio RTF | 0.401680 | 0.395701 | -1.49% |
+| Mean raw chunk RTF | 0.431435 | 0.420423 | -2.55% |
+| Total run duration | 16.6901 s | 16.5360 s | -0.92% |
+| Text TTFT | 76.11 ms | 78.09 ms | +2.60% |
+| Audio TTFP | 764.74 ms | 826.12 ms | +8.03% |
+
+Lower is better. This proves that the INT8 operators can execute inside the
+outer graph, but the dynamic per-token reduction/scale overhead consumes most
+of the Cube saving and materially regresses first packet latency. The path
+remains opt-in and does not replace the BF16 submission profile.
+
+### A2 weight-only and fused-GELU lower-layer screens
+
+`npu_weight_quant_batchmatmul` was tested as a W8A16 alternative so activations
+would not need dynamic quantization. The installed A2 documentation confirms
+BF16 activations, per-channel INT8 weights, and graph-mode support. At the
+actual DiT MLP shape (`100x512 -> 2048 -> 512`), however, the complete
+weight-only chain took 117.12 us versus 69.07 us for BF16, a 69.6% latency
+regression. A2's weight dequantization setup cost dominates at this small M,
+so W8A16 was rejected before service integration.
+
+The newer A2 `npu_quant_matmul_gelu` operator was then screened. Its documented
+BF16-scale output branch was numerically invalid on this CANN 8.5 image: output
+magnitude reached 6,304 for a reference bounded near 2. Using FP32 weight scale
+selects the valid FP16-output branch, which matched the split FC1+GELU with
+0.0078125 maximum and 0.000369 mean absolute error. FC2's dynamic quantizer can
+consume that FP16 producer directly. For the complete two-layer MLP, the fused
+path reduced split dynamic-W8A8 latency from 173.72 us to 121.60 us (1.43x),
+while its drift from BF16 was comparable to the unfused quantized path. It
+remained slower than eager BF16 in isolation, so it is a graph-level candidate,
+not an assumed win. Raw NPUGraph capture succeeded even though the installed
+TorchAir lacks an AscendIR converter for the fused op. The structurally matched
+service run measured 0.404142 RTF, 0.425329 mean raw-chunk RTF, and 861.95 ms
+TTFP. That is 2.13%, 1.17%, and 4.34% worse respectively than split W8A8, and
+also worse than the BF16 control in whole-audio RTF and TTFP. The fusion was
+therefore removed from the runtime rather than retained as dead experimental
+surface.
+
+The next lower-layer screen uses A2's dense non-quantized `npu_ffn`, which
+fuses both BF16 projections and GELU without dynamic scales. At the same actual
+`100x512 -> 2048 -> 512` shape it took 42.65 us versus 75.52 us for the split
+BF16 chain, a 1.77x microbenchmark speedup. Its maximum/mean absolute drift was
+0.0078125/0.000591. This is now the active graph-level candidate: transposed
+Cube-ready weights and FP32 biases are allocated once, while normalization,
+AdaLN and the residual remain BF16 outside the fused operator.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/bf16-no-outer-graph-control/bf16-no-outer-graph-control.json
+/tmp/lunanexa-bench/w8a8-mlp-no-outer-graph/w8a8-mlp-no-outer-graph.json
+/tmp/lunanexa-bench/bf16-outer-graph-matched-control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260826-120243.json
+/tmp/lunanexa-bench/w8a8-channel-major-outer-graph/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260826-115106.json
+/tmp/lunanexa-bench/w8a8-fused-gelu-outer-graph-v2/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260826-123758.json
+/tmp/minicpmo-bf16-no-outer-graph-control.log
+/tmp/minicpmo-w8a8-mlp-no-outer-graph.log
+/tmp/minicpmo-bf16-outer-graph-matched-control.log
+/tmp/minicpmo-w8a8-channel-major-outer-graph.log
+```
+
+## Talker codec-sampler graph and AICPU boundary
+
+NPU telemetry on a structurally matched 10-request run showed only 1--16%
+AICore utilization and 1--4% HBM-bandwidth utilization. Stage logs attributed
+roughly 0.74--1.55 seconds per request to the autoregressive Talker, compared
+with about 0.30--0.52 seconds added by Code2Wav. The next large target was
+therefore the per-code Talker continuation rather than another DiT micro-op.
+
+Every codec token historically launched a BF16 `768 -> 6562` head, frequency
+penalty, top-k/top-p filter, softmax, AICPU multinomial, gather, and frequency
+window update outside the already captured Llama decode graph. Capturing only
+the deterministic distribution preserved the checkpoint's NPU multinomial
+sequence and measured 2.34x faster in isolation. It was rejected in service:
+the first real decode consistently raised Ascend 507018 from
+`MultinomialWithReplacement`, even after all graph outputs were verified as
+finite ND tensors and copied into fixed non-graph-pool buffers. The failing
+path is not a tensor-format or graph-storage-lifetime bug; it is the AICPU
+multinomial boundary after replay in the vLLM FULL_DECODE environment.
+
+The replacement uses one fixed graph for the complete codec continuation:
+
+- the request-local NPU generator produces one uniform scalar outside capture;
+- the graph executes the codec head, penalty, bounded top-k/top-p filter,
+  inverse-CDF draw, gather, and 16-code rolling-frequency update;
+- EOS masking and the expired window code are fixed-address runtime inputs, so
+  the same executable covers both pre-minimum and EOS-eligible steps;
+- sampled-code and next-frequency buffers are allocated once and reused.
+
+Inverse-CDF is categorically distribution-equivalent for a single draw, but it
+does not preserve multinomial's seed-to-code mapping. It is therefore an
+accuracy-gated experimental path, not a bitwise-equivalent default. On the A2
+microbenchmark with the checkpoint's actual hidden/vocabulary/top-k shapes,
+the full eager continuation measured 1,190.29 us. Graph replay measured
+208.96 us, and replay including request-local NPU uniform generation measured
+303.98 us: 3.92x end-to-end kernel-chain speedup. Five focused CPU tests
+passed for bounded-distribution, inverse-CDF selection, EOS masking, and
+rolling-frequency equivalence.
+
+Artifacts:
+
+```text
+benchmarks/kernels/bench_minicpmo45_codec_sampler_npu.py
+/tmp/minicpmo-talker-sampler-graph-v3.log
+```
+
+The inverse-CDF service then completed two official-wrapper hot runs with two
+warmups, ten measured Chinese Seed-TTS requests, concurrency one, and 100%
+streaming continuity:
+
+| Metric | Prior fused-FFN two-run mean | Inverse-CDF run 1 | Inverse-CDF run 2 | Two-run mean vs control |
+| --- | ---: | ---: | ---: | ---: |
+| Whole-audio RTF | 0.35557 | 0.32294 | 0.30336 | -11.93% |
+| Audio TTFP | 765.28 ms | 751.18 ms | 749.79 ms | -1.93% |
+| Text TTFT | 79.85 ms | 80.13 ms | 79.94 ms | +0.23% |
+| Middle-chunk RTF | 0.17701 | 0.16795 | 0.17280 | -3.75% |
+| Talker inter-output latency | about 9.9--10.0 ms | about 9.0--9.3 ms | about 9.0--9.3 ms | about -8% |
+
+Lower is better. Run 1 generated 56.76 seconds / 1,362,240 frames and run 2
+generated 63.08 seconds / 1,513,920 frames, compared with 43.20 seconds /
+1,036,800 frames for the seed-mapped control. Total serving duration is
+therefore not structurally comparable; RTF and per-output latency are the
+valid normalized comparisons. A separate measured request reached 0.296 RTF,
+734.35 ms TTFP, and 75.27 ms TTFT, matching the published leaderboard scale,
+but it is not reported as the multi-request mean.
+
+An eight-row English accuracy screen generated 8/8 valid audios with 100%
+streaming continuity and 0.32 performance RTF. Its WER/SIM evaluator could not
+run on this replacement host: Whisper Large v3 and WavLM were not cached, and
+the Hugging Face processor download was reset by the remote endpoint. The
+inverse-CDF profile therefore remains experimental and must not replace the
+submission profile until paired WER/SIM stays within two percentage points and
+Daily-Omni plus Video-MME are rerun. The client was stopped after the first
+repeated download failure to avoid eight long retries; that interrupted run
+did not persist its temporary WAVs, so the eight-row screen must be rerun once
+the evaluator weights are available.
+
+```text
+/tmp/lunanexa-bench/talker-inverse-cdf-v4-official10/
+/tmp/lunanexa-bench/talker-inverse-cdf-v4-official10-repeat/
+/tmp/lunanexa-bench/talker-inverse-cdf-v4-quality-en8/
+/tmp/minicpmo-talker-sampler-graph-v4.log
+```
+
+```text
+790eb64835f4e42d99963e14b2769d1578184d734bf9e3c45b1fe4f758199d92  inverse-cdf-run1.json
+c94bc10eaa9d99645fe43c46182e4b11985464d6edc68165b6ae7f3e76f49b7d  inverse-cdf-run2.json
+```

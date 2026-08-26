@@ -16,7 +16,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _apply_repetition_penalty,
     _apply_repetition_penalty_from_frequencies,
     _apply_top_k_top_p,
+    _bounded_codec_distribution,
     _bounded_top_k_top_p_candidates,
+    _graphable_codec_sample,
     _max_audio_tokens,
     _restore_weight_norm_weight,
 )
@@ -144,6 +146,96 @@ def test_bounded_codec_candidates_match_full_warper_distribution() -> None:
     )
 
     assert torch.allclose(actual, expected, atol=1e-7, rtol=1e-6)
+
+
+@pytest.mark.parametrize("mask_eos", [False, True])
+def test_graphable_codec_distribution_matches_eager_filter(mask_eos: bool) -> None:
+    generator = torch.Generator().manual_seed(19)
+    hidden = torch.randn(1, 16, generator=generator, dtype=torch.bfloat16)
+    weight = torch.randn(128, 16, generator=generator, dtype=torch.bfloat16)
+    frequencies = torch.randint(0, 4, (1, 128), generator=generator).float()
+    penalty = torch.tensor([1.05])
+
+    logits = torch.nn.functional.linear(hidden, weight).float() / 0.8
+    expected_logits = _apply_repetition_penalty_from_frequencies(
+        logits,
+        frequencies,
+        penalty=1.05,
+    )
+    if mask_eos:
+        expected_logits[..., 127] = float("-inf")
+    expected_candidates, expected_ids = _bounded_top_k_top_p_candidates(
+        expected_logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+    expected_probabilities = torch.softmax(expected_candidates, dim=-1)
+
+    probabilities, candidate_ids = _bounded_codec_distribution(
+        hidden,
+        frequencies,
+        weight,
+        penalty,
+        temperature=0.8,
+        top_k=25,
+        top_p=0.85,
+        eos_id=127,
+        mask_eos=mask_eos,
+    )
+
+    assert torch.equal(candidate_ids, expected_ids)
+    assert torch.equal(probabilities, expected_probabilities)
+
+
+@pytest.mark.parametrize("mask_eos", [False, True])
+def test_inverse_cdf_codec_sample_matches_bounded_distribution(mask_eos: bool) -> None:
+    generator = torch.Generator().manual_seed(23)
+    hidden = torch.randn(1, 16, generator=generator, dtype=torch.bfloat16)
+    weight = torch.randn(128, 16, generator=generator, dtype=torch.bfloat16)
+    frequencies = torch.randint(0, 4, (1, 128), generator=generator).float()
+    penalty = torch.tensor([1.05])
+    uniform = torch.tensor([[0.417]])
+    expired = torch.tensor([[7]])
+    vocab_ids = torch.arange(128).reshape(1, -1)
+
+    probabilities, candidate_ids = _bounded_codec_distribution(
+        hidden,
+        frequencies,
+        weight,
+        penalty,
+        temperature=0.8,
+        top_k=25,
+        top_p=0.85,
+        eos_id=127,
+        mask_eos=mask_eos,
+    )
+    expected_position = torch.sum(
+        probabilities.cumsum(dim=-1) < uniform,
+        dim=-1,
+        keepdim=True,
+    ).clamp_max_(probabilities.shape[-1] - 1)
+    expected_sample = candidate_ids.gather(-1, expected_position)
+    expected_frequencies = frequencies + (vocab_ids == expected_sample).float()
+    expected_frequencies -= (vocab_ids == expired).float()
+
+    sampled, next_frequencies = _graphable_codec_sample(
+        hidden,
+        frequencies,
+        weight,
+        penalty,
+        uniform,
+        torch.tensor([mask_eos]),
+        expired,
+        vocab_ids,
+        temperature=0.8,
+        top_k=25,
+        top_p=0.85,
+        eos_id=127,
+    )
+
+    assert torch.equal(sampled, expected_sample)
+    assert torch.equal(next_frequencies, expected_frequencies)
 
 
 def test_weight_norm_restore_matches_checkpoint_parametrization_in_bfloat16() -> None:

@@ -1,0 +1,17 @@
+# Matched full-precision control for the non-nested dynamic-W8A8 screen.
+# Keep the complete connector/layout/precision contract from the candidate
+# and override only the selective MLP quantization selector.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_hf32_w8a8_mlp_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH: "0"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "0"
+          VLLM_OMNI_MINICPMO45_NPU_MATMUL_HF32: "1"
+          VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND: "auto"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM: "1"
+          VLLM_OMNI_MINICPMO45_NPU_DIT_DYNAMIC_W8A8: "0"

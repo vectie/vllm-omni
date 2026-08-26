@@ -102,3 +102,27 @@ def test_single_chip_w8a8_candidate_quantizes_only_dit_mlp():
     assert extra["npu_dit_cache_major"] is True
     assert extra["npu_dit_conv_mlp_graph"] is True
     assert extra["npu_cfm_planar_kv_slabs"] is True
+
+
+def test_a2_fused_bf16_ffn_candidate_keeps_retained_outer_graph():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_fused_ffn_experimental.yaml"
+    )
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert extra["npu_dit_fused_bf16_ffn"] is True
+    assert extra["npu_dit_compute_dtype"] == "bf16"
+    assert extra["npu_dit_cache_major"] is False
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+
+
+def test_a2_talker_sampler_graph_is_scoped_to_stage_one():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_graph_experimental.yaml"
+    )
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"

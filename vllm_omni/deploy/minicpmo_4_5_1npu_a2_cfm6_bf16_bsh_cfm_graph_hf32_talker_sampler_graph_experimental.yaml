@@ -1,0 +1,18 @@
+# Atlas 800I A2 distribution-equivalent Talker codec-sampler NPUGraph candidate.
+#
+# Stage 1 already captures the Llama decode backbone, but its 6,562-class
+# codec head, repetition penalty and top-k/top-p filter historically ran as a
+# Python-driven eager kernel chain for every audio code. Capture the fixed head,
+# filtering, inverse-CDF draw and repetition-window update together. A single
+# request-local NPU uniform remains outside capture. This preserves categorical
+# probabilities, but intentionally does not preserve multinomial's seed-to-code
+# mapping; retain only after the official Seed-TTS quality gate passes.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_matmul_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH: "1"

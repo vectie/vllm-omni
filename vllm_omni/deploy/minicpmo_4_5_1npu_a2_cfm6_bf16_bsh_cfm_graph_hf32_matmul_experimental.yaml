@@ -1,0 +1,16 @@
+# Atlas 800I A2 / Ascend 910B Stage-2 HF32 MatMul candidate.
+#
+# Retain FP32 tensor storage for graph attention and HiFT while allowing A2's
+# Cube to execute FP32 MatMul internally as HF32.  Convolution already uses
+# the torch-npu HF32 default; this overlay changes MatMul only in Stage 2.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "1"
+          VLLM_OMNI_MINICPMO45_NPU_MATMUL_HF32: "1"

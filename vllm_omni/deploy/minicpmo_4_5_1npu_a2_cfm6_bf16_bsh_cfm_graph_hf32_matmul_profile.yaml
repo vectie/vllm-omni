@@ -1,0 +1,14 @@
+# Historical development-only Stage-2 profiler overlay. Do not use it with
+# the fixed CFM NPUGraph on CANN 9.0: profiler initialization creates an
+# auxiliary stream before the first capture, so capture_end fails with 107025.
+# Use an external msprof/Ascend Insight attach after both slots capture, or
+# disable the CFM graph when profiling a deliberately non-equivalent path.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_matmul_experimental.yaml
+
+stages:
+  - stage_id: 2
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /tmp/vllm-omni-profiles/minicpmo45/a2-hf32-matmul-stage2
+      torch_profiler_record_shapes: true

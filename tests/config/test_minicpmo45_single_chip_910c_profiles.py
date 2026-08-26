@@ -75,6 +75,22 @@ def test_single_chip_cfm_graph_has_one_static_graph_entry():
     assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE"] == "1"
 
 
+def test_a2_cache_fill_candidate_keeps_first_packet_and_steady_shapes():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_cache_fill_experimental.yaml"
+    )
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+    assert stage2.env[
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH"
+    ] == "1"
+    assert stage2.env[
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH_LENGTHS"
+    ] == "302"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE"] == "2"
+
+
 def test_single_chip_w8a8_candidate_quantizes_only_dit_mlp():
     deploy = _load_profile(
         "minicpmo_4_5_1npu_910c_cfm6_canonical_w8a8_mlp_experimental.yaml"

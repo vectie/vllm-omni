@@ -431,6 +431,34 @@ def test_get_merged_hidden_states(num_tokens_padded, mocker):
     assert torch.all(req2_merged_states == req2_new_states)
 
 
+def test_get_merged_hidden_states_includes_running_request_partial_prefix_block():
+    cache = get_omni_pcache()
+    computed = 6
+    cached_states = torch.arange(computed * HIDDEN_SIZE, dtype=DTYPE).reshape(computed, HIDDEN_SIZE)
+    cache.update_omni_tensor_prefix_cache(
+        hidden_states=cached_states,
+        multimodal_outputs=None,
+        num_tokens_unpadded=computed,
+        slot_mapping=torch.arange(8, 8 + computed),
+    )
+    new_states = torch.tensor([[101.0, 102.0], [201.0, 202.0]])
+    input_batch = MockInputBatch(
+        num_computed_tokens_cpu=torch.tensor([computed, 0]),
+        block_table=torch.tensor([[2, 3], [0, 0]], dtype=torch.long),
+    )
+
+    merged = cache.get_merged_hidden_states(
+        query_start_loc=[0, 1],
+        input_batch=input_batch,
+        hidden_states=new_states,
+        num_scheduled_tokens={"req1": 1, "req2": 1},
+        include_computed_prefix=True,
+    )
+
+    assert torch.equal(merged["req1"], torch.cat([cached_states, new_states[:1]], dim=0))
+    assert torch.equal(merged["req2"], new_states[1:])
+
+
 def test_get_merged_hidden_states_uses_precomputed_hidden_states_cpu(mocker):
     cache = get_omni_pcache()
 

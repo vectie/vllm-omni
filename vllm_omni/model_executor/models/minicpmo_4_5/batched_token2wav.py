@@ -57,6 +57,12 @@ _NPU_CFM_STACKED_CACHE_OUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_STACKED_CACHE_OUT
 _NPU_CFM_FIXED_KV_SLABS_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_FIXED_KV_SLABS"
 _NPU_CFM_PLANAR_KV_SLABS_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_PLANAR_KV_SLABS"
 _NPU_CFM_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"
+_NPU_CFM_CACHE_FILL_GRAPH_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH"
+)
+_NPU_CFM_CACHE_FILL_GRAPH_LENGTHS_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH_LENGTHS"
+)
 _NPU_CFM_GRAPH_ATTN_MAX_ABS_DRIFT = 3.125e-2
 _NPU_CFM_GRAPH_ATTN_MEAN_ABS_DRIFT = 3.0e-3
 _NPU_DIT_BSH_ATTENTION_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_BSH_ATTENTION"
@@ -70,6 +76,7 @@ _NPU_DIT_FUSED_CONV_LINEAR_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_CONV_LINEAR
 _NPU_DIT_COMPUTE_DTYPE_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_COMPUTE_DTYPE"
 _NPU_CFM_INTEGRATION_DTYPE_ENV = "VLLM_OMNI_MINICPMO45_NPU_CFM_INTEGRATION_DTYPE"
 _NPU_DIT_DYNAMIC_W8A8_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_DYNAMIC_W8A8"
+_NPU_MATMUL_HF32_ENV = "VLLM_OMNI_MINICPMO45_NPU_MATMUL_HF32"
 logger = logging.getLogger(__name__)
 
 
@@ -154,6 +161,22 @@ def _npu_dit_dynamic_w8a8_enabled(config_value: Any = None) -> bool:
     raise ValueError(f"Invalid {_NPU_DIT_DYNAMIC_W8A8_ENV}={raw!r}")
 
 
+def _npu_matmul_hf32_enabled(config_value: Any = None) -> bool:
+    """Resolve the opt-in Stage-2 FP32 MatMul-to-HF32 Cube policy."""
+    env_value = os.environ.get(_NPU_MATMUL_HF32_ENV)
+    raw = env_value if env_value not in (None, "") else config_value
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid {_NPU_MATMUL_HF32_ENV}={raw!r}")
+
+
 def _npu_cfm_fixed_kv_slabs_enabled(config_value: Any = None) -> bool:
     """Resolve the opt-in, request-owned fixed estimator KV workspace."""
     env_value = os.environ.get(_NPU_CFM_FIXED_KV_SLABS_ENV)
@@ -178,6 +201,60 @@ def _npu_cfm_graph_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def _npu_cfm_cache_fill_graph_enabled() -> bool:
+    """Whether fixed width-50 cache-fill CFM shapes get outer NPUGraphs."""
+    return os.environ.get(
+        _NPU_CFM_CACHE_FILL_GRAPH_ENV, "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _npu_cfm_cache_fill_graph_lengths() -> tuple[int, ...]:
+    """Resolve the exact old-cache lengths admitted to cache-fill capture."""
+    if not _npu_cfm_cache_fill_graph_enabled():
+        return ()
+    raw = os.environ.get(_NPU_CFM_CACHE_FILL_GRAPH_LENGTHS_ENV, "302")
+    try:
+        lengths = tuple(
+            dict.fromkeys(
+                int(item.strip())
+                for item in raw.split(",")
+                if item.strip()
+            )
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {_NPU_CFM_CACHE_FILL_GRAPH_LENGTHS_ENV}={raw!r}"
+        ) from exc
+    if not lengths or any(length <= 0 for length in lengths):
+        raise ValueError(
+            f"Invalid {_NPU_CFM_CACHE_FILL_GRAPH_LENGTHS_ENV}={raw!r}"
+        )
+    return lengths
+
+
+def _npu_cfm_graph_phase(
+    *,
+    fixed_kv_slabs: bool,
+    cache_fill_lengths: tuple[int, ...],
+    steady_graph: bool,
+    width: int,
+    cache_length: int | None,
+    has_cache_outputs: bool,
+) -> str | None:
+    """Classify only shapes whose addresses and cache semantics are stable."""
+    if not fixed_kv_slabs:
+        return "dynamic"
+    if steady_graph:
+        return "steady"
+    if (
+        cache_length in cache_fill_lengths
+        and width == 50
+        and has_cache_outputs
+    ):
+        return "cache-fill"
+    return None
 
 
 def _npu_cfm_planar_kv_slabs_enabled(config_value: Any = None) -> bool:
@@ -1325,6 +1402,29 @@ def _dit_cache_major_post_attention_conv_mlp_residual(
     )
 
 
+def _dit_flat_capture_conv_mlp_partition(
+    *,
+    fused_conv_pack: bool,
+    cache_major: bool,
+    post_attention: bool,
+):
+    """Select the Conv/MLP partition embedded in the steady CFM graph.
+
+    The outer NPUGraph must preserve the same cache layout as the separately
+    compiled steady-width Conv/MLP graph. Falling back to the legacy
+    channel-major partition here materializes two cache transposes in every
+    DiT block and CFM step, even though the fixed slabs are already stored as
+    ``[batch, taps, channels]``.
+    """
+    if not fused_conv_pack:
+        return None
+    if cache_major and post_attention:
+        return _dit_cache_major_post_attention_conv_mlp_residual
+    if cache_major:
+        return _dit_cache_major_conv_mlp_residual
+    return _dit_fused_conv_mlp_residual
+
+
 def _dit_fused_conv_linear_mlp_residual(
     hidden: torch.Tensor,
     conv_input: torch.Tensor,
@@ -1528,6 +1628,223 @@ def _dit_fused_full_block(
     return hidden, new_cnn_cache, new_att_cache
 
 
+def _dit_fused_full_block_bsh_from_modulation(
+    x: torch.Tensor,
+    modulation: torch.Tensor,
+    att_cache: torch.Tensor,
+    cnn_cache: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_norm_bias: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    proj_weight: torch.Tensor,
+    proj_bias: torch.Tensor,
+    conv1_flat_weight: torch.Tensor,
+    conv1_bias: torch.Tensor,
+    conv_norm_weight: torch.Tensor,
+    conv_norm_bias: torch.Tensor,
+    conv2_flat_weight: torch.Tensor,
+    conv2_bias: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc1_bias: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    fc2_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One GE-visible BSH DiT block using the shared AdaLN slab.
+
+    Unlike the older full-block diagnostic, this boundary does not recompute
+    AdaLN and never converts the sequence-major K/V slabs to BHSD. It is small
+    enough to screen one producer-consumer block without constructing a
+    sixteen-block or six-step monolith.
+    """
+    modulation, q, k, v = _dit_attention_preamble_bsh_from_modulation(
+        x,
+        modulation,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        v_weight,
+        v_bias,
+        q_norm_weight,
+        q_norm_bias,
+        k_norm_weight,
+        k_norm_bias,
+    )
+    cache_k = att_cache.select(0, 0)
+    cache_v = att_cache.select(0, 1)
+    full_k = torch.cat((k, cache_k), dim=1)
+    full_v = torch.cat((v, cache_v), dim=1)
+    new_att_cache = torch.stack((full_k, full_v), dim=0)
+
+    batch, query_width, hidden_size = q.shape
+    num_heads = 8
+    head_dim = 64
+    if q.device.type == "npu":
+        import torch_npu
+
+        attention = torch_npu.npu_fusion_attention(
+            query=q,
+            key=full_k,
+            value=full_v,
+            head_num=num_heads,
+            input_layout="BSH",
+            scale=head_dim**-0.5,
+            keep_prob=1.0,
+            pre_tockens=2147483647,
+            next_tockens=2147483647,
+            sparse_mode=0,
+        )[0]
+    else:
+        query = q.reshape(batch, query_width, num_heads, head_dim).transpose(1, 2)
+        key = full_k.reshape(batch, full_k.shape[1], num_heads, head_dim).transpose(1, 2)
+        value = full_v.reshape(batch, full_v.shape[1], num_heads, head_dim).transpose(1, 2)
+        attention = F.scaled_dot_product_attention(query, key, value)
+        attention = attention.transpose(1, 2).reshape(
+            batch, query_width, hidden_size
+        )
+    attention = F.linear(attention, proj_weight, proj_bias)
+
+    modulations = modulation.chunk(9, dim=-1)
+    hidden = x + modulations[2] * attention
+    conv_input = F.layer_norm(hidden, (512,), eps=1e-6)
+    conv_input = conv_input * (1 + modulations[7]) + modulations[6]
+    hidden, new_cnn_cache = _dit_fused_conv_mlp_residual(
+        hidden,
+        conv_input,
+        cnn_cache,
+        modulations[8],
+        modulations[3],
+        modulations[4],
+        modulations[5],
+        conv1_flat_weight,
+        conv1_bias,
+        conv_norm_weight,
+        conv_norm_bias,
+        conv2_flat_weight,
+        conv2_bias,
+        fc1_weight,
+        fc1_bias,
+        fc2_weight,
+        fc2_bias,
+    )
+    return hidden, new_cnn_cache, new_att_cache
+
+
+def _dit_full_block_bsh_standard_conv_from_modulation(
+    x: torch.Tensor,
+    modulation: torch.Tensor,
+    att_cache: torch.Tensor,
+    cnn_cache: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor,
+    v_weight: torch.Tensor,
+    v_bias: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    q_norm_bias: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    proj_weight: torch.Tensor,
+    proj_bias: torch.Tensor,
+    conv1_weight: torch.Tensor,
+    conv1_bias: torch.Tensor,
+    conv_norm_weight: torch.Tensor,
+    conv_norm_bias: torch.Tensor,
+    conv2_weight: torch.Tensor,
+    conv2_bias: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc1_bias: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    fc2_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GE-visible BSH DiT block retaining canonical ``Conv1d`` math.
+
+    This is the numerical control for the native causal-pack variant. Keeping
+    the convolution visible to GE also lets the compiler propagate producer
+    layouts without an opaque custom-op boundary.
+    """
+    modulation, q, k, v = _dit_attention_preamble_bsh_from_modulation(
+        x,
+        modulation,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        v_weight,
+        v_bias,
+        q_norm_weight,
+        q_norm_bias,
+        k_norm_weight,
+        k_norm_bias,
+    )
+    cache_k = att_cache.select(0, 0)
+    cache_v = att_cache.select(0, 1)
+    full_k = torch.cat((k, cache_k), dim=1)
+    full_v = torch.cat((v, cache_v), dim=1)
+    new_att_cache = torch.stack((full_k, full_v), dim=0)
+
+    batch, query_width, hidden_size = q.shape
+    num_heads = 8
+    head_dim = 64
+    if q.device.type == "npu":
+        import torch_npu
+
+        attention = torch_npu.npu_fusion_attention(
+            query=q,
+            key=full_k,
+            value=full_v,
+            head_num=num_heads,
+            input_layout="BSH",
+            scale=head_dim**-0.5,
+            keep_prob=1.0,
+            pre_tockens=2147483647,
+            next_tockens=2147483647,
+            sparse_mode=0,
+        )[0]
+    else:
+        query = q.reshape(batch, query_width, num_heads, head_dim).transpose(1, 2)
+        key = full_k.reshape(batch, full_k.shape[1], num_heads, head_dim).transpose(1, 2)
+        value = full_v.reshape(batch, full_v.shape[1], num_heads, head_dim).transpose(1, 2)
+        attention = F.scaled_dot_product_attention(query, key, value)
+        attention = attention.transpose(1, 2).reshape(
+            batch, query_width, hidden_size
+        )
+    attention = F.linear(attention, proj_weight, proj_bias)
+
+    modulations = modulation.chunk(9, dim=-1)
+    hidden = x + modulations[2] * attention
+    conv_input = F.layer_norm(hidden, (512,), eps=1e-6)
+    conv_input = conv_input * (1 + modulations[7]) + modulations[6]
+    hidden, new_cnn_cache = _dit_conv_mlp_residual(
+        hidden,
+        conv_input,
+        cnn_cache,
+        modulations[8],
+        modulations[3],
+        modulations[4],
+        modulations[5],
+        conv1_weight,
+        conv1_bias,
+        conv_norm_weight,
+        conv_norm_bias,
+        conv2_weight,
+        conv2_bias,
+        fc1_weight,
+        fc1_bias,
+        fc2_weight,
+        fc2_bias,
+    )
+    return hidden, new_cnn_cache, new_att_cache
+
+
 class _DiTFullStackGraph(nn.Module):
     """All DiT blocks behind one GE boundary for a fixed cache shape."""
 
@@ -1691,6 +2008,23 @@ class BatchedToken2Wav(nn.Module):
         self.flow = token2wav.flow
         self.hift = token2wav.hift
         hift_parameter = next(self.hift.parameters(), None)
+        self._npu_matmul_hf32_enabled = _npu_matmul_hf32_enabled()
+        if (
+            self._npu_matmul_hf32_enabled
+            and hift_parameter is not None
+            and hift_parameter.device.type == "npu"
+        ):
+            npu_backend = getattr(torch, "npu", None)
+            matmul_backend = getattr(npu_backend, "matmul", None)
+            if matmul_backend is None or not hasattr(matmul_backend, "allow_hf32"):
+                raise RuntimeError(
+                    f"{_NPU_MATMUL_HF32_ENV}=1 requires torch.npu.matmul.allow_hf32"
+                )
+            matmul_backend.allow_hf32 = True
+            logger.info(
+                "MiniCPM-o Stage-2 HF32 MatMul active; FP32 tensor storage and "
+                "non-MatMul precision boundaries are unchanged"
+            )
         if hift_parameter is not None and hift_parameter.device.type == "cuda":
             # Prime the CUDA state used by HiFT during backend construction.
             # Otherwise, the first live audio chunk can fail when async stages
@@ -1734,6 +2068,11 @@ class BatchedToken2Wav(nn.Module):
         self._npu_cfm_graph_disabled = False
         self._npu_cfm_graph_capture_used = False
         self._npu_cfm_graph_replay_used = False
+        self._npu_cfm_graph_capture_phases: set[str] = set()
+        self._npu_cfm_graph_replay_phases: set[str] = set()
+        self._npu_cfm_cache_fill_graph_lengths = (
+            _npu_cfm_cache_fill_graph_lengths()
+        )
         self._npu_dit_mlp_graph_enabled = _npu_dit_mlp_graph_enabled(npu_dit_mlp_graph)
         self._npu_dit_mlp_graph_width = _npu_dit_mlp_graph_width(npu_dit_mlp_graph_width)
         extra_graph_widths = _npu_dit_graph_buckets(npu_dit_graph_buckets)
@@ -3534,7 +3873,10 @@ class BatchedToken2Wav(nn.Module):
             or not isinstance(weight, torch.Tensor)
             or weight.device.type != "npu"
             or not self._dit_full_block_compatible(block)
-            or not self._npu_dit_fused_conv_pack_enabled
+            or (
+                not self._npu_dit_bsh_attention_enabled
+                and not self._npu_dit_fused_conv_pack_enabled
+            )
         ):
             self._npu_dit_full_block_graph_enabled = False
             logger.warning("MiniCPM-o NPU full-block graph disabled: block or causal-pack layout is incompatible")
@@ -3545,7 +3887,11 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache = weight.new_zeros((2, 1024, 2))
         for cache_length in lengths:
             try:
-                att_cache = weight.new_zeros((2, 8, cache_length, 128))
+                att_cache = weight.new_zeros(
+                    (2, 2, cache_length, 512)
+                    if self._npu_dit_bsh_attention_enabled
+                    else (2, 8, cache_length, 128)
+                )
                 with torch.inference_mode():
                     self._call_npu_dit_full_block_graph(
                         graph_fn,
@@ -3557,7 +3903,9 @@ class BatchedToken2Wav(nn.Module):
                     )
                 torch.npu.synchronize()
                 logger.info(
-                    "Compiled MiniCPM-o NPU full DiT block graph for width=50, attention cache=%d",
+                    "Compiled MiniCPM-o NPU %s full DiT block graph for "
+                    "width=50, attention cache=%d",
+                    "BSH standard-Conv" if self._npu_dit_bsh_attention_enabled else "legacy causal-pack",
                     cache_length,
                 )
             except Exception:
@@ -3591,7 +3939,11 @@ class BatchedToken2Wav(nn.Module):
             register_minicpmo_fusion_attention_v3_converter()
             compiler_config = torchair.CompilerConfig()
             self._npu_dit_full_block_graph = torch.compile(
-                _dit_fused_full_block,
+                (
+                    _dit_full_block_bsh_standard_conv_from_modulation
+                    if self._npu_dit_bsh_attention_enabled
+                    else _dit_fused_full_block
+                ),
                 backend=torchair.get_npu_backend(compiler_config=compiler_config),
                 fullgraph=True,
                 dynamic=False,
@@ -3606,10 +3958,42 @@ class BatchedToken2Wav(nn.Module):
         time_embedding: torch.Tensor,
         att_cache: torch.Tensor,
         cnn_cache: torch.Tensor,
+        modulation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         conv1 = block.conv.block[1]
         conv_norm = block.conv.block[3]
         conv2 = block.conv.block[6]
+        if self._npu_dit_bsh_attention_enabled:
+            if modulation is None:
+                modulation = block.adaLN_modulation(time_embedding)
+            return graph_fn(
+                hidden,
+                modulation,
+                att_cache,
+                cnn_cache,
+                block.attn.to_q.weight,
+                block.attn.to_q.bias,
+                block.attn.to_k.weight,
+                block.attn.to_k.bias,
+                block.attn.to_v.weight,
+                block.attn.to_v.bias,
+                block.attn.q_norm.weight,
+                block.attn.q_norm.bias,
+                block.attn.k_norm.weight,
+                block.attn.k_norm.bias,
+                block.attn.proj.weight,
+                block.attn.proj.bias,
+                conv1.weight,
+                conv1.bias,
+                conv_norm.weight,
+                conv_norm.bias,
+                conv2.weight,
+                conv2.bias,
+                block.mlp.fc1.weight,
+                block.mlp.fc1.bias,
+                block.mlp.fc2.weight,
+                block.mlp.fc2.bias,
+            )
         return graph_fn(
             hidden,
             time_embedding,
@@ -4056,8 +4440,12 @@ class BatchedToken2Wav(nn.Module):
                     ):
                         preamble_graph_fn = self._get_npu_dit_preamble_graph(graph_width)
                     conv_mlp_graph_fn = (
-                        _dit_fused_conv_mlp_residual
-                        if flat_capture and self._npu_dit_fused_conv_pack_enabled
+                        _dit_flat_capture_conv_mlp_partition(
+                            fused_conv_pack=self._npu_dit_fused_conv_pack_enabled,
+                            cache_major=cache_major,
+                            post_attention=self._npu_dit_post_attn_graph_enabled,
+                        )
+                        if flat_capture
                         else None
                     )
                     last_block_final_euler_graph_fn = None
@@ -4067,7 +4455,6 @@ class BatchedToken2Wav(nn.Module):
                     if not flat_capture and full_block_graph_fn is None and (
                         graph_width == self._npu_dit_mlp_graph_width
                         and not planar_att
-                        and not bsh_attention
                         and not cache_major
                         and cnn_cache is not None
                         and att_cache is not None
@@ -4290,7 +4677,10 @@ class BatchedToken2Wav(nn.Module):
             wide_modulations is None
             and self._npu_dit_wide_adaln_enabled
             and preamble_graph_fn is not None
-            and full_block_graph_fn is None
+            and (
+                full_block_graph_fn is None
+                or self._npu_dit_bsh_attention_enabled
+            )
         ):
             wide_modulations = self._get_npu_dit_wide_adaln_graph()(
                 time_embedding,
@@ -4314,6 +4704,11 @@ class BatchedToken2Wav(nn.Module):
                     time_embedding,
                     old_att[block_idx],
                     old_cnn[block_idx],
+                    (
+                        None
+                        if wide_modulations is None
+                        else wide_modulations[:, :, block_idx, :]
+                    ),
                 )
                 cnn_out[block_idx].copy_(new_cnn)
                 att_out[block_idx, :, :, : new_att.shape[2], :].copy_(new_att)
@@ -5268,10 +5663,20 @@ class BatchedToken2Wav(nn.Module):
                 att_output=att_output,
             )
 
-        # Fixed-slab mode captures only the repetitive width-50/cache-402
-        # steady state. Prompt and cache-fill shapes remain eager and therefore
-        # cannot churn the graph cache or evict the useful executable.
-        if self._npu_cfm_fixed_kv_slabs_enabled and not steady_graph:
+        graph_phase = _npu_cfm_graph_phase(
+            fixed_kv_slabs=self._npu_cfm_fixed_kv_slabs_enabled,
+            cache_fill_lengths=self._npu_cfm_cache_fill_graph_lengths,
+            steady_graph=steady_graph,
+            width=int(mu.shape[2]),
+            cache_length=(
+                None if att_cache is None else int(att_cache.shape[-2])
+            ),
+            has_cache_outputs=cnn_output is not None and att_output is not None,
+        )
+        # Prompt CFM and variable-width tails remain eager. The opt-in
+        # cache-fill policy admits only explicitly configured fixed width-50
+        # shapes before cache-402 steady state.
+        if graph_phase is None:
             return self._decode_cfm_eager(
                 mu,
                 speakers,
@@ -5286,11 +5691,13 @@ class BatchedToken2Wav(nn.Module):
         flat_capture = (
             self._npu_cfm_fixed_kv_slabs_enabled
             and self._npu_dit_bsh_attention_enabled
-            and steady_graph
+            and graph_phase in {"cache-fill", "steady"}
         )
         key = tuple(self._optional_tensor_signature(value) for value in inputs)
         entry = self._npu_cfm_graphs.get(key)
-        slot_count = 2 if self._npu_cfm_fixed_kv_slabs_enabled else 1
+        # Cache-fill shapes execute once per request, so one persistent output
+        # set is safe. Only repetitive steady state uses ping-pong outputs.
+        slot_count = 2 if graph_phase == "steady" else 1
         if entry is not None and len(entry["slots"]) >= slot_count:
             self._npu_cfm_graphs.move_to_end(key)
             slot_index = int(entry["next_slot"])
@@ -5302,14 +5709,16 @@ class BatchedToken2Wav(nn.Module):
                 if static is not None and current is not None:
                     static.copy_(current)
             slot["graph"].replay()
-            if not self._npu_cfm_graph_replay_used:
+            if graph_phase not in self._npu_cfm_graph_replay_phases:
                 logger.info(
-                    "MiniCPM-o NPU steady CFM graph replay active: "
-                    "slots=%d, mu=%s, attention_cache=%s",
+                    "MiniCPM-o NPU CFM graph replay active: "
+                    "phase=%s, slots=%d, mu=%s, attention_cache=%s",
+                    graph_phase,
                     slot_count,
                     tuple(mu.shape),
                     None if att_cache is None else tuple(att_cache.shape),
                 )
+                self._npu_cfm_graph_replay_phases.add(graph_phase)
                 self._npu_cfm_graph_replay_used = True
             if self._npu_cfm_fixed_kv_slabs_enabled:
                 return slot["outputs"]
@@ -5399,15 +5808,17 @@ class BatchedToken2Wav(nn.Module):
             "inputs": static_inputs,
             "outputs": outputs,
         })
-        if not self._npu_cfm_graph_capture_used:
+        if graph_phase not in self._npu_cfm_graph_capture_phases:
             logger.info(
-                "MiniCPM-o NPU steady CFM graph captured: "
-                "slot=%d/%d, mu=%s, attention_cache=%s",
+                "MiniCPM-o NPU CFM graph captured: "
+                "phase=%s, slot=%d/%d, mu=%s, attention_cache=%s",
+                graph_phase,
                 len(entry["slots"]),
                 slot_count,
                 tuple(mu.shape),
                 None if att_cache is None else tuple(att_cache.shape),
             )
+            self._npu_cfm_graph_capture_phases.add(graph_phase)
             self._npu_cfm_graph_capture_used = True
         entry["next_slot"] = len(entry["slots"]) % slot_count
         max_graphs = self._npu_cfm_graph_cache_limit()

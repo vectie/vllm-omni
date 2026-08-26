@@ -287,12 +287,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                     input_batch=self.input_batch,
                     hidden_states=hidden_states,
                     num_scheduled_tokens=num_scheduled_tokens,
+                    include_computed_prefix=self._model_needs_full_prefix_hidden_states(),
                 )
             combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
                 query_start_loc=self.query_start_loc.cpu,
                 input_batch=self.input_batch,
                 multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_scheduled_tokens=num_scheduled_tokens,
+                include_computed_prefix=self._model_needs_full_prefix_hidden_states(),
             )
         return combined_hidden_states, combined_multimodal_outputs
 

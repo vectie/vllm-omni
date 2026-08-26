@@ -899,6 +899,8 @@ def llm2tts(
 
         latent = mm_output.get("latent", None)
         if latent is None:
+            latent = mm_output.get("hidden", None)
+        if latent is None:
             latent = output.hidden_states if hasattr(output, "hidden_states") else None
             if latent is None:
                 raise ValueError("No latent or hidden_states found in thinker output")
@@ -923,23 +925,46 @@ def llm2tts(
             tts_end_ids = set(tts_end_ids) | {151704, 151645}
 
         tts_bos_idx = None
+        tts_eos_idx = None
         # For native duplex the resumable prompt folds every earlier unit, so
         # a <|tts_bos|> from an already-spoken reply can sit mid-prompt; only
         # a boundary folded as the FINAL prompt token (this unit's decision)
         # or one inside the current segment may start the slice, or stale
         # text would be re-handed to the talker on text-less continuations.
         search_start = max(0, prompt_token_ids_len - 1) if is_native_duplex_handoff else 0
-        for idx_t in range(search_start, len(full_token_ids)):
-            if full_token_ids[idx_t] == tts_bos_id:
-                tts_bos_idx = idx_t + 1
+        bos_starts = [
+            idx_t + 1
+            for idx_t in range(search_start, len(full_token_ids))
+            if full_token_ids[idx_t] == tts_bos_id
+        ]
+        if is_native_duplex_handoff:
+            if bos_starts:
+                tts_bos_idx = bos_starts[-1]
+        else:
+            # ``use_tts`` appends MiniCPM-o's generation suffix, which itself
+            # ends in a second, open <|tts_bos|>.  Teacher-forced TTS already
+            # placed a complete <|tts_bos|>text<|tts_eos|> span earlier in the
+            # prompt.  Selecting the final BOS therefore points one past the
+            # last available hidden row and silently drops Talker conditioning.
+            # Prefer the last *complete* span; retain the last open BOS for
+            # ordinary autoregressive audio generation.
+            completed_spans: list[tuple[int, int]] = []
+            for bos_start in bos_starts:
+                for idx_t in range(bos_start, len(full_token_ids)):
+                    if full_token_ids[idx_t] in tts_end_ids:
+                        completed_spans.append((bos_start, idx_t))
+                        break
+            if completed_spans:
+                tts_bos_idx, tts_eos_idx = completed_spans[-1]
+            elif bos_starts:
+                tts_bos_idx = bos_starts[-1]
         if tts_bos_idx is None and not is_native_duplex_handoff and llm_output_ids:
             # Audio routing is a model-stage concern, not an OpenAI serving
             # default. Plain chat templates do not include <|tts_bos|>; in
             # that case condition the Talker on the generated assistant span.
             tts_bos_idx = prompt_token_ids_len
 
-        tts_eos_idx = None
-        if tts_bos_idx is not None:
+        if tts_bos_idx is not None and tts_eos_idx is None:
             for idx_t in range(tts_bos_idx, len(full_token_ids)):
                 if full_token_ids[idx_t] in tts_end_ids:
                     tts_eos_idx = idx_t
@@ -1033,6 +1058,18 @@ def llm2tts(
                         .contiguous()
                     )
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
+        if handoff_ids is None or tts_hidden_slice is None:
+            logger.warning(
+                "MiniCPM-o TTS handoff slice missing for req=%s: prompt_tokens=%d "
+                "output_tokens=%d hidden_rows=%d bos_index=%s eos_index=%s mm_keys=%s",
+                llm_output.request_id,
+                prompt_token_ids_len,
+                len(llm_output_ids),
+                int(thinker_hidden_states.shape[0]),
+                tts_bos_idx,
+                tts_eos_idx,
+                sorted(str(key) for key in mm_output),
+            )
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(
                 handoff_ids,

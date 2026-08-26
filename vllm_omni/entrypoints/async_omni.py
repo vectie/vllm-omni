@@ -143,6 +143,45 @@ class AsyncOmni(EngineClient, OmniBase):
         ...     print(output)
     """
 
+    @staticmethod
+    def _enforce_minicpmo45_audio_stage_boundary(
+        sampling_params_list: Sequence[Any],
+        stage_configs: Sequence[Any],
+        output_modalities: Sequence[str] | None,
+    ) -> Sequence[Any]:
+        """Keep the Thinker-to-Talker handoff cumulative for audio requests.
+
+        MiniCPM-o 4.5's Talker consumes one aligned slice of Thinker token IDs
+        and hidden states. A DELTA Stage-0 output can be emitted before that
+        slice is complete, which starts Stage 1 with a one-token scheduler
+        prompt and no TTS conditioning tensors. Enforce the boundary at the
+        engine entrypoint as well as the OpenAI adapter so non-chat callers and
+        future serving refactors cannot bypass the model invariant.
+        """
+        if not output_modalities or "audio" not in output_modalities:
+            return sampling_params_list
+
+        def _get(obj: Any, key: str) -> Any:
+            if isinstance(obj, Mapping):
+                return obj.get(key)
+            return getattr(obj, key, None)
+
+        for index, stage in enumerate(stage_configs):
+            if index >= len(sampling_params_list):
+                break
+            engine_args = _get(stage, "engine_args")
+            if _get(engine_args, "model_arch") != "MiniCPMO45OmniForConditionalGeneration":
+                continue
+            params = sampling_params_list[index]
+            if not isinstance(params, SamplingParams):
+                continue
+            model_stage = _get(engine_args, "model_stage")
+            if model_stage == "llm":
+                params.output_kind = RequestOutputKind.FINAL_ONLY
+            elif model_stage == "tts":
+                params.output_kind = RequestOutputKind.DELTA
+        return sampling_params_list
+
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
@@ -555,6 +594,11 @@ class AsyncOmni(EngineClient, OmniBase):
             sampling_params_list = self.resolve_sampling_params_list(
                 sampling_params_list,
                 allow_delta_coercion=True,
+            )
+            sampling_params_list = self._enforce_minicpmo45_audio_stage_boundary(
+                sampling_params_list,
+                self.stage_configs,
+                output_modalities,
             )
 
             # Track per-request metrics

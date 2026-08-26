@@ -558,6 +558,55 @@ def compute_seed_tts_wer_metrics(
     assert isinstance(first, SeedTTSSampleRequest)
     lang = "zh" if (first.seed_tts_locale or "en").lower().startswith("zh") else "en"
 
+    official_export_raw = os.environ.get("SEED_TTS_OFFICIAL_EXPORT_DIR", "").strip()
+    official_export_dir = Path(official_export_raw).expanduser() if official_export_raw else None
+    wer_enabled = os.environ.get("SEED_TTS_WER_EVAL", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if official_export_dir is not None and not wer_enabled:
+        request_failed = 0
+        no_pcm = 0
+        official_exported = 0
+        official_export_failed = 0
+        for req, out in zip(input_requests, outputs, strict=True):
+            assert isinstance(req, SeedTTSSampleRequest)
+            if not out.success:
+                request_failed += 1
+                continue
+            pcm = getattr(out, "tts_output_pcm_bytes", None)
+            if not pcm:
+                no_pcm += 1
+                continue
+            try:
+                _save_seed_tts_official_audio(
+                    pcm,
+                    output_dir=official_export_dir,
+                    utterance_id=req.seed_tts_utterance_id,
+                )
+                official_exported += 1
+            except (OSError, ValueError) as e:
+                official_export_failed += 1
+                logger.warning(
+                    "Seed-TTS official audio export failed for utterance=%s: %s",
+                    req.seed_tts_utterance_id,
+                    e,
+                )
+        return {
+            "seed_tts_eval_protocol": "seed-tts-official-export-only",
+            "seed_tts_content_evaluated": 0,
+            "seed_tts_content_error_mean": None,
+            "seed_tts_content_error_median": None,
+            "seed_tts_request_failed": request_failed,
+            "seed_tts_no_pcm": no_pcm,
+            "seed_tts_asr_failed": 0,
+            "seed_tts_content_metric": None,
+            "seed_tts_official_exported": official_exported,
+            "seed_tts_official_export_failed": official_export_failed,
+            "seed_tts_official_export_dir": str(official_export_dir),
+        }
+
     setup_err = _missing_deps_message(lang)
     if setup_err:
         logger.error("%s", setup_err)
@@ -588,8 +637,6 @@ def compute_seed_tts_wer_metrics(
     utmos_on = _eval_submetric_enabled("SEED_TTS_UTMOS_EVAL", default=False)
     save_audio_raw = os.environ.get("SEED_TTS_WER_SAVE_AUDIO_DIR", "").strip()
     save_audio_dir = Path(save_audio_raw).expanduser() if save_audio_raw else None
-    official_export_raw = os.environ.get("SEED_TTS_OFFICIAL_EXPORT_DIR", "").strip()
-    official_export_dir = Path(official_export_raw).expanduser() if official_export_raw else None
     saved_audio = 0
     save_audio_failed = 0
     official_exported = 0

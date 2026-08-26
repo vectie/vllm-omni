@@ -1,0 +1,89 @@
+# Atlas 800I A2 / Ascend 910B single-chip canonical-layout candidate.
+#
+# Keep the MiniCPM-o 4.5 steady-path optimizations from the 910C profile, but
+# do not install vLLM-Ascend's quantization-pattern rewrites on CANN releases
+# whose libopapi does not export aclnnAddRmsNormBias.  These two passes are
+# unrelated to the MiniCPM-o causal-conv and QKV custom kernels below.
+
+base_config: minicpmo_4_5_1npu_910c_cfm6_canonical_layout_experimental.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      # Keep the first packet at the steady 25-frame geometry. A2 A/B showed
+      # that 20 and 10 frames improved TTFP but regressed aggregate RTF and
+      # per-chunk RTF by creating extra Stage-2/HiFT invocations.
+      initial_codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      raw_tensor_shm: false
+      shm_event_notifications: true
+      shm_notification_namespace: minicpmo45-a2-1npu
+      token2wav_n_timesteps: 6
+      npu_dit_mlp_graph: true
+      npu_dit_mlp_graph_width: 50
+      npu_dit_graph_buckets: [20, 302]
+      npu_dit_preamble_graph: true
+      npu_dit_wide_adaln: false
+      npu_dit_conv_mlp_graph: true
+      npu_dit_prompt_conv_mlp_graph: true
+      npu_dit_fused_conv_pack: true
+      npu_dit_cache_major: true
+      npu_single_request_cache_passthrough: true
+      npu_cfm_fixed_kv_slabs: true
+      npu_cfm_planar_kv_slabs: true
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        # A 32 GiB 910B4 cannot use the percentage-based cache profiler from
+        # the 64/128 GiB 910C profile: the 16.84 GiB omni weights plus the
+        # worst-case video profiling graph already exceed the 55% reservation.
+        # Reserve a small, deterministic KV arena for the single-request A2
+        # validation lane and skip only the synthetic MM peak run.  Runtime MM
+        # inputs are still enabled and exercised by the benchmark suites.
+        max_num_seqs: 1
+        max_model_len: 8192
+        max_num_batched_tokens: 4096
+        # vLLM reports 1.12 GiB as the exact 8192-token single-request floor.
+        # Keep a small block-alignment margin without restoring auto-sizing.
+        kv_cache_memory_bytes: 1342177280  # 1.25 GiB
+        mm_processor_cache_gb: 0
+        skip_mm_profiling: true
+        # The MiniCPM-o TTS chat template places the target speech span in
+        # the Thinker prompt.  Talker conditioning therefore needs the full
+        # prompt hidden-state prefix, not only the final decode token.  Keep
+        # the Omni tensor prefix cache on for Stage 0 only; Stage 1/2 inherit
+        # the pipeline-wide disabled setting and avoid its overhead.
+        engine_extras:
+          enable_prefix_caching: true
+          disable_hybrid_kv_cache_manager: true
+        additional_config:
+          ascend_compilation_config:
+            fuse_norm_quant: false
+        compilation_config:
+          pass_config:
+            fuse_norm_quant: false
+            fuse_act_quant: false
+      - stage_id: 1
+        max_num_seqs: 1
+        kv_cache_memory_bytes: 268435456  # 256 MiB
+        additional_config:
+          ascend_compilation_config:
+            fuse_norm_quant: false
+        compilation_config:
+          pass_config:
+            fuse_norm_quant: false
+            fuse_act_quant: false
+      - stage_id: 2
+        # Keep model-specific runtime tuning scoped to Code2Wav. A2 A/B
+        # rejected both the F0-only graph (-2.2%) and F0+residual graphs
+        # (-1.7%), so the accepted control retains eager HiFT execution.
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND: "auto"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM: "1"

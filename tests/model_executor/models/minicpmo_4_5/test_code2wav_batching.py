@@ -1,3 +1,6 @@
+import ast
+import inspect
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,15 +25,21 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_final_cfg_euler_from_modulation,
     _dit_final_from_modulation,
     _dit_final_from_modulation_addcmul,
+    _dit_flat_capture_conv_mlp_partition,
     _dit_fused_conv_block_mlp_residual,
     _dit_fused_conv_linear_mlp_residual,
     _dit_fused_conv_mlp_residual,
     _dit_fused_full_block,
+    _dit_fused_full_block_bsh_from_modulation,
+    _dit_full_block_bsh_standard_conv_from_modulation,
     _dit_mlp_residual,
     _dit_wide_adaln_steps,
     _dit_wide_adaln_steps_with_final,
     _npu_cfm_fixed_kv_slabs_enabled,
+    _npu_cfm_cache_fill_graph_enabled,
+    _npu_cfm_cache_fill_graph_lengths,
     _npu_cfm_graph_enabled,
+    _npu_cfm_graph_phase,
     _npu_cfm_integration_dtype,
     _npu_cfm_planar_kv_slabs_enabled,
     _npu_cfm_stacked_cache_out_enabled,
@@ -51,6 +60,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_dit_graph_buckets,
     _npu_dit_last_block_final_euler_graph_enabled,
     _npu_dit_last_block_final_euler_perf_qualifies,
+    _npu_matmul_hf32_enabled,
     _npu_dit_mlp_graph_enabled,
     _npu_dit_mlp_graph_width,
     _npu_dit_post_attn_graph_enabled,
@@ -69,6 +79,126 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_flat_capture_forces_explicit_attention_only_for_bsh_cache():
+    """Raw NPUGraph capture must not enter the fused-attention aux stream."""
+    source = textwrap.dedent(
+        inspect.getsource(
+            BatchedToken2Wav._estimator_blocks_forward_chunk_mlp_graph
+        )
+    )
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    bsh_calls = [
+        call
+        for call in calls
+        if call.func.attr == "_attention_from_projected_qkv_bsh_planar"
+    ]
+    planar_calls = [
+        call
+        for call in calls
+        if call.func.attr == "_attention_from_projected_qkv_planar"
+    ]
+
+    assert len(bsh_calls) == 1
+    explicit = {
+        keyword.arg: keyword.value for keyword in bsh_calls[0].keywords
+    }["explicit_attention"]
+    assert isinstance(explicit, ast.Name)
+    assert explicit.id == "flat_capture"
+    assert len(planar_calls) == 1
+    assert all(
+        keyword.arg != "explicit_attention"
+        for keyword in planar_calls[0].keywords
+    )
+
+
+@pytest.mark.parametrize(
+    ("steady", "width", "cache_length", "has_outputs", "expected"),
+    [
+        (False, 50, 302, True, "cache-fill"),
+        (True, 50, 402, True, "steady"),
+        (False, 50, 352, True, None),
+        (False, 44, 302, True, None),
+        (False, 50, None, False, None),
+    ],
+)
+def test_fixed_slab_cfm_graph_phase_is_shape_strict(
+    steady: bool,
+    width: int,
+    cache_length: int | None,
+    has_outputs: bool,
+    expected: str | None,
+):
+    assert _npu_cfm_graph_phase(
+        fixed_kv_slabs=True,
+        cache_fill_lengths=(302,),
+        steady_graph=steady,
+        width=width,
+        cache_length=cache_length,
+        has_cache_outputs=has_outputs,
+    ) == expected
+
+
+def test_cache_fill_cfm_graph_is_opt_in(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH_LENGTHS",
+        raising=False,
+    )
+    assert not _npu_cfm_cache_fill_graph_enabled()
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH", "true"
+    )
+    assert _npu_cfm_cache_fill_graph_enabled()
+    assert _npu_cfm_cache_fill_graph_lengths() == (302,)
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH_LENGTHS",
+        "302,352,302",
+    )
+    assert _npu_cfm_cache_fill_graph_lengths() == (302, 352)
+
+
+def test_flat_capture_preserves_cache_major_conv_partition():
+    assert (
+        _dit_flat_capture_conv_mlp_partition(
+            fused_conv_pack=True,
+            cache_major=True,
+            post_attention=False,
+        )
+        is _dit_cache_major_conv_mlp_residual
+    )
+    assert (
+        _dit_flat_capture_conv_mlp_partition(
+            fused_conv_pack=True,
+            cache_major=True,
+            post_attention=True,
+        )
+        is _dit_cache_major_post_attention_conv_mlp_residual
+    )
+    assert (
+        _dit_flat_capture_conv_mlp_partition(
+            fused_conv_pack=True,
+            cache_major=False,
+            post_attention=False,
+        )
+        is _dit_fused_conv_mlp_residual
+    )
+    assert (
+        _dit_flat_capture_conv_mlp_partition(
+            fused_conv_pack=False,
+            cache_major=True,
+            post_attention=False,
+        )
+        is None
+    )
 
 
 class _FakeEncoder(nn.Module):
@@ -359,6 +489,29 @@ def test_npu_dit_compute_dtype_config_and_environment(monkeypatch) -> None:
     )
     with pytest.raises(ValueError, match="NPU_DIT_COMPUTE_DTYPE"):
         _npu_dit_compute_dtype()
+
+
+def test_npu_matmul_hf32_config_and_environment(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_MATMUL_HF32",
+        raising=False,
+    )
+    assert _npu_matmul_hf32_enabled() is False
+    assert _npu_matmul_hf32_enabled(True) is True
+    assert _npu_matmul_hf32_enabled("on") is True
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_MATMUL_HF32",
+        "0",
+    )
+    assert _npu_matmul_hf32_enabled(True) is False
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_MATMUL_HF32",
+        "sometimes",
+    )
+    with pytest.raises(ValueError, match="NPU_MATMUL_HF32"):
+        _npu_matmul_hf32_enabled()
 
 
 def test_npu_cfm_integration_dtype_config_and_environment(monkeypatch) -> None:
@@ -850,7 +1003,6 @@ def test_planar_attention_from_projected_qkv_matches_legacy_cache_math():
             attention, q, k, v, planar_cache, planar_output
         )
     )
-
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(
         BatchedToken2Wav._legacy_att_cache_from_planar(actual_cache),
@@ -1423,6 +1575,159 @@ def test_dit_fused_full_block_matches_split_partition_math(monkeypatch):
     torch.testing.assert_close(actual_hidden, expected_hidden, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(actual_cnn, expected_cnn, rtol=0, atol=0)
     torch.testing.assert_close(actual_att, expected_att, rtol=0, atol=0)
+
+
+def test_dit_fused_full_block_bsh_matches_split_partition_math(monkeypatch):
+    torch.manual_seed(23)
+
+    def causal_pack(x, cache):
+        history = torch.cat((cache, x.transpose(1, 2)), dim=2)
+        packed = torch.stack(
+            [
+                history[:, :, offset : offset + 3]
+                .transpose(1, 2)
+                .reshape(2, -1)
+                for offset in range(50)
+            ],
+            dim=1,
+        ).reshape(100, 1536)
+        return packed, x[:, -2:, :].transpose(1, 2).contiguous()
+
+    monkeypatch.setattr(
+        torch.ops._C_ascend,
+        "npu_minicpmo_causal_conv_pack",
+        causal_pack,
+        raising=False,
+    )
+    hidden = torch.randn(2, 50, 512)
+    modulation = torch.randn(2, 1, 9 * 512)
+    att_cache = torch.randn(2, 2, 4, 512)
+    cnn_cache = torch.randn(2, 1024, 2)
+    q_proj = nn.Linear(512, 512)
+    k_proj = nn.Linear(512, 512)
+    v_proj = nn.Linear(512, 512)
+    q_norm = nn.LayerNorm(64)
+    k_norm = nn.LayerNorm(64)
+    out_proj = nn.Linear(512, 512)
+    conv1 = nn.Conv1d(512, 512, 3)
+    conv_norm = nn.LayerNorm(512)
+    conv2 = nn.Conv1d(512, 512, 3)
+    fc1 = nn.Linear(512, 2048)
+    fc2 = nn.Linear(2048, 512)
+
+    _, q, k, v = _dit_attention_preamble_bsh_from_modulation(
+        hidden,
+        modulation,
+        q_proj.weight,
+        q_proj.bias,
+        k_proj.weight,
+        k_proj.bias,
+        v_proj.weight,
+        v_proj.bias,
+        q_norm.weight,
+        q_norm.bias,
+        k_norm.weight,
+        k_norm.bias,
+    )
+    full_k = torch.cat((k, att_cache[0]), dim=1)
+    full_v = torch.cat((v, att_cache[1]), dim=1)
+    expected_att = torch.stack((full_k, full_v), dim=0)
+    query = q.reshape(2, 50, 8, 64).transpose(1, 2)
+    key = full_k.reshape(2, 54, 8, 64).transpose(1, 2)
+    value = full_v.reshape(2, 54, 8, 64).transpose(1, 2)
+    attention = F.scaled_dot_product_attention(query, key, value)
+    attention = out_proj(attention.transpose(1, 2).reshape(2, 50, 512))
+    modulations = modulation.chunk(9, dim=-1)
+    expected_hidden = hidden + modulations[2] * attention
+    conv_input = F.layer_norm(expected_hidden, (512,), eps=1e-6)
+    conv_input = conv_input * (1 + modulations[7]) + modulations[6]
+    expected_hidden, expected_cnn = _dit_conv_mlp_residual(
+        expected_hidden,
+        conv_input,
+        cnn_cache,
+        modulations[8],
+        modulations[3],
+        modulations[4],
+        modulations[5],
+        conv1.weight,
+        conv1.bias,
+        conv_norm.weight,
+        conv_norm.bias,
+        conv2.weight,
+        conv2.bias,
+        fc1.weight,
+        fc1.bias,
+        fc2.weight,
+        fc2.bias,
+    )
+    actual_hidden, actual_cnn, actual_att = (
+        _dit_fused_full_block_bsh_from_modulation(
+            hidden,
+            modulation,
+            att_cache,
+            cnn_cache,
+            q_proj.weight,
+            q_proj.bias,
+            k_proj.weight,
+            k_proj.bias,
+            v_proj.weight,
+            v_proj.bias,
+            q_norm.weight,
+            q_norm.bias,
+            k_norm.weight,
+            k_norm.bias,
+            out_proj.weight,
+            out_proj.bias,
+            conv1.weight.permute(0, 2, 1).reshape(512, 1536),
+            conv1.bias,
+            conv_norm.weight,
+            conv_norm.bias,
+            conv2.weight.permute(0, 2, 1).reshape(512, 1536),
+            conv2.bias,
+            fc1.weight,
+            fc1.bias,
+            fc2.weight,
+            fc2.bias,
+        )
+    )
+    torch.testing.assert_close(actual_hidden, expected_hidden, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(actual_cnn, expected_cnn, rtol=0, atol=0)
+    torch.testing.assert_close(actual_att, expected_att, rtol=0, atol=0)
+    standard_hidden, standard_cnn, standard_att = (
+        _dit_full_block_bsh_standard_conv_from_modulation(
+            hidden,
+            modulation,
+            att_cache,
+            cnn_cache,
+            q_proj.weight,
+            q_proj.bias,
+            k_proj.weight,
+            k_proj.bias,
+            v_proj.weight,
+            v_proj.bias,
+            q_norm.weight,
+            q_norm.bias,
+            k_norm.weight,
+            k_norm.bias,
+            out_proj.weight,
+            out_proj.bias,
+            conv1.weight,
+            conv1.bias,
+            conv_norm.weight,
+            conv_norm.bias,
+            conv2.weight,
+            conv2.bias,
+            fc1.weight,
+            fc1.bias,
+            fc2.weight,
+            fc2.bias,
+        )
+    )
+    torch.testing.assert_close(
+        standard_hidden, expected_hidden, rtol=1e-5, atol=1e-5
+    )
+    torch.testing.assert_close(standard_cnn, expected_cnn, rtol=0, atol=0)
+    torch.testing.assert_close(standard_att, expected_att, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(("value", "expected"), [(None, 50), ("64", 64)])

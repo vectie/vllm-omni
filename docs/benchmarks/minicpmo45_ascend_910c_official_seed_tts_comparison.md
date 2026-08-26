@@ -5087,3 +5087,96 @@ Artifacts:
 /workspace/user_data/lunanexa-stack/experiments/minicpmo45-dual-bsh-cfm-graph-20260822
 /workspace/user_data/lunanexa-stack/experiments/minicpmo45-dual-source-default-bsh-cfm-final-official-yaml-20260822
 ```
+
+## A2 external trace and cache-fill graph screen
+
+An external dynamic `msprof` trace refreshed the single-chip A2 attribution
+after fixed slabs, BSH attention, HF32 MatMul, and two-slot steady CFM replay.
+The representative ten-request trace counted 236,082 host kernel launches.
+Every request still executed prompt width 302, width 50/cache 302, and width
+50/cache 352 as complete six-step by sixteen-block eager CFM evaluations;
+only eight later cache-402 evaluations used the outer steady graph. The
+largest device families were TransData 310.47 ms, MatMulV2 264.81 ms,
+LayerNormV3 231.97 ms, Transpose 211.70 ms, Mul 199.21 ms, Add 164.69 ms,
+Slice 152.83 ms, and FlashAttention 129.77 ms. Profiling overhead invalidates
+the run as a speed sample but not these counts.
+
+Capturing both recurrent cache-fill shapes reduced TTFP but regressed matched
+whole-audio RTF by 4.78%, so cache 352 was removed. A cache-302-only candidate
+then completed four structurally matched 10-request runs with the accepted
+1,036,800-frame / 43.2-second signature:
+
+| Metric | Retained A2 HF32 graph | Cache-302-only mean | Change |
+| --- | ---: | ---: | ---: |
+| Whole-audio RTF | 0.33852 | 0.33470 | -1.13% |
+| Audio TTFP | 0.75645 s | 0.67398 s | -10.90% |
+| Text TTFT | 77.70 ms | 76.72 ms | -1.26% |
+| Mean E2E | 1.46186 s | 1.44539 s | -1.13% |
+| Steady-chunk RTF | 0.16915 | 0.18452 | +9.09% |
+
+Lower is better. One mismatched run was excluded. The strong first-packet win
+is real, but the later-chunk regression prevents promotion over the retained
+balanced profile. Capturing both steady slots before the cache-302 graph did
+not fix the interaction: two matched runs averaged 0.35645 whole-audio RTF
+and 0.18925 steady-chunk RTF while retaining roughly 0.67210-second TTFP. That
+allocation-order experiment was removed. Further work should not add another
+persistent raw NPUGraph boundary; it should use a bounded GE-visible
+producer-consumer partition or reduce work within the existing executable.
+
+## Full-DiT-block GE experiment
+
+The next experiment moved one complete BSH DiT block, including the canonical
+Conv1d producer/consumer chain, behind a single TorchAir/GE executable. It did
+not use the earlier native causal-pack helper: that helper was fast in
+isolation but produced unacceptable real-weight drift. The canonical-Conv
+variant preserved the intended block arithmetic to BF16 tolerance.
+
+On real checkpoint weights at width 50/cache 302, the isolated block result
+was:
+
+| Path | Mean block latency | Relative speed |
+| --- | ---: | ---: |
+| Split eager control | 1,096.45 us | 1.00x |
+| Canonical-Conv full GE block | 402.44 us | 2.72x |
+| Native causal-pack diagnostic | 281.93 us | 3.89x, rejected for drift |
+
+The service-level cache-302 candidate compiled and replayed the canonical
+full-block graph and completed 10/10 requests. Its structurally matched hot run
+used the same 1,036,800-frame / 43.2-second output signature as the retained
+A2 result:
+
+| Metric | Retained A2 profile | Full block at cache 302 | Change |
+| --- | ---: | ---: | ---: |
+| Whole-audio RTF | 0.33852 | 0.33707 | -0.43% |
+| Audio TTFP | 0.75645 s | 0.67801 s | -10.37% |
+| Text TTFT | 77.70 ms | 79.53 ms | +2.35% |
+| Mean E2E | 1.46186 s | 1.45614 s | -0.39% |
+| Steady-chunk RTF | 0.16915 | 0.18721 | +10.67% |
+
+Lower is better. The profile remains an explicit low-TTFP experiment rather
+than the submission default: its first-packet gain is material, but it moves
+work into the steady path, regresses steady-chunk RTF, and has not passed the
+three-suite quality gate.
+
+Two attempts to extend the optimization further were rejected:
+
+- nesting the cache-402 GE executable inside the retained outer NPUGraph
+  failed on the first request with `Unsupport run graph with different stream`;
+  the GE executable is bound to the default stream while the outer capture
+  runs on a capture stream;
+- TorchAir ACLGraph replay preserved exact microbenchmark output but took
+  2,097.83 us versus 1,142.68 us for the control (0.54x), and enabling the
+  ACLNN static-shape compiler terminated its TBE worker before producing an
+  executable. The separate `npugraph_ex` package is absent from this A2 image.
+
+The safe selector therefore excludes full-block GE when an outer flat capture
+is active. Retrying a single static six-step executable requires a compatible
+CANN/TorchAir image with NPUGraphEx support or an explicit same-stream graph
+composition API; it is not safe to emulate by nesting the current wrappers.
+
+After reverting the unsafe nested selector, the retained HF32/BSH/steady-CFM
+profile was restored on the A2 host. A cold warm-up request generated 3.88
+seconds of continuous audio, and the following two hot requests completed 2/2
+with 77.38 ms mean TTFT, 8.28 seconds of generated audio, and 100% streaming
+continuity. Runtime logs confirmed `slots=2` and `NPU CFM graph replay active`;
+the model API remained healthy with HTTP 200.

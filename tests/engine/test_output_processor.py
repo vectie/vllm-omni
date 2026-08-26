@@ -498,6 +498,29 @@ def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypa
     assert AUDIO in result.request_outputs[0].outputs[0].multimodal_output
 
 
+def test_completion_path_accumulates_pooling_hidden_payload(monkeypatch):
+    state = _make_state(RequestOutputKind.FINAL_ONLY)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.output_modality = OutputModality.TEXT
+    processor.request_states = {"r": state}
+    monkeypatch.setattr(
+        VLLMOutputProcessor,
+        "process_outputs",
+        lambda *_args, **_kwargs: SimpleNamespace(request_outputs=[], reqs_to_abort=[]),
+    )
+    hidden = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    engine_output = SimpleNamespace(
+        request_id="r",
+        multimodal_output=None,
+        output_type="latent",
+        pooling_output={"hidden": hidden},
+    )
+
+    processor.process_outputs([engine_output])
+
+    assert torch.equal(state.mm_accumulated["hidden"], hidden)
+
+
 def _make_mm_only_output_processor(monkeypatch):
     processor = object.__new__(MultimodalOutputProcessor)
     processor.output_modality = OutputModality.AUDIO

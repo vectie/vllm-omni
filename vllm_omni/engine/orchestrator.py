@@ -1342,8 +1342,19 @@ class Orchestrator:
             )
             return
 
+        complete_stage_handoff = self._requires_complete_stage_handoff(
+            stage_id,
+            req_state,
+        )
         if (
-            (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
+            (
+                finished
+                or (
+                    not complete_stage_handoff
+                    and req_state.streaming.enabled
+                    and req_state.streaming.segment_finished
+                )
+            )
             and stage_id < req_state.final_stage_id
             and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
@@ -1392,6 +1403,27 @@ class Orchestrator:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    def _requires_complete_stage_handoff(
+        self,
+        stage_id: int,
+        req_state: OrchestratorRequestState,
+    ) -> bool:
+        """Whether a streaming API response still needs a final stage edge.
+
+        API streaming and pipeline streaming are separate concerns. The
+        MiniCPM-o 4.5 Talker needs the Thinker's complete, token-aligned latent
+        span for ordinary chat/TTS. Only the native duplex runtime establishes
+        resumable segment boundaries that are valid on this edge.
+        """
+        if stage_id != 0 or self._is_duplex_session_request(req_state):
+            return False
+        pool = self.stage_pools[stage_id]
+        model_config = getattr(pool.stage_vllm_config, "model_config", None)
+        return (
+            getattr(model_config, "model_arch", None) == "MiniCPMO45OmniForConditionalGeneration"
+            and getattr(model_config, "model_stage", None) == "llm"
+        )
 
     def _stage_receives_async_chunks(self, stage_id: int) -> bool:
         """Whether a stage's connector supplies its runtime inputs."""

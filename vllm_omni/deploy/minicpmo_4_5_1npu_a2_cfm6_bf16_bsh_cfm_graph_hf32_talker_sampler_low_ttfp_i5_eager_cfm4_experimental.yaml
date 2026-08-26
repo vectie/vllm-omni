@@ -1,0 +1,18 @@
+# Atlas 800I A2 five-code first packet with eager width-10 fallback.
+#
+# Capturing width 10 through the inner DiT graphs passes startup compilation
+# but CANN aborts the first replay with ``tiling offset out of range`` on A2.
+# Keep the minimum useful five-code chunk and first-packet CFM4 policy, but do
+# not admit width 10 to any graph bucket. This isolates the short first packet
+# in canonical eager kernels while all later width-50/302 work keeps the proven
+# graph path.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_cfm4_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES: "5"

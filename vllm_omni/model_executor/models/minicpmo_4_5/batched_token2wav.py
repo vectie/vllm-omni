@@ -65,6 +65,12 @@ _NPU_CFM_CACHE_FILL_GRAPH_LENGTHS_ENV = (
 )
 _NPU_CFM_GRAPH_ATTN_MAX_ABS_DRIFT = 3.125e-2
 _NPU_CFM_GRAPH_ATTN_MEAN_ABS_DRIFT = 3.0e-3
+_NPU_INITIAL_CFM_TIMESTEPS_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS"
+)
+_NPU_PROMPT_CFM_TIMESTEPS_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS"
+)
 _NPU_DIT_BSH_ATTENTION_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_BSH_ATTENTION"
 _NPU_DIT_BSH_ATTENTION_MAX_ABS_DRIFT = 2.0e-2
 _NPU_DIT_BSH_ATTENTION_MEAN_ABS_DRIFT = 2.0e-3
@@ -218,6 +224,51 @@ def _npu_cfm_graph_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def _npu_initial_cfm_timesteps(full_timesteps: int) -> int:
+    """Resolve the optional first-audio-packet CFM solver width.
+
+    The default preserves the full quality path. Experimental profiles may
+    spend fewer solver evaluations on the short first packet while retaining
+    the full solver for every subsequent chunk.
+    """
+    raw = os.environ.get(_NPU_INITIAL_CFM_TIMESTEPS_ENV)
+    if raw in (None, ""):
+        return full_timesteps
+    try:
+        timesteps = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {_NPU_INITIAL_CFM_TIMESTEPS_ENV}={raw!r}; expected an "
+            f"integer in [1, {full_timesteps}]"
+        ) from exc
+    if not 1 <= timesteps <= full_timesteps:
+        raise ValueError(
+            f"Invalid {_NPU_INITIAL_CFM_TIMESTEPS_ENV}={raw!r}; expected an "
+            f"integer in [1, {full_timesteps}]"
+        )
+    return timesteps
+
+
+def _npu_prompt_cfm_timesteps(full_timesteps: int) -> int:
+    """Resolve the optional reference-prompt cache solver width."""
+    raw = os.environ.get(_NPU_PROMPT_CFM_TIMESTEPS_ENV)
+    if raw in (None, ""):
+        return full_timesteps
+    try:
+        timesteps = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {_NPU_PROMPT_CFM_TIMESTEPS_ENV}={raw!r}; expected an "
+            f"integer in [1, {full_timesteps}]"
+        ) from exc
+    if not 1 <= timesteps <= full_timesteps:
+        raise ValueError(
+            f"Invalid {_NPU_PROMPT_CFM_TIMESTEPS_ENV}={raw!r}; expected an "
+            f"integer in [1, {full_timesteps}]"
+        )
+    return timesteps
 
 
 def _npu_cfm_cache_fill_graph_enabled() -> bool:
@@ -2218,6 +2269,12 @@ class BatchedToken2Wav(nn.Module):
             torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
         self.n_timesteps = int(token2wav.n_timesteps)
+        self.initial_cfm_timesteps = _npu_initial_cfm_timesteps(
+            self.n_timesteps
+        )
+        self.prompt_cfm_timesteps = _npu_prompt_cfm_timesteps(
+            self.n_timesteps
+        )
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
         self.register_buffer(
@@ -2231,8 +2288,12 @@ class BatchedToken2Wav(nn.Module):
             persistent=False,
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
-        self._timeline_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
-        self._cfm_delta_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
+        self._timeline_cache: dict[
+            tuple[str, int | None, torch.dtype, int], torch.Tensor
+        ] = {}
+        self._cfm_delta_cache: dict[
+            tuple[str, int | None, torch.dtype, int], torch.Tensor
+        ] = {}
         self._timestep_embedding_cache: dict[tuple[Any, ...], torch.Tensor] = {}
         self._cfg_workspace: dict[tuple[str, tuple[int, ...], torch.dtype, str, int | None], torch.Tensor] = {}
         self._npu_cfm_graphs: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
@@ -2241,6 +2302,8 @@ class BatchedToken2Wav(nn.Module):
         self._npu_cfm_graph_replay_used = False
         self._npu_cfm_graph_capture_phases: set[str] = set()
         self._npu_cfm_graph_replay_phases: set[str] = set()
+        self._npu_initial_cfm_used = False
+        self._npu_prompt_cfm_used = False
         self._npu_cfm_cache_fill_graph_lengths = (
             _npu_cfm_cache_fill_graph_lengths()
         )
@@ -4365,11 +4428,26 @@ class BatchedToken2Wav(nn.Module):
             raise RuntimeError("MiniCPM-o native causal Conv weight was not prepacked")
         return flat_weight
 
-    def _timeline_for(self, value: torch.Tensor) -> torch.Tensor:
-        key = (value.device.type, value.device.index, value.dtype)
+    def _timeline_for(
+        self,
+        value: torch.Tensor,
+        num_timesteps: int | None = None,
+    ) -> torch.Tensor:
+        steps = self.n_timesteps if num_timesteps is None else num_timesteps
+        key = (value.device.type, value.device.index, value.dtype, steps)
         timeline = self._timeline_cache.get(key)
         if timeline is None:
-            timeline = self.cfm_timeline_base.to(device=value.device, dtype=value.dtype)
+            base = (
+                self.cfm_timeline_base
+                if steps == self.n_timesteps
+                else 1
+                - torch.cos(
+                    torch.linspace(0, 1, steps + 1, dtype=torch.float32)
+                    * 0.5
+                    * torch.pi
+                )
+            )
+            timeline = base.to(device=value.device, dtype=value.dtype)
             self._timeline_cache[key] = timeline
         return timeline
 
@@ -4383,17 +4461,23 @@ class BatchedToken2Wav(nn.Module):
         from each non-final CFM step while preserving the original update
         order and values.
         """
-        key = (timeline.device.type, timeline.device.index, timeline.dtype)
+        num_timesteps = int(timeline.shape[0]) - 1
+        key = (
+            timeline.device.type,
+            timeline.device.index,
+            timeline.dtype,
+            num_timesteps,
+        )
         cached = self._cfm_delta_cache.get(key)
         if cached is not None:
             return cached
         time = timeline[0]
         dt = timeline[1] - timeline[0]
         deltas: list[torch.Tensor] = []
-        for step in range(self.n_timesteps):
+        for step in range(num_timesteps):
             deltas.append(dt)
             time = time + dt
-            if step + 1 < self.n_timesteps:
+            if step + 1 < num_timesteps:
                 dt = timeline[step + 2] - time
         cached = torch.stack(deltas).detach()
         self._cfm_delta_cache[key] = cached
@@ -5606,13 +5690,17 @@ class BatchedToken2Wav(nn.Module):
         Lightweight test/dummy estimators that do not expose CosyVoice's
         embedder attributes keep the generic eager behavior.
         """
+        num_timesteps = int(timeline.shape[0]) - 1
         embedder = estimator.t_embedder
         frequency_size = getattr(embedder, "frequency_embedding_size", None)
         scale = getattr(embedder, "scale", None)
         mlp = getattr(embedder, "mlp", None)
         if not isinstance(frequency_size, int) or scale is None or not isinstance(mlp, nn.Module):
             return torch.stack(
-                [embedder(timeline[step].expand(cfg_batch_size)).unsqueeze(1) for step in range(self.n_timesteps)]
+                [
+                    embedder(timeline[step].expand(cfg_batch_size)).unsqueeze(1)
+                    for step in range(num_timesteps)
+                ]
             )
 
         key = (
@@ -5621,7 +5709,7 @@ class BatchedToken2Wav(nn.Module):
             timeline.device.type,
             timeline.device.index,
             timeline.dtype,
-            self.n_timesteps,
+            num_timesteps,
         )
         cached = self._timestep_embedding_cache.get(key)
         if cached is not None:
@@ -5634,14 +5722,14 @@ class BatchedToken2Wav(nn.Module):
         embeddings: list[torch.Tensor] = []
         time = timeline[0].expand(cfg_batch_size)
         dt = timeline[1] - timeline[0]
-        for step in range(self.n_timesteps):
+        for step in range(num_timesteps):
             arguments = (time * float(scale))[:, None] * frequencies[None]
             sinusoidal = torch.cat((torch.cos(arguments), torch.sin(arguments)), dim=-1)
             if frequency_size % 2:
                 sinusoidal = torch.cat((sinusoidal, torch.zeros_like(sinusoidal[:, :1])), dim=-1)
             embeddings.append(mlp(sinusoidal).unsqueeze(1))
             time = time + dt
-            if step + 1 < self.n_timesteps:
+            if step + 1 < num_timesteps:
                 dt = timeline[step + 2] - time[0]
         cached = torch.stack(embeddings).detach()
         self._timestep_embedding_cache[key] = cached
@@ -5658,9 +5746,16 @@ class BatchedToken2Wav(nn.Module):
         cnn_output: torch.Tensor | None = None,
         att_output: torch.Tensor | None = None,
         flat_capture: bool = False,
+        num_timesteps: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         decoder = self.flow.decoder
         estimator = decoder.estimator
+        steps = self.n_timesteps if num_timesteps is None else num_timesteps
+        if not 1 <= steps <= self.n_timesteps:
+            raise ValueError(
+                f"num_timesteps must be in [1, {self.n_timesteps}], got {steps}"
+            )
+        reduced_steps = steps != self.n_timesteps
         batch_size = int(mu.shape[0])
         integration_dtype = (
             self._npu_cfm_integration_dtype
@@ -5701,9 +5796,9 @@ class BatchedToken2Wav(nn.Module):
         estimator_mu = mu.to(dtype=estimator_dtype)
         estimator_speakers = speakers.to(dtype=estimator_dtype)
         estimator_cond = cond.to(dtype=estimator_dtype)
-        estimator_timeline = self._timeline_for(estimator_mu)
+        estimator_timeline = self._timeline_for(estimator_mu, steps)
         integration_reference = mu.to(dtype=integration_dtype)
-        integration_timeline = self._timeline_for(integration_reference)
+        integration_timeline = self._timeline_for(integration_reference, steps)
         mu_cfg = self._cfg_pair("mu", estimator_mu, zero_unconditional=True)
         speakers_cfg = self._cfg_pair(
             "speakers",
@@ -5719,7 +5814,21 @@ class BatchedToken2Wav(nn.Module):
         wide_modulation_steps: torch.Tensor | None = None
         final_modulation_steps: torch.Tensor | None = None
         if self._npu_dit_wide_adaln_enabled:
-            if flat_capture and self._npu_dit_wide_final_adaln_enabled:
+            if reduced_steps and self._npu_dit_wide_final_adaln_enabled:
+                wide_modulation_steps, final_modulation_steps = (
+                    _dit_wide_adaln_steps_with_final(
+                        time_embeddings,
+                        self._npu_dit_wide_final_adaln_weight,
+                        self._npu_dit_wide_final_adaln_bias,
+                    )
+                )
+            elif reduced_steps:
+                wide_modulation_steps = _dit_wide_adaln_steps(
+                    time_embeddings,
+                    self._npu_dit_wide_adaln_weight,
+                    self._npu_dit_wide_adaln_bias,
+                )
+            elif flat_capture and self._npu_dit_wide_final_adaln_enabled:
                 wide_modulation_steps, final_modulation_steps = (
                     _dit_wide_adaln_steps_with_final(
                         time_embeddings,
@@ -5769,7 +5878,7 @@ class BatchedToken2Wav(nn.Module):
                 logger.info(
                     "MiniCPM-o all-step wide AdaLN replay active for %d CFM steps x "
                     "16 blocks%s",
-                    self.n_timesteps,
+                    steps,
                     " plus final layer" if final_modulation_steps is not None else "",
                 )
                 self._npu_dit_wide_adaln_steps_used = True
@@ -5780,8 +5889,14 @@ class BatchedToken2Wav(nn.Module):
         if (cnn_output is None) != (att_output is None):
             raise ValueError("cnn_output and att_output must be provided together")
         direct_cache_output = (
-            cnn_output is not None
-            or (self._npu_cfm_stacked_cache_out_enabled and mu.device.type == "npu")
+            not reduced_steps
+            and (
+                cnn_output is not None
+                or (
+                    self._npu_cfm_stacked_cache_out_enabled
+                    and mu.device.type == "npu"
+                )
+            )
         )
         stacked_cnn_out = cnn_output
         stacked_att_out = att_output
@@ -5807,8 +5922,8 @@ class BatchedToken2Wav(nn.Module):
                 cache_major=self._is_cache_major_cnn(first_old_cnn),
                 bsh_attention=bsh_attention,
             )
-            expected_cnn = (self.n_timesteps, *cnn_shape)
-            expected_att = (self.n_timesteps, *att_shape)
+            expected_cnn = (steps, *cnn_shape)
+            expected_att = (steps, *att_shape)
             if stacked_cnn_out is None:
                 stacked_cnn_out = mu_cfg.new_empty(expected_cnn)
                 stacked_att_out = mu_cfg.new_empty(expected_att)
@@ -5824,9 +5939,17 @@ class BatchedToken2Wav(nn.Module):
                 )
         next_cnn: list[torch.Tensor] = []
         next_att: list[torch.Tensor] = []
-        for step in range(self.n_timesteps):
-            old_cnn = working_cnn_cache[step] if working_cnn_cache is not None else None
-            old_att = att_cache[step] if att_cache is not None else None
+        for step in range(steps):
+            cache_step = min(
+                self.n_timesteps - 1,
+                step * self.n_timesteps // steps,
+            )
+            old_cnn = (
+                working_cnn_cache[cache_step]
+                if working_cnn_cache is not None
+                else None
+            )
+            old_att = att_cache[cache_step] if att_cache is not None else None
             estimate, step_cnn, step_att, cfm_updated = self._estimator_step(
                 estimator,
                 x=self._cfg_pair(
@@ -5871,8 +5994,26 @@ class BatchedToken2Wav(nn.Module):
             if stacked_cnn_out is None:
                 next_cnn.append(step_cnn)
                 next_att.append(step_att)
-        stacked_cnn = stacked_cnn_out if stacked_cnn_out is not None else torch.stack(next_cnn)
-        stacked_att = stacked_att_out if stacked_att_out is not None else torch.stack(next_att)
+        if stacked_cnn_out is not None:
+            stacked_cnn = stacked_cnn_out
+            stacked_att = stacked_att_out
+        elif reduced_steps:
+            # The fixed serving ABI owns one cache slot per full CFM timestep.
+            # Map each reduced solver cache to its nearest following full slot
+            # so subsequent CFM6 chunks retain stable six-slot tensor shapes.
+            full_to_reduced = tuple(
+                min(steps - 1, step * steps // self.n_timesteps)
+                for step in range(self.n_timesteps)
+            )
+            stacked_cnn = torch.stack(
+                [next_cnn[index] for index in full_to_reduced]
+            )
+            stacked_att = torch.stack(
+                [next_att[index] for index in full_to_reduced]
+            )
+        else:
+            stacked_cnn = torch.stack(next_cnn)
+            stacked_att = torch.stack(next_att)
         if direct_cache_output and not self._npu_cfm_stacked_cache_out_used:
             logger.info("MiniCPM-o NPU direct stacked CFM cache output active")
             self._npu_cfm_stacked_cache_out_used = True
@@ -5913,7 +6054,25 @@ class BatchedToken2Wav(nn.Module):
         cnn_output: torch.Tensor | None = None,
         att_output: torch.Tensor | None = None,
         steady_graph: bool = False,
+        num_timesteps: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            num_timesteps is not None
+            and num_timesteps != self.n_timesteps
+        ):
+            return self._decode_cfm_eager(
+                mu,
+                speakers,
+                cond,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+                # Reduced first-packet execution returns a six-slot cache by
+                # remapping its solver caches; fixed graph destinations remain
+                # reserved for the full six-step steady path.
+                cnn_output=None,
+                att_output=None,
+                num_timesteps=num_timesteps,
+            )
         if (
             not _npu_cfm_graph_enabled()
             or mu.device.type != "npu"
@@ -6320,7 +6479,20 @@ class BatchedToken2Wav(nn.Module):
                 prompt_mels.transpose(1, 2).contiguous(),
                 cnn_cache=None,
                 att_cache=None,
+                num_timesteps=self.prompt_cfm_timesteps,
             )
+            if (
+                self.prompt_cfm_timesteps != self.n_timesteps
+                and not self._npu_prompt_cfm_used
+            ):
+                logger.info(
+                    "MiniCPM-o prompt-cache CFM solver active: steps=%d/%d, "
+                    "prompt_width=%d; live steady chunks retain the full solver",
+                    self.prompt_cfm_timesteps,
+                    self.n_timesteps,
+                    int(hidden.shape[1]),
+                )
+                self._npu_prompt_cfm_used = True
         flow_cache = {
             "conformer_cnn_cache": conformer_cnn,
             "conformer_att_cache": conformer_att,
@@ -6409,6 +6581,14 @@ class BatchedToken2Wav(nn.Module):
                     f'{{"reason":"chunk_below_lookahead_window","frames":{num_frames},'
                     f'"minimum":{lookahead + 1}}}'
                 )
+        first_audio_chunk = all(
+            int(state.hift_cache["mel"].shape[-1]) == 0 for state in states
+        )
+        cfm_timesteps = (
+            self.initial_cfm_timesteps
+            if first_audio_chunk and not last_chunk
+            else self.n_timesteps
+        )
         flow_cache = self._stack_flow_cache(states)
         fixed_slabs = (
             states[0].estimator_kv_slabs
@@ -6464,7 +6644,20 @@ class BatchedToken2Wav(nn.Module):
                 cnn_output=cnn_output,
                 att_output=att_output,
                 steady_graph=steady_graph,
+                num_timesteps=cfm_timesteps,
             )
+            if (
+                cfm_timesteps != self.n_timesteps
+                and not self._npu_initial_cfm_used
+            ):
+                logger.info(
+                    "MiniCPM-o first-packet CFM solver active: steps=%d/%d, "
+                    "codec_frames=%d; subsequent chunks retain the full solver",
+                    cfm_timesteps,
+                    self.n_timesteps,
+                    int(tokens.shape[1]),
+                )
+                self._npu_initial_cfm_used = True
 
         prompt_len = int(features.mels.shape[1])
         if fixed_slabs is not None:

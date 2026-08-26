@@ -126,3 +126,92 @@ def test_a2_talker_sampler_graph_is_scoped_to_stage_one():
 
     assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"] == "1"
     assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+
+
+def test_a2_low_ttfp_profile_reuses_width_twenty_first_packet_graph():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_experimental.yaml"
+    )
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert extra["codec_chunk_frames"] == 25
+    assert extra["initial_codec_chunk_frames"] == 25
+    assert 20 in extra["npu_dit_graph_buckets"]
+    assert stage1.env["VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"] == "10"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+
+
+def test_a2_first_packet_cfm4_retains_cfm6_after_initial_chunk():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_cfm4_experimental.yaml"
+    )
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert extra["token2wav_n_timesteps"] == 6
+    assert stage1.env["VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"] == "10"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS"] == "4"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+
+
+def test_a2_minimum_useful_first_packet_precompiles_width_ten():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_i5_cfm4_experimental.yaml"
+    )
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert extra["codec_chunk_frames"] == 25
+    assert extra["token2wav_n_timesteps"] == 6
+    assert stage1.env["VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"] == "5"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS"] == "10,20,302"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS"] == "4"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+
+
+def test_a2_width_ten_eager_fallback_does_not_admit_failed_graph_bucket():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_i5_eager_cfm4_experimental.yaml"
+    )
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.env["VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"] == "5"
+    assert 10 not in extra["npu_dit_graph_buckets"]
+    assert "VLLM_OMNI_MINICPMO45_NPU_DIT_GRAPH_BUCKETS" not in stage2.env
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS"] == "4"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+
+
+def test_a2_prompt_cfm2_retains_exact_speaker_and_cfm6_steady_policy():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt2_cfm4_experimental.yaml"
+    )
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert extra["token2wav_n_timesteps"] == 6
+    assert stage1.env["VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"] == "10"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS"] == "2"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS"] == "4"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+
+
+def test_a2_minimum_solver_first_path_still_retains_cfm6_steady_policy():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_experimental.yaml"
+    )
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert extra["token2wav_n_timesteps"] == 6
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"

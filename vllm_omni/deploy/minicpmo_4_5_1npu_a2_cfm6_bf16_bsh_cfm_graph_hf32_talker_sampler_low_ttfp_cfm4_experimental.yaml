@@ -1,0 +1,17 @@
+# Atlas 800I A2 single-chip first-packet CFM4 candidate.
+#
+# The first ten-code packet represents only about 120 ms of emitted waveform,
+# yet running the full CFM6 solver for it dominates TTFP. Solve that one packet
+# with four cosine-schedule evaluations, map its four estimator cache states
+# back into the fixed six-slot ABI, then return every subsequent chunk to the
+# full CFM6 quality path. This is deliberately experimental: unlike pure chunk
+# rescheduling, it requires the official Seed-TTS quality gate before use.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS: "4"

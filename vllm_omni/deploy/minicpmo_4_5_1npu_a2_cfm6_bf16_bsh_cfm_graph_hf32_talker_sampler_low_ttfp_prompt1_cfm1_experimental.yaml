@@ -1,0 +1,17 @@
+# Atlas 800I A2 minimum-solver first-path candidate.
+#
+# Retain the stable ten-code/width-20 graph shape, but evaluate the discarded
+# prompt-cache mel path once and the 120 ms first live packet once. Both cache
+# results are expanded into the six-slot ABI; all subsequent chunks remain
+# exact CFM6. This is the latency ceiling experiment for solver-count changes
+# and has a stricter quality risk than prompt2/CFM4.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_cfm4_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS: "1"
+          VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS: "1"

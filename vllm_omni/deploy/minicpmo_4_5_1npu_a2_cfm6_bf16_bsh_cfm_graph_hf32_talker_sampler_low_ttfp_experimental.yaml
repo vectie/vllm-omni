@@ -1,0 +1,18 @@
+# Atlas 800I A2 single-chip low-TTFP candidate.
+#
+# Keep the validated 25-code steady chunk so whole-audio RTF and launch
+# amortization are unchanged, but hand the first ten codec codes to Code2Wav
+# immediately. Ten codes map to the already captured width-20 Stage-2 graph,
+# so this removes fifteen serial Talker decode steps from first-packet latency
+# without introducing a new dynamic shape. The model's three-code lookahead
+# leaves seven newly decodable frames in this first non-final chunk.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_graph_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES: "10"

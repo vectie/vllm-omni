@@ -5890,3 +5890,12 @@ Artifacts:
 /tmp/lunanexa-bench/prompt-state-cache-official10-third/
 /tmp/minicpmo-stable-pa-prompt-state-cache.log
 ```
+
+A follow-up pinned-host D2H candidate was rejected at the smoke gate.  It
+copied the first 23,040-byte FP32 waveform through a dedicated NPU copy stream
+into pinned CPU storage and synchronized that stream before EngineCore IPC.
+The path was confirmed active, but TTFP rose from the prompt-cache smoke's
+280.74 ms to 297.54 ms (+5.99%).  For this small payload, pinned allocation,
+stream handoff, and explicit synchronization cost more than the pageable D2H
+copy.  The implementation and profile were reverted; the artifact remains at
+`/tmp/lunanexa-bench/prompt-cache-pinned-d2h-smoke/`.

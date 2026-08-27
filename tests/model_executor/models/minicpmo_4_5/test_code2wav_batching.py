@@ -3306,6 +3306,28 @@ def test_forward_builds_backend_when_weight_loading_was_skipped(monkeypatch):
     assert output.multimodal_outputs["model_outputs"][0].numel() > 0
 
 
+def test_load_weights_skips_unowned_parent_checkpoint(monkeypatch):
+    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    token2wav = _FakeToken2Wav()
+    builds = 0
+
+    def build_backend():
+        nonlocal builds
+        builds += 1
+        model.backend = BatchedToken2Wav(token2wav)
+
+    def parent_checkpoint():
+        raise AssertionError("Stage 2 must not consume the parent checkpoint")
+        yield "unused", torch.empty(0)
+
+    monkeypatch.setattr(model, "_build_backend", build_backend)
+
+    loaded = model.load_weights(parent_checkpoint())
+
+    assert builds == 1
+    assert loaded == {name for name, _ in model.named_parameters()}
+
+
 @pytest.mark.parametrize(
     ("info", "reason"),
     [

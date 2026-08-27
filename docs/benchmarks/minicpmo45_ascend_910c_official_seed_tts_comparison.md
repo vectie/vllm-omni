@@ -6439,6 +6439,15 @@ RTF `0.25438`, mean TTFP `621.37 ms`, and mean TTFT `80.95 ms` on the available
 910C leaderboard, but they provide the local target for reduced-solver
 qualification.
 
+Stage 2 previously consumed and discarded the complete lazy parent-checkpoint
+iterator before loading its independently owned `flow.pt` and `hift.pt`.
+Skipping that unowned 17.46-GiB safetensors scan reduced the observed Stage-2
+initialization-to-API-ready interval from about 465 seconds to 148 seconds on
+the GlusterFS-backed A2 host, a **68%** reduction (about 5 minutes 17 seconds).
+The already running service imported this change when Stage 2 was spawned, so
+the passing safe-exact performance/WER run above also exercised the corrected
+loader. This changes startup only, not model tensors or scored inference.
+
 At the 2026-08-27 23:58:38 leaderboard refresh, `向量贴贴` ranked ninth at
 RTF `0.2423`, TTFP `514.22 ms` and TTFT `45.72 ms`. The RTF leader reported
 `0.1066`, while the best observed first-response entry reported TTFP

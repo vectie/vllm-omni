@@ -1203,8 +1203,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         raise TypeError(f"MiniCPMO45Code2Wav expected OmniOutput, got {type(model_outputs).__name__}")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        for _ in weights:
-            pass
+        # This stage owns no tensor from the parent MiniCPM checkpoint.  Its
+        # complete state comes from assets/token2wav/{flow,hift}.pt in
+        # _build_backend().  Do not consume the lazy parent iterator: doing so
+        # needlessly reads every 17+ GiB safetensors shard once more for Stage
+        # 2 before discarding every tensor.
+        del weights
         self._build_backend()
         # Token2wav loads flow.pt and hift.pt inside its constructor instead of
         # from the parent MiniCPM checkpoint iterator. Report those registered

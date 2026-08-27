@@ -434,6 +434,19 @@ def test_a2_cfm3_deferred_eos_is_scoped_to_sparse_talker_transport():
     assert stage2.env["VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"] == "3"
 
 
+def test_a2_cfm3_deferred_eos_i5_changes_only_initial_transport_boundary():
+    deploy = _load_profile("minicpmo_4_5_1npu_a2_cfm3_deferred_eos_i5_experimental.yaml")
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES" not in (stage0.env or {})
+    assert stage1.env["VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"] == "5"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"] == "1"
+    assert "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES" not in (stage2.env or {})
+    assert stage2.env["VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"] == "3"
+
+
 def test_a2_cfm3_deferred_eos_profiler_keeps_stage_two_unprofiled():
     deploy = _load_profile("minicpmo_4_5_1npu_a2_cfm3_deferred_eos_profile.yaml")
     stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)

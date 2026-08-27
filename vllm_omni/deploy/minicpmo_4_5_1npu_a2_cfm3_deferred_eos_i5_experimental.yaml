@@ -1,0 +1,14 @@
+# Atlas 800I A2 minimum-useful first packet on the current CFM3 stack.
+#
+# Five codec codes plus the three-code left context give HiFT its minimum ten
+# mel frames and one publishable 40 ms waveform packet.  Keep width 10 eager:
+# this A2 CANN release rejects its captured DiT graph bucket at first replay.
+
+base_config: minicpmo_4_5_1npu_a2_cfm3_deferred_chunk_eos_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES: "5"

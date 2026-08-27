@@ -6192,3 +6192,43 @@ substitute for amortizing multiple decode steps inside one worker execution.
 /tmp/lunanexa-bench/cfm3-sync-talker-official10/
 /tmp/minicpmo-cfm3-sync-talker.log
 ```
+
+### Retained five-code first-packet profile on the current CFM3 stack
+
+The earlier five-code screen predated prompt-state reuse, native CFM3 and
+chunk-boundary EOS, so its 566 ms result did not answer whether the minimum
+packet helps the current stack.  The new profile changes only Stage 1's first
+transport boundary from ten codes to five.  With the three-code left context,
+HiFT receives ten mel frames and publishes its minimum non-empty 40 ms packet.
+Width 10 intentionally stays eager because this A2 CANN release previously
+aborted its captured graph at first replay; width-50 steady work retains the
+proven graph.
+
+Two independent runs used two warmups, ten measured Chinese Seed-TTS prompts,
+concurrency one, seed zero and temperature zero.  Both completed 10/10 with no
+failures and 100% streaming continuity:
+
+| Variant | Aggregate RTF | Mean reported RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Retained first-10 control | 0.171280 | - | 267.86 ms | **79.47 ms** | 1023.84 ms | 59.80 s |
+| First-5 run 1 | 0.172712 | 0.176069 | **253.09 ms** | 79.36 ms | **970.83 ms** | 56.24 s |
+| First-5 run 2 | **0.165697** | **0.168205** | 255.55 ms | 80.02 ms | 1046.71 ms | 63.20 s |
+| First-5 pooled/mean | **0.169000** | 0.172137 | **254.32 ms** | 79.69 ms | **1008.77 ms** | 119.44 s total |
+
+Pooled aggregate RTF is total serving duration divided by total generated
+audio across both runs; other pooled-row latency values are two-run means.
+Relative to the first-10 control, the new profile improves aggregate RTF by
+1.33%, mean TTFP by 5.05%, and mean E2E by 1.47%.  TTFT moves by 0.27% and is
+effectively unchanged.  The repeated TTFP gain shows that the saved five
+Talker steps outweigh the eager width-10 Code2Wav launch on the current stack.
+
+This becomes the retained low-TTFP/high-score profile.  It does not remove the
+existing accuracy gate: native CFM3 and chunk-boundary EOS already require the
+official Seed-TTS WER/SIM, Daily-Omni and Video-MME checks, and changing the
+first HiFT partition must be covered by the same end-to-end audio screen.
+
+```text
+/tmp/lunanexa-bench/cfm3-deferred-eos-i5-official10/
+/tmp/lunanexa-bench/cfm3-deferred-eos-i5-official10-repeat/
+/tmp/minicpmo-cfm3-deferred-eos-i5.log
+```

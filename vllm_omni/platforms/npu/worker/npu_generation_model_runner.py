@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import time
 from collections.abc import Mapping
 from copy import copy, deepcopy
@@ -52,11 +51,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
-        self._pinned_mm_output_d2h = os.environ.get(
-            "VLLM_OMNI_NPU_PINNED_MM_OUTPUT_D2H",
-            "0",
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        self._pinned_mm_output_d2h_used = False
         #  -------------------------------------- Omni-new -------------------------------------------------
         # Mirrors the init allowlist in gpu_generation_model_runner.py. The
         # connector-role fallback keeps consumer stages whose arch is not on the
@@ -82,46 +76,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 model_config=self.model_config,
             )
         #  -------------------------------------- Omni-new -------------------------------------------------
-
-    def _copy_multimodal_output_to_cpu(self, output: torch.Tensor) -> torch.Tensor:
-        """Copy an NPU output through pinned host memory when opted in.
-
-        Generation stages must hand CPU tensors to EngineCore IPC.  A direct
-        pageable ``Tensor.to('cpu')`` synchronizes the producer stream and
-        pays pageable registration on every audio chunk.  Pinned destination
-        storage gives CANN a real asynchronous D2H target; synchronizing the
-        dedicated copy stream preserves the existing ready-on-return contract.
-        """
-        detached = output.detach()
-        if (
-            not self._pinned_mm_output_d2h
-            or detached.device.type != "npu"
-            or detached.numel() * detached.element_size() < 4096
-        ):
-            return detached.to("cpu").contiguous()
-
-        host = torch.empty(
-            detached.shape,
-            dtype=detached.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
-        producer = torch.npu.current_stream(device=detached.device)
-        copy_stream = self.async_output_copy_stream
-        copy_stream.wait_stream(producer)
-        with torch.npu.stream(copy_stream):
-            host.copy_(detached, non_blocking=True)
-        copy_stream.synchronize()
-        if not self._pinned_mm_output_d2h_used:
-            logger.info(
-                "NPU generation pinned multimodal-output D2H active: "
-                "shape=%s dtype=%s bytes=%d",
-                tuple(detached.shape),
-                detached.dtype,
-                detached.numel() * detached.element_size(),
-            )
-            self._pinned_mm_output_d2h_used = True
-        return host.contiguous()
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
@@ -546,16 +500,14 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             )
             assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                per_req_payloads.append(
-                    {"model_outputs": self._copy_multimodal_output_to_cpu(multimodal_outputs_raw[i])}
-                )
+                per_req_payloads.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
         elif isinstance(multimodal_outputs_raw, list):
             assert len(multimodal_outputs_raw) == 1, (
                 "model should return a single list, to return multiple lists, use a dict"
             )
             for out in multimodal_outputs_raw:
                 per_req_payloads.append(
-                    {"model_outputs": self._copy_multimodal_output_to_cpu(out) if out is not None else None}
+                    {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
         elif isinstance(multimodal_outputs_raw, Mapping):
             num_reqs = self.input_batch.num_reqs
@@ -568,9 +520,9 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                                 f"Multimodal output list for key '{key}' has length {len(out)} "
                                 f"but expected {num_reqs} (one entry per request)."
                             )
-                        mm_payload[key] = self._copy_multimodal_output_to_cpu(out[i])
+                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
                     elif isinstance(out, torch.Tensor):
-                        mm_payload[key] = self._copy_multimodal_output_to_cpu(out)
+                        mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:
                         logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
                 per_req_payloads.append(_ensure_tensor_values(mm_payload))

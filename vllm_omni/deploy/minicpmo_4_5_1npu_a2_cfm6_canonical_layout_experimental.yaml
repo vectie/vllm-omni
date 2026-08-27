@@ -64,6 +64,10 @@ platforms:
           enable_prefix_caching: true
           disable_hybrid_kv_cache_manager: true
         additional_config:
+          # A2's default binder assumes one worker per NPU. This profile
+          # co-locates all three Omni stages on one chip; binding every worker
+          # to the same local pool regresses hot RTF through CPU contention.
+          enable_cpu_binding: false
           ascend_compilation_config:
             fuse_norm_quant: false
         compilation_config:
@@ -74,6 +78,7 @@ platforms:
         max_num_seqs: 1
         kv_cache_memory_bytes: 268435456  # 256 MiB
         additional_config:
+          enable_cpu_binding: false
           ascend_compilation_config:
             fuse_norm_quant: false
         compilation_config:
@@ -87,3 +92,5 @@ platforms:
         env:
           VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND: "auto"
           VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM: "1"
+        additional_config:
+          enable_cpu_binding: false

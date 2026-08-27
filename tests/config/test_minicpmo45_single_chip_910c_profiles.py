@@ -215,3 +215,142 @@ def test_a2_minimum_solver_first_path_still_retains_cfm6_steady_policy():
     assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS"] == "1"
     assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS"] == "1"
     assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("name", "prompt_steps", "initial_steps"),
+    [
+        (
+            "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt2_cfm4_fused_ffn_experimental.yaml",
+            "2",
+            "4",
+        ),
+        (
+            "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_experimental.yaml",
+            "1",
+            "1",
+        ),
+    ],
+)
+def test_a2_low_ttfp_fused_ffn_profiles_compose_first_and_steady_paths(
+    name: str,
+    prompt_steps: str,
+    initial_steps: str,
+):
+    deploy = _load_profile(name)
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert extra["token2wav_n_timesteps"] == 6
+    assert stage1.env["VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"] == "10"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS"] == prompt_steps
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS"] == initial_steps
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_BF16_FFN"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+
+
+def test_a2_prompt1_fused_ffn_disables_overlapping_single_chip_cpu_binding():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_experimental.yaml"
+    )
+
+    assert all(
+        stage.engine_extras["additional_config"]["enable_cpu_binding"] is False
+        for stage in deploy.stages
+    )
+
+
+def test_a2_chunk50_profile_uses_static_width_100_after_first_packet():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_chunk50_experimental.yaml"
+    )
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert extra["initial_codec_chunk_frames"] == 10
+    assert extra["codec_chunk_frames"] == 50
+    assert extra["npu_dit_mlp_graph_width"] == 100
+    assert extra["npu_dit_graph_buckets"] == [20, 50, 302]
+    assert extra["token2wav_n_timesteps"] == 6
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_BF16_FFN"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_SLOTS"] == "1"
+
+
+def test_a2_chunk50_eager_diagnostic_changes_only_outer_cfm_capture():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_chunk50_eager_diagnostic.yaml"
+    )
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert extra["initial_codec_chunk_frames"] == 10
+    assert extra["codec_chunk_frames"] == 50
+    assert extra["npu_dit_mlp_graph_width"] == 100
+    assert extra["npu_cfm_fixed_kv_slabs"] is True
+    assert extra["npu_dit_conv_mlp_graph"] is True
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "0"
+
+
+def test_a2_talker_static_kernel_is_scoped_to_fixed_shape_stage_one():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_static_kernel_experimental.yaml"
+    )
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    stage1_compile = stage1.engine_extras["additional_config"][
+        "ascend_compilation_config"
+    ]
+    assert stage1_compile["enable_npugraph_ex"] is True
+    assert stage1_compile["enable_static_kernel"] is True
+    assert stage1_compile["fuse_norm_quant"] is False
+    assert stage1.engine_extras["additional_config"]["enable_cpu_binding"] is False
+    assert stage0.engine_extras["additional_config"]["ascend_compilation_config"].get(
+        "enable_static_kernel", False
+    ) is False
+    assert stage0.engine_extras["additional_config"]["enable_cpu_binding"] is False
+    assert stage2.engine_extras["additional_config"]["enable_cpu_binding"] is False
+
+
+def test_a2_talker_nz_preformats_only_stage_one_bf16_weights():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_experimental.yaml"
+    )
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.engine_extras["additional_config"]["weight_nz_mode"] == 2
+    assert stage1.engine_extras["additional_config"]["enable_cpu_binding"] is False
+    assert "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH" not in stage1.env
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"] == "1"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"] == "10"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"] == "1"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES"] == "25"
+    assert "weight_nz_mode" not in stage0.engine_extras["additional_config"]
+    assert stage0.engine_extras["additional_config"]["enable_cpu_binding"] is False
+    assert stage2.engine_extras["additional_config"]["enable_cpu_binding"] is False
+
+
+def test_a2_talker_nz_profiler_is_isolated_from_cfm_graph_process():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_profile.yaml"
+    )
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage0.profiler_config is None
+    assert stage1.profiler_config["profiler"] == "torch"
+    assert stage1.profiler_config["torch_profiler_record_shapes"] is True
+    assert stage1.profiler_config["torch_profiler_with_memory"] is False
+    assert stage1.profiler_config["torch_profiler_with_stack"] is False
+    assert stage2.profiler_config is None
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"

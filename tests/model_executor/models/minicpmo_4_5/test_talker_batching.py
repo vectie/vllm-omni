@@ -70,6 +70,65 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     return talker
 
 
+def test_talker_batches_codec_transport_at_initial_and_steady_boundaries(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "2")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "3")
+    talker = _make_talker()
+    talker.batched_codec_output = True
+
+    def push(code: int, *, finished: bool = False) -> torch.Tensor:
+        return talker._transport_codec_delta(
+            "req-batched-output",
+            torch.tensor([[code]], dtype=torch.long),
+            finished=finished,
+            native_duplex=False,
+        )
+
+    assert push(1).numel() == 0
+    assert push(2).tolist() == [[1, 2]]
+    assert push(3).numel() == 0
+    assert push(4).numel() == 0
+    assert push(5).tolist() == [[3, 4, 5]]
+    assert push(6).numel() == 0
+    flushed = talker._transport_codec_delta(
+        "req-batched-output",
+        torch.empty((0, 1), dtype=torch.long),
+        finished=True,
+        native_duplex=False,
+    )
+    assert flushed.tolist() == [[6]]
+
+
+def test_talker_marks_only_publishable_codec_chunks_as_sparse_output(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "2")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "3")
+    talker = _make_talker()
+    talker.batched_codec_output = True
+    samples = iter((torch.tensor(3), torch.tensor(4)))
+    monkeypatch.setattr(talker, "_sample_audio_code", lambda *_args: next(samples))
+    info = {
+        "request_id": "req-sparse-output",
+        "audio_state": {"step": 0, "min_tokens": 50, "max_tokens": 64},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    first = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+    second = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+
+    assert first.multimodal_outputs["meta"]["req_id"] == []
+    assert first.multimodal_outputs["codes"]["audio"] == []
+    assert second.multimodal_outputs["meta"]["req_id"] == ["req-sparse-output"]
+    assert second.multimodal_outputs["codes"]["audio"][0].tolist() == [[3, 4]]
+
+
 def _routed(output, index: int):
     return to_payload_element(
         output.multimodal_outputs,

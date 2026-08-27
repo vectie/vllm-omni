@@ -148,6 +148,50 @@ def test_fixed_slab_cfm_graph_phase_is_shape_strict(
     ) == expected
 
 
+def test_fixed_kv_slabs_reserve_one_configured_steady_append():
+    attention = torch.zeros((6, 16, 2, 2, 302, 512))
+    cnn = torch.zeros((6, 16, 2, 1024, 2))
+
+    slabs = BatchedToken2Wav._make_fixed_estimator_kv_slabs(
+        attention,
+        cnn,
+        302,
+        steady_width=100,
+    )
+
+    assert slabs is not None
+    assert slabs.retained.shape[-2] == 402
+    assert slabs.append.shape[-2] == 502
+
+
+def test_dit_conv_mlp_admits_static_width_100():
+    conv_layers = nn.ModuleList([nn.Identity() for _ in range(7)])
+    conv_layers[1] = nn.Conv1d(512, 512, kernel_size=3)
+    conv_layers[6] = nn.Conv1d(512, 512, kernel_size=3)
+    block = SimpleNamespace(
+        training=False,
+        conv=SimpleNamespace(block=conv_layers),
+        norm2=nn.LayerNorm(512, eps=1e-6, elementwise_affine=False),
+        mlp=SimpleNamespace(
+            fc1=nn.Linear(512, 2048),
+            fc2=nn.Linear(2048, 512),
+        ),
+    )
+
+    assert BatchedToken2Wav._dit_conv_mlp_compatible(block, 100)
+
+
+def test_cfm_graph_slot_count_is_bounded(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_SLOTS", raising=False)
+    assert BatchedToken2Wav._npu_cfm_graph_slot_count() == 2
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_SLOTS", "1")
+    assert BatchedToken2Wav._npu_cfm_graph_slot_count() == 1
+
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_SLOTS", "99")
+    assert BatchedToken2Wav._npu_cfm_graph_slot_count() == 2
+
+
 def test_cache_fill_cfm_graph_is_opt_in(monkeypatch):
     monkeypatch.delenv(
         "VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH",

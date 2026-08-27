@@ -3645,7 +3645,11 @@ class BatchedToken2Wav(nn.Module):
 
     @staticmethod
     def _dit_conv_mlp_compatible(block: nn.Module, width: int) -> bool:
-        return width in (50, 64) and BatchedToken2Wav._dit_conv_mlp_layout_compatible(block)
+        # Width 100 is the two-second steady streaming bucket used by the
+        # single-chip latency/throughput profile.  The causal-pack and GE MLP
+        # partitions are shape-polymorphic at compile time; each admitted
+        # width still receives its own static executable.
+        return width in (50, 64, 100) and BatchedToken2Wav._dit_conv_mlp_layout_compatible(block)
 
     @staticmethod
     def _dit_post_attention_compatible(block: nn.Module, width: int) -> bool:
@@ -5211,7 +5215,11 @@ class BatchedToken2Wav(nn.Module):
                 if block_cnn_cache is None:
                     block_cnn_cache = hidden.new_zeros(
                         (hidden.shape[0], 2, 1024)
-                        if self._npu_dit_cache_major_enabled and int(hidden.shape[1]) == 50
+                        if (
+                            self._npu_dit_cache_major_enabled
+                            and int(hidden.shape[1])
+                            == self._npu_dit_mlp_graph_width
+                        )
                         else (hidden.shape[0], 1024, 2)
                     )
                 conv1_weight = (
@@ -6043,6 +6051,24 @@ class BatchedToken2Wav(nn.Module):
             )
             return 4
 
+    @staticmethod
+    def _npu_cfm_graph_slot_count() -> int:
+        """Return the number of fixed-address output sets per steady graph.
+
+        The width-50 path retains the proven two-slot default. Wider chunks
+        can select one slot to avoid capturing a second, very large attention
+        workspace when Stage 2 executes requests synchronously.
+        """
+        raw = os.environ.get("VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_SLOTS", "2")
+        try:
+            return max(1, min(2, int(raw)))
+        except ValueError:
+            logger.warning(
+                "Invalid VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_SLOTS=%r; using 2",
+                raw,
+            )
+            return 2
+
     def _decode_cfm(
         self,
         mu: torch.Tensor,
@@ -6121,8 +6147,13 @@ class BatchedToken2Wav(nn.Module):
         key = tuple(self._optional_tensor_signature(value) for value in inputs)
         entry = self._npu_cfm_graphs.get(key)
         # Cache-fill shapes execute once per request, so one persistent output
-        # set is safe. Only repetitive steady state uses ping-pong outputs.
-        slot_count = 2 if graph_phase == "steady" else 1
+        # set is safe. Steady state uses the configured single or ping-pong
+        # output policy; the proven width-50 default remains two slots.
+        slot_count = (
+            self._npu_cfm_graph_slot_count()
+            if graph_phase == "steady"
+            else 1
+        )
         if entry is not None and len(entry["slots"]) >= slot_count:
             self._npu_cfm_graphs.move_to_end(key)
             slot_index = int(entry["next_slot"])
@@ -6370,6 +6401,7 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor,
         prompt_length: int,
         *,
+        steady_width: int = 50,
         planar: bool = False,
         bsh_attention: bool = False,
         cnn_cache_major: bool = False,
@@ -6399,8 +6431,18 @@ class BatchedToken2Wav(nn.Module):
                 logical_length,
             )
             return None
+        # Keep the exact prompt+100 rolling history policy, but size the
+        # separate output workspace for one complete configured steady
+        # append.  Width-50 retains the historical prompt+150 allocation;
+        # width-100 needs prompt+200 so graph destinations never change
+        # address or fall back to a dynamic output on every large chunk.
+        append_width = max(50, int(steady_width))
         retained_shape = (*cache.shape[:-2], prompt_length + 100, cache.shape[-1])
-        append_shape = (*cache.shape[:-2], prompt_length + 150, cache.shape[-1])
+        append_shape = (
+            *cache.shape[:-2],
+            prompt_length + 100 + append_width,
+            cache.shape[-1],
+        )
         retained = cache.new_empty(retained_shape)
         append = cache.new_empty(append_shape)
         retained[..., :logical_length, :].copy_(cache)
@@ -6509,6 +6551,7 @@ class BatchedToken2Wav(nn.Module):
                     row["estimator_att_cache"],
                     row["estimator_cnn_cache"],
                     prompt_length,
+                    steady_width=self._npu_dit_mlp_graph_width,
                     planar=self._npu_cfm_planar_kv_slabs_enabled,
                     bsh_attention=self._npu_dit_bsh_attention_enabled,
                     cnn_cache_major=(
@@ -6620,7 +6663,8 @@ class BatchedToken2Wav(nn.Module):
                         1 - fixed_slabs.active_cnn_bank
                     ]
                     steady_graph = (
-                        int(hidden.shape[1]) == 50
+                        int(hidden.shape[1])
+                        == self._npu_dit_mlp_graph_width
                         and fixed_slabs.logical_length
                         == fixed_slabs.prompt_length + 100
                     )

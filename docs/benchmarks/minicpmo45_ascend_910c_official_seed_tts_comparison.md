@@ -5484,3 +5484,180 @@ and Video-MME validation before replacing the submission profile.
 /tmp/lunanexa-bench/talker-low-ttfp-i5-eager-cfm4-smoke/
 /tmp/minicpmo-low-ttfp-prompt2-cfm4.log
 ```
+
+## A2 main-bottleneck isolation and Talker producer-consumer fusion
+
+Fresh hot-stage timestamps on the single-chip 910B4/A2 host changed the
+optimization priority.  For a representative resident request, Stage 0 took
+about 64 ms, Stage 1 completed at about 1,195 ms, and Stage 2 completed at
+about 1,627 ms.  The incremental Code2Wav cost was therefore about 431 ms,
+while the autoregressive Talker consumed about 73% of hot end-to-end latency.
+Talker emitted roughly 120--160 codec tokens at about 9 ms/token.  This makes
+another isolated Stage-2 microkernel the wrong main target: even eliminating
+ten percent of Stage 2 would save only about 43 ms, whereas every millisecond
+removed from the Talker loop is repeated more than one hundred times.
+
+Several plausible lower-layer candidates were screened with the same two
+warmups, ten fixed English Seed-TTS requests, concurrency one, and identical
+54.00 seconds / 1,296,000 output frames:
+
+| Stage-1 candidate | Mean RTF | Audio TTFP | TTFT | E2E | Decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| NZ BF16 weights (`weight_nz_mode=2`) | 0.307868 | 352.10 ms | 79.55 ms | 1,617.03 ms | retained control |
+| Static kernel + NPUGraph-ex | 0.311524 | 351.41 ms | 75.90 ms | 1,636.56 ms | reject |
+| Explicit FULL_DECODE_ONLY | 0.310824 | 352.54 ms | 79.85 ms | 1,634.76 ms | redundant/reject |
+| Device-resident EOS branch | 0.312021 | 353.88 ms | 75.99 ms | 1,640.17 ms | reject |
+
+Lower is better.  The explicit decode profile was redundant because the A2
+single-chip producer policy already resolves Stage 1 to
+`FULL_DECODE_ONLY` with capture size one.  Device EOS was slower because the
+next autoregressive token already depends on the sampled codec token: its host
+scalar decision is not an independent bubble, and the extra compare/where
+operators cost more than the avoided scalar read.  The static-kernel result
+also confirms that a more opaque executable is not automatically faster when
+it reduces GE's scheduling freedom.  Only NZ weight preformatting survived the
+whole-service gate.
+
+The first structural experiment appended the complete codec continuation to
+the Talker graph: the `768 -> 6562` head, repetition penalty, bounded
+top-k/top-p, inverse-CDF draw, and frequency update. TorchAir produced a new
+Stage-1 cache hash and captured full decode successfully. A one-shot log also
+proved that real requests consumed its fused sample rather than a fallback.
+Nevertheless, it was decisively slower: the first request took 60.73 seconds
+and the immediately following resident request still took 9.89 seconds for
+3.88 seconds of output, compared with 1.617 seconds mean E2E for the NZ
+control. Putting vocabulary-wide `pow`, top-k, prefix-sum and sampling into the
+large Llama GE graph destroyed the efficient small-batch decode schedule. The
+experiment was removed rather than hidden behind the submission profile.
+
+The narrower follow-up appended only the `768 -> 6562` codec head and
+temperature scaling. They wrote one fixed-address FP32 logits row, which the
+proven small inverse-CDF NPUGraph consumed directly. Even this boundary was
+too opaque: after the first 61.85-second lazy-capture request, the immediately
+following resident request still took 9.64 seconds for 4.88 seconds of audio.
+The result is essentially the same six-fold regression as the complete-tail
+fusion. The large external-buffer write, not only top-k, prevents GE from
+preserving the efficient batch-one Llama decode schedule. This candidate and
+its environment flag were removed as well.
+
+A final boundary check returned the head logits as an ordinary two-tensor
+model output instead of mutating an external buffer. This allowed GE to see
+the producer value and the small sampler graph copied the row as a regular
+input. It still measured 61.34 seconds on the first lazy-capture request and
+9.56 seconds hot for the same 4.88-second waveform. Therefore the regression
+is not specific to an opaque side effect: extending this FULL_DECODE graph
+with the large head itself changes the batch-one executable unfavorably. The
+tuple-output candidate was removed too.
+
+The retained architecture therefore keeps the Llama full-decode graph and the
+roughly 0.30 ms/token inverse-CDF sampler graph separate. The next material
+Talker gain must be graph-visible fusion inside the Llama producer-consumer
+chain, or a trained multi-code/speculative head; another side-effecting custom
+boundary is not a viable route on this A2 stack.
+
+### Hot Talker trace: launch bubbles, then slot mapping
+
+A Stage-1-only `torch_npu.profiler` trace of one warmed 120-code request
+resolved the next optimization level. Profiling was initialized only in the
+Talker process; Stage 2 retained its normal fixed CFM NPUGraph because an
+auxiliary profiler stream in that process invalidates capture on this CANN
+release. The trace covered a 1.402-second device window, of which only
+230.708 ms was device compute and 1.171 seconds was free. Thus 83.5% of the
+Talker device window was idle rather than arithmetic. The 120 identical main
+decode bursts each contained 201 kernels, spanned 4.356 ms on average, and
+started 11.229 ms apart. Their summed kernel time was only 1.449 ms per code.
+
+Within the compute budget, MatMulV2 used 101.399 ms (43.95%), fused infer
+attention 47.761 ms (20.70%), and the generic slot-mapping kernel 22.814 ms
+(9.89%). The slot kernel ran 121 times at 188.54 us average. Host attribution
+also showed 130.800 ms in 2,420 fused-attention dispatches, 92.376 ms in 4,078
+copies, 37.890 ms in event recording, and 28.301 ms in event synchronization.
+This confirms two different budgets: the immediate safe target is the
+oversized metadata kernel; the larger architectural target is eliminating
+per-layer/per-code host dispatch through a multi-code or device-loop Talker
+executable.
+
+The first candidate replaced only the batch-one, one-token, non-DCP slot
+calculation with a fixed-address NPUGraph. It dynamically indexed the stable
+block table from the stable position buffer and wrote slot zero; prefill,
+batching, DCP, graph nesting, and address changes fell back to the canonical
+Triton kernel. On the same A2, its isolated 500-replay microbenchmark was
+2.09x faster. The service-level Stage-1 ITL nevertheless regressed from
+8.752 ms to 9.097 ms, so the candidate and its profile flag were removed.
+This is another example of a locally faster boundary losing more in launch and
+graph interaction than it saves in arithmetic.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/talker-nz-official10/
+/tmp/lunanexa-bench/talker-static-kernel-official10/
+/tmp/lunanexa-bench/talker-full-decode-official10/
+/tmp/lunanexa-bench/talker-device-eos-official10/
+/tmp/lunanexa-bench/talker-fused-continuation-smoke3/
+/tmp/lunanexa-bench/talker-fused-continuation-smoke4/
+/tmp/minicpmo-talker-fused-continuation-v3.log
+/tmp/lunanexa-bench/talker-fused-head-smoke-corrected1/
+/tmp/lunanexa-bench/talker-fused-head-smoke-corrected2/
+/tmp/minicpmo-talker-fused-head-v2.log
+/tmp/lunanexa-bench/talker-head-output-smoke1/
+/tmp/lunanexa-bench/talker-head-output-smoke2/
+/tmp/minicpmo-talker-head-output.log
+/tmp/lunanexa-bench/talker-nz-torch-profile-hot/
+/tmp/vllm-omni-profiles/minicpmo45/a2-talker-nz-stage1/
+```
+
+### Main-bottleneck result: publish codec payloads at chunk boundaries
+
+The hot trace showed that the dominant Stage-1 cost was not a single compute
+kernel: the NPU was idle for 83.5% of the measured window. The retained change
+therefore removes per-code framework work rather than adding another isolated
+kernel. Previously every generated codec code caused `make_omni_output` to
+publish one NPU scalar, the NPU runner to build a CPU multimodal payload and
+copy an unused 768-wide hidden row, and the engine to create a downstream
+connector task. Code2Wav cannot consume those single-code messages: after its
+initial ten codes it works in 25-code chunks.
+
+The new Talker path accumulates the exact sampled codec values on device and
+publishes only at the initial 10-code boundary, each subsequent 25-code
+boundary, and the terminal tail. Sparse output metadata lets the NPU runner
+skip payload construction and connector routing on all other decode steps.
+For the MiniCPM-o Talker, the unused hidden-state transfer is also omitted.
+A typical 120-code response consequently creates about five downstream
+payloads instead of about 120. Sampling, the codec sequence, CFM steps, HiFT,
+and audio chunk boundaries are unchanged.
+
+Two independent official-shape runs used two warmups followed by ten measured
+requests at concurrency one. Lower is better for every value in this table.
+
+| Candidate | Mean RTF | P99 RTF | Mean TTFP (ms) | Mean TTFT (ms) | Mean E2E (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous retained baseline | 0.307868 | 0.386839 | 352.10 | 79.55 | 1617.03 |
+| Chunk-boundary payload run 1 | 0.302844 | 0.383994 | 352.89 | 79.63 | 1589.46 |
+| Chunk-boundary payload run 2 | 0.298986 | 0.379363 | 349.21 | 79.26 | 1569.91 |
+| Two-run mean | **0.300915** | - | - | - | - |
+
+The two-run mean RTF is 2.26% lower than the previous retained baseline. The
+repeat run is 2.89% lower in mean RTF and E2E, while TTFP is 0.82% lower and
+TTFT is 0.36% lower. Its ten-request Stage-1 mean ITL was 8.593 ms, 1.82%
+lower than the 8.752-ms control. Both runs produced all 1,296,000 expected
+frames for 54 seconds of reference duration with 100% chunk continuity.
+
+Two more transport experiments were rejected. Reusing sampled-token transport
+storage changed output duration between otherwise identical requests and only
+reduced ITL by about 0.24%. Copying outputs on a separate NPU stream increased
+hot ITL to 8.948--9.118 ms. Neither implementation remains in the candidate.
+
+This optimization is sequence-preserving by construction, and the focused
+batching, sparse-publication, cleanup, configuration, and syntax checks pass.
+Formal submission acceptance still requires the official TTS-Seed WER/SIM
+gate; the local continuity and frame-count checks are not a substitute for
+that evaluator.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/talker-batched-codec-v2-official10/
+/tmp/lunanexa-bench/talker-batched-codec-v2-official10-repeat/
+/tmp/minicpmo-talker-batched-codec-v2.log
+```

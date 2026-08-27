@@ -47,6 +47,9 @@ _CODEC_MIN_TOKENS = 50
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 _NPU_BOUNDED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_BOUNDED_CODEC_SAMPLER"
 _NPU_CODEC_SAMPLER_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"
+_NPU_BATCHED_CODEC_OUTPUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
+_CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES"
+_INITIAL_CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
@@ -285,6 +288,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._npu_codec_sampler_graphs: dict[bool, dict[str, Any]] = {}
         self._npu_codec_sampler_graph_pool: Any | None = None
         self._npu_codec_sampler_graph_disabled = False
+        # Code2Wav consumes codec chunks, not Talker's per-token hidden row.
+        # Batch codec scalars on-device so the NPU runner performs one D2H per
+        # publishable chunk instead of one D2H for every autoregressive step.
+        self.batched_codec_output = _env_enabled(
+            _NPU_BATCHED_CODEC_OUTPUT_ENV,
+            default=False,
+        )
+        self.omni_pooler_payload_include_hidden = not self.batched_codec_output
+        self._request_transport_codes: dict[str, list[torch.Tensor]] = {}
+        self._request_transport_chunks: dict[str, int] = {}
 
         tts_config = getattr(config, "tts_config", None)
         if tts_config is None and getattr(config, "model_type", None) == "minicpmtts":
@@ -832,6 +845,51 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return False
         return int(sampled.item()) == self._num_audio_tokens - 1
 
+    def _transport_codec_delta(
+        self,
+        request_id: str,
+        delta: torch.Tensor,
+        *,
+        finished: bool,
+        native_duplex: bool,
+    ) -> torch.Tensor:
+        """Coalesce one-code NPU outputs into the chunks Code2Wav consumes."""
+        if not getattr(self, "batched_codec_output", False) or native_duplex:
+            return delta
+
+        pending_by_request = getattr(self, "_request_transport_codes", None)
+        if pending_by_request is None:
+            pending_by_request = {}
+            self._request_transport_codes = pending_by_request
+        chunks_by_request = getattr(self, "_request_transport_chunks", None)
+        if chunks_by_request is None:
+            chunks_by_request = {}
+            self._request_transport_chunks = chunks_by_request
+
+        pending = pending_by_request.setdefault(request_id, [])
+        if delta.numel():
+            # The codec sampler graph reuses its output address. Own each code
+            # until the current output slab is published.
+            pending.append(delta.reshape(-1).clone())
+
+        chunk_index = chunks_by_request.get(request_id, 0)
+        default_chunk = max(1, int(os.environ.get(_CODEC_CHUNK_FRAMES_ENV, "25")))
+        initial_chunk = max(
+            1,
+            int(os.environ.get(_INITIAL_CODEC_CHUNK_FRAMES_ENV, str(default_chunk))),
+        )
+        threshold = initial_chunk if chunk_index == 0 else default_chunk
+        pending_count = sum(int(item.numel()) for item in pending)
+        if not finished and pending_count < threshold:
+            return delta.new_empty((0, 1))
+        if not pending:
+            return delta.new_empty((0, 1))
+
+        output = torch.cat(pending).reshape(1, -1)
+        pending.clear()
+        chunks_by_request[request_id] = chunk_index + 1
+        return output
+
     def make_omni_output(
         self,
         model_outputs: torch.Tensor | OmniOutput,
@@ -856,6 +914,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         stop_rows: list[torch.Tensor] = []
         codec_deltas: list[torch.Tensor] = []
         terminal_flags: list[torch.Tensor] = []
+        finished_rows: list[bool] = []
+        output_request_ids: list[str] = []
         native_duplex_flags: list[torch.Tensor] = []
         duplex_epochs: list[torch.Tensor] = []
         duplex_turn_ids: list[torch.Tensor] = []
@@ -864,6 +924,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
+            request_id = str(info_dict.get("request_id", index))
+            output_request_ids.append(request_id)
             native_duplex = info_dict.get("native_duplex") is True
             if emit_duplex_metadata:
                 duplex_info = info_dict.get("duplex")
@@ -910,6 +972,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                finished_rows.append(False)
                 continue
             start, end = spans[index]
             end = min(int(end), int(hidden.shape[0]))
@@ -917,8 +980,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                finished_rows.append(False)
                 continue
-            request_id = str(info.get("request_id", index))
             request_states = getattr(self, "_request_audio_states", None)
             if request_states is None:
                 request_states = {}
@@ -931,6 +994,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 stop_rows.append(hidden.new_tensor([float("-inf"), 0.0]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                finished_rows.append(False)
                 continue
             if not sample_eligible[index]:
                 # vLLM computes a logit row for incomplete chunked prefills but
@@ -939,6 +1003,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                finished_rows.append(False)
                 continue
             codes = state.get("codes")
             if not isinstance(codes, torch.Tensor):
@@ -967,6 +1032,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 delta = sampled.reshape(1, 1)
             else:
                 delta = empty_delta
+            delta = self._transport_codec_delta(
+                request_id,
+                delta,
+                finished=finished,
+                native_duplex=native_duplex,
+            )
             state["codes"] = codes
             info["audio_state"] = state
             info["audio_codes"] = {
@@ -975,6 +1046,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             }
             codec_deltas.append(delta)
             terminal_flags.append(torch.tensor(finished, dtype=torch.bool))
+            finished_rows.append(finished)
             stop_rows.append(hidden.new_tensor([float("-inf"), 0.0] if finished else [0.0, float("-inf")]))
 
         self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
@@ -995,6 +1067,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "codes": {"audio": codec_deltas},
             "meta": meta_outputs,
         }
+        if getattr(self, "batched_codec_output", False):
+            emit_indices = [
+                index
+                for index, delta in enumerate(codec_deltas)
+                if delta.numel() or finished_rows[index]
+            ]
+            multimodal_outputs["codes"]["audio"] = [
+                codec_deltas[index] for index in emit_indices
+            ]
+            sparse_meta = {
+                key: [values[index] for index in emit_indices]
+                for key, values in meta_outputs.items()
+            }
+            sparse_meta["req_id"] = [output_request_ids[index] for index in emit_indices]
+            sparse_meta["sparse_audio"] = ["1"]
+            multimodal_outputs["meta"] = sparse_meta
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=multimodal_outputs,
@@ -1005,10 +1093,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     def _flush_deferred_cleanup(self) -> None:
         request_audio_states = getattr(self, "_request_audio_states", {})
+        transport_codes = getattr(self, "_request_transport_codes", {})
+        transport_chunks = getattr(self, "_request_transport_chunks", {})
         for request_id in self._deferred_cleanup_ids:
             self._request_generators.pop(request_id, None)
             request_audio_states.pop(request_id, None)
             self._request_repetition_frequencies.pop(request_id, None)
+            transport_codes.pop(request_id, None)
+            transport_chunks.pop(request_id, None)
         self._deferred_cleanup_ids.clear()
 
     def _dummy_hidden_states(

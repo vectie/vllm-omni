@@ -1,0 +1,25 @@
+# Atlas 800I A2 Cube-ready Talker-weight candidate.
+#
+# The BF16 Talker is a small-M, memory/launch-bound decoder. vLLM Ascend's
+# default weight_nz_mode=1 leaves BF16 matrices in ND; mode 2 preformats them
+# as FRACTAL_NZ once during load. This isolates whether removing recurrent
+# weight TransData is more valuable than its internal-format constraints.
+# Keep this separate from static-kernel compilation so each mechanism has a
+# clean official-wrapper A/B result.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES: "10"
+          VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT: "1"
+          VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES: "25"
+        additional_config:
+          enable_cpu_binding: false
+          weight_nz_mode: 2
+          ascend_compilation_config:
+            fuse_norm_quant: false

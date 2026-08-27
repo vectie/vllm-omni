@@ -3099,6 +3099,12 @@ def test_npu_prepare_event_builds_state_and_first_chunk_reuses_it(mocker):
     assert model._states["a"].chunk_seq is None
     assert setup.call_count == 1
 
+    first = _forward(model, [_info("a", 0, [1, 2])], request_ids=["a"])
+
+    assert first.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert model._states["a"].chunk_seq == 0
+    assert setup.call_count == 1
+
 
 def test_prompt_state_cache_reuses_setup_without_aliasing(monkeypatch):
     model, _ = _model()
@@ -3143,7 +3149,7 @@ def test_prompt_state_cache_reuses_setup_without_aliasing(monkeypatch):
 
     assert first.multimodal_outputs["model_outputs"][0].numel() > 0
     assert model._states["a"].chunk_seq == 0
-    assert setup.call_count == 1
+    assert setup_calls == 1
 
 
 def test_prepare_event_carries_exact_reference_and_avoids_default_prompt_setup(mocker):

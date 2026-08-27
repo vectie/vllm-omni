@@ -5822,12 +5822,18 @@ This is the first Talker change in this series that removes the profiled
 twenty-layer control-plane mechanism rather than making each update slightly
 cheaper. It remains an experimental submission candidate until the matched
 official Seed-TTS WER/SIM gate is rerun; the current server lacks `funasr`, so
-the performance run cannot substitute for that accuracy result.
+the performance run cannot substitute for that accuracy result. An export-only
+quality run nevertheless produced 10/10 official utterance-name WAV files with
+zero failures or missing PCM. All files are 24-kHz mono WAV, span 3.28--8.48
+seconds, and total 61.52 seconds, ready for the organizer's `cal_wer.sh` and
+`cal_sim.sh`.
 
 Artifacts:
 
 ```text
 /tmp/lunanexa-bench/talker-stable-pa-official10/
 /tmp/lunanexa-bench/talker-stable-pa-official10-repeat/
+/tmp/lunanexa-bench/talker-stable-pa-export10/
+/tmp/lunanexa-quality/talker-stable-pa-seed10/
 /tmp/minicpmo-talker-stable-pa-host-slab.log
 ```

@@ -6123,3 +6123,44 @@ preserving the efficient one-token Llama executable.
 /tmp/minicpmo-cfm3-deferred-eos-stage1.raw
 /tmp/lunanexa-bench/cfm3-fixed-codec-slabs-official10/
 ```
+
+### Graph-internal codec embedding rejection
+
+An additional Stage-1 candidate connected the standalone inverse-CDF sampler
+to the existing one-token Talker graph through a fixed resident NPU scalar.
+The graph performed the small codec embedding at ingress, while the runner
+skipped its ordinary Python decode preprocess, eager embedding launch and
+`inputs_embeds` copy.  The vocabulary-wide codec head deliberately remained
+outside the Talker graph because the earlier fused-head experiment was much
+slower.
+
+The implementation passed its focused fixed-address and graph-switch tests,
+and both measured runs completed 10/10 requests with 100% streaming
+continuity.  It nevertheless failed the determinism and performance gates:
+
+| Variant | Aggregate RTF | Mean reported RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Retained deferred EOS | **0.171280** | - | **267.86 ms** | **79.47 ms** | 1023.84 ms | 59.80 s |
+| Internal embedding run 1 | 0.170075 | 0.173272 | 276.73 ms | 79.94 ms | 1012.46 ms | 59.56 s |
+| Internal embedding run 2 | 0.172009 | 0.175373 | 271.09 ms | 79.82 ms | **982.02 ms** | 57.12 s |
+
+Aggregate RTF is serving duration divided by generated audio duration; lower
+is better.  Its marginal movement changed sign across repeats, while TTFP
+regressed in both runs.  More importantly, the same ten prompts, seed zero and
+temperature zero produced different total frame counts in all three rows.
+The candidate's resident sampled-code scalar crosses the asynchronous engine
+state boundary and can be overwritten before every downstream consumer has
+materialized the prior value.  This is not a safe fixed-address ABI even
+though the next Talker replay itself reads the correct address.  The code and
+profile were removed rather than retaining a nondeterministic fast path.
+
+The result narrows the next architecture change: a multi-code device loop must
+own sampling, history, EOS and the repeated Talker invocation together.  A
+single mutable tensor cannot be exported through the current per-step engine
+contract as both graph input and scheduler-visible request state.
+
+```text
+/tmp/lunanexa-bench/internal-codec-embed-official10/
+/tmp/lunanexa-bench/internal-codec-embed-official10-repeat/
+/tmp/minicpmo-cfm3-internal-codec-embed.log
+```

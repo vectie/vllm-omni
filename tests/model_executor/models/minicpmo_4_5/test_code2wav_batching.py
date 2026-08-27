@@ -45,6 +45,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_cfm_integration_dtype,
     _npu_initial_cfm_timesteps,
     _npu_prompt_cfm_timesteps,
+    _npu_prompt_cache_max_frames,
     _npu_cfm_planar_kv_slabs_enabled,
     _npu_cfm_stacked_cache_out_enabled,
     _npu_dit_attn_cache_out_enabled,
@@ -488,6 +489,42 @@ def test_prompt_cfm_solver_is_opt_in_and_range_checked(monkeypatch) -> None:
     )
     with pytest.raises(ValueError, match=r"integer in \[1, 6\]"):
         _npu_prompt_cfm_timesteps(6)
+
+
+def test_prompt_cache_limit_is_opt_in_and_range_checked(monkeypatch) -> None:
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_PROMPT_CACHE_MAX_FRAMES",
+        raising=False,
+    )
+    assert _npu_prompt_cache_max_frames() is None
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_PROMPT_CACHE_MAX_FRAMES",
+        "150",
+    )
+    assert _npu_prompt_cache_max_frames() == 150
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_PROMPT_CACHE_MAX_FRAMES",
+        "0",
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        _npu_prompt_cache_max_frames()
+
+
+def test_prompt_cache_limit_preserves_full_conformer_state(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_PROMPT_CACHE_MAX_FRAMES",
+        "2",
+    )
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+
+    assert states[0].flow_cache["estimator_att_cache"].shape[-2] == 2
+    assert states[0].flow_cache["conformer_att_cache"].shape[3] == 4
+    assert prompt.mels.shape[1] == 4
 
 
 def test_reduced_prompt_solver_restores_full_cache_abi(monkeypatch) -> None:

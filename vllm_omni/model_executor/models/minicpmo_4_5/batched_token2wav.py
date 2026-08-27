@@ -71,6 +71,9 @@ _NPU_INITIAL_CFM_TIMESTEPS_ENV = (
 _NPU_PROMPT_CFM_TIMESTEPS_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS"
 )
+_NPU_PROMPT_CACHE_MAX_FRAMES_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_PROMPT_CACHE_MAX_FRAMES"
+)
 _NPU_DIT_BSH_ATTENTION_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_BSH_ATTENTION"
 _NPU_DIT_BSH_ATTENTION_MAX_ABS_DRIFT = 2.0e-2
 _NPU_DIT_BSH_ATTENTION_MEAN_ABS_DRIFT = 2.0e-3
@@ -269,6 +272,26 @@ def _npu_prompt_cfm_timesteps(full_timesteps: int) -> int:
             f"integer in [1, {full_timesteps}]"
         )
     return timesteps
+
+
+def _npu_prompt_cache_max_frames() -> int | None:
+    """Limit only the DiT prompt-cache suffix; preserve full prompt encoding."""
+    raw = os.environ.get(_NPU_PROMPT_CACHE_MAX_FRAMES_ENV)
+    if raw in (None, ""):
+        return None
+    try:
+        frames = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {_NPU_PROMPT_CACHE_MAX_FRAMES_ENV}={raw!r}; expected a "
+            "positive integer"
+        ) from exc
+    if frames <= 0:
+        raise ValueError(
+            f"Invalid {_NPU_PROMPT_CACHE_MAX_FRAMES_ENV}={raw!r}; expected a "
+            "positive integer"
+        )
+    return frames
 
 
 def _npu_cfm_cache_fill_graph_enabled() -> bool:
@@ -2275,6 +2298,8 @@ class BatchedToken2Wav(nn.Module):
         self.prompt_cfm_timesteps = _npu_prompt_cfm_timesteps(
             self.n_timesteps
         )
+        self._npu_prompt_cache_max_frames = _npu_prompt_cache_max_frames()
+        self._npu_prompt_cache_limit_used = False
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
         self.register_buffer(
@@ -6515,10 +6540,33 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=None,
                 att_cache=None,
             )
+            estimator_hidden = hidden
+            estimator_prompt_mels = prompt_mels
+            prompt_cache_limit = self._npu_prompt_cache_max_frames
+            if (
+                prompt_cache_limit is not None
+                and int(hidden.shape[1]) > prompt_cache_limit
+            ):
+                # Preserve full prompt tokenization, Conformer execution and
+                # speaker embedding. Only the suffix admitted to the costly
+                # DiT estimator K/V cache is bounded. The retained hidden rows
+                # have already attended to the complete causal prompt, while
+                # the aligned mel suffix keeps estimator conditioning exact
+                # within the retained region.
+                estimator_hidden = hidden[:, -prompt_cache_limit:, :]
+                estimator_prompt_mels = prompt_mels[:, -prompt_cache_limit:, :]
+                if not self._npu_prompt_cache_limit_used:
+                    logger.info(
+                        "MiniCPM-o bounded DiT prompt cache active: full=%d, "
+                        "retained_suffix=%d; full Conformer and speaker paths preserved",
+                        int(hidden.shape[1]),
+                        prompt_cache_limit,
+                    )
+                    self._npu_prompt_cache_limit_used = True
             _, estimator_cnn, estimator_att = self._decode_cfm(
-                hidden.transpose(1, 2).contiguous(),
+                estimator_hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
-                prompt_mels.transpose(1, 2).contiguous(),
+                estimator_prompt_mels.transpose(1, 2).contiguous(),
                 cnn_cache=None,
                 att_cache=None,
                 num_timesteps=self.prompt_cfm_timesteps,
@@ -6532,7 +6580,7 @@ class BatchedToken2Wav(nn.Module):
                     "prompt_width=%d; live steady chunks retain the full solver",
                     self.prompt_cfm_timesteps,
                     self.n_timesteps,
-                    int(hidden.shape[1]),
+                    int(estimator_hidden.shape[1]),
                 )
                 self._npu_prompt_cfm_used = True
         flow_cache = {
@@ -6544,7 +6592,7 @@ class BatchedToken2Wav(nn.Module):
         split = self._split_flow_cache(flow_cache, batch_size)
         mel_channels = int(prompt_mels.shape[2])
         states: list[BatchedToken2WavState] = []
-        prompt_length = int(features.mels.shape[1])
+        prompt_length = int(estimator_hidden.shape[1])
         for row in split:
             slabs = (
                 self._make_fixed_estimator_kv_slabs(
@@ -6703,7 +6751,15 @@ class BatchedToken2Wav(nn.Module):
                 )
                 self._npu_initial_cfm_used = True
 
-        prompt_len = int(features.mels.shape[1])
+        conformer_prompt_len = int(features.mels.shape[1])
+        estimator_prompt_len = (
+            fixed_slabs.prompt_length
+            if fixed_slabs is not None
+            else min(
+                conformer_prompt_len,
+                self._npu_prompt_cache_max_frames or conformer_prompt_len,
+            )
+        )
         if fixed_slabs is not None:
             fixed_slabs = self._advance_fixed_estimator_kv_slabs(
                 fixed_slabs, estimator_att, estimator_cnn
@@ -6725,14 +6781,20 @@ class BatchedToken2Wav(nn.Module):
                     fixed_slabs.cnn_cache_major,
                 )
                 self._npu_cfm_fixed_kv_slabs_used = True
-        elif estimator_att.shape[-2] > prompt_len + 100:
+        elif estimator_att.shape[-2] > estimator_prompt_len + 100:
             estimator_att = torch.cat(
-                (estimator_att[..., :prompt_len, :], estimator_att[..., -100:, :]),
+                (
+                    estimator_att[..., :estimator_prompt_len, :],
+                    estimator_att[..., -100:, :],
+                ),
                 dim=-2,
             )
-        if conformer_att.shape[3] > prompt_len + 100:
+        if conformer_att.shape[3] > conformer_prompt_len + 100:
             conformer_att = torch.cat(
-                (conformer_att[..., :prompt_len, :], conformer_att[..., -100:, :]),
+                (
+                    conformer_att[..., :conformer_prompt_len, :],
+                    conformer_att[..., -100:, :],
+                ),
                 dim=3,
             )
         new_flow = self._split_flow_cache(

@@ -6559,6 +6559,38 @@ setting `VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT=0` restores CFM6.
 An explicit launch or Stage-2 timestep value still wins over every default.
 The complete 2020-row official pool remains the release gate.
 
+### First-five packet rejection under the official chunk-mean RTF
+
+With CFM1 established, synchronized hot timing measured the default first
+Code2Wav packet at 75.30 ms: 12.77 ms encode, 34.38 ms CFM, 27.85 ms HiFT and
+0.31 ms state publication. Client TTFP was 479.79 ms, leaving about 404.5 ms
+before or around Stage 2, principally the wait for the first 25 Talker codes.
+
+An official-protocol candidate lowered only the first transport boundary to
+five new codes, the HiFT continuity minimum. It completed 32/32 requests,
+retained 100% continuity and 158.60 seconds of audio at concurrency four, and
+passed WER at `0.0102`. At concurrency one it reduced mean TTFP from 455.93 ms
+to **271.47 ms** and P99 TTFP to **280.44 ms**, while E2E was unchanged.
+
+It is nevertheless rejected for the ranked submission. The organizer defines
+RTF as the arithmetic mean over every audio chunk and ranks RTF first. The
+40-ms first packet makes its full request wait the numerator of a very small
+first-chunk denominator. Mean flattened chunk RTF therefore regressed from
+`0.30273` to `1.33619`, despite unchanged whole-audio throughput. This is a
+real scoring consequence, not a throughput regression. A submission-oriented
+first boundary must amortize pre-audio work over a longer packet and preferably
+land on an efficient static Stage-2 width.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-source-default-cfm1-stage2-timing-zh1/
+/tmp/lunanexa-bench/a2-evaluator-source-default-cfm1-stage2-timing-hot-zh1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first5-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first5-official-export-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first5-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-source-default-cfm1-stage2-timing.log
+/tmp/minicpmo-a2-evaluator-cfm1-first5-official-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

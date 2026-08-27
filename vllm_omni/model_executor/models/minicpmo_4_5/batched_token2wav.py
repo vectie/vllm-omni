@@ -956,6 +956,24 @@ def _dit_final_from_modulation_addcmul(
     return output(torch.addcmul(normalized + shift, normalized, scale))
 
 
+def _dit_final_addcmul_drift_limit(dtype: torch.dtype) -> float:
+    """Allow one storage ULP while keeping the FP32 gate unchanged.
+
+    ``addcmul`` and the canonical multiply/add expression round at different
+    points.  Requiring FP32's absolute tolerance from a BF16 graph therefore
+    disables the path for the expected one-ULP difference even though the
+    retained 32-row WER/SIM screen qualified this exact rewrite.  Do not scale
+    the bound with tensor magnitude: one dtype epsilon is the complete extra
+    numerical budget granted to the fused launch.
+    """
+    if dtype in {torch.float16, torch.bfloat16, torch.float32, torch.float64}:
+        return max(
+            _NPU_DIT_FINAL_ADDCMUL_MAX_ABS_DRIFT,
+            float(torch.finfo(dtype).eps),
+        )
+    return _NPU_DIT_FINAL_ADDCMUL_MAX_ABS_DRIFT
+
+
 def _dit_final_from_modulation_fused_npu(
     hidden: torch.Tensor,
     modulation: torch.Tensor,
@@ -3069,19 +3087,21 @@ class BatchedToken2Wav(nn.Module):
                 final_layer.linear,
             )
             max_abs_drift = float((actual - expected).abs().max().item())
+            drift_limit = _dit_final_addcmul_drift_limit(actual.dtype)
             if (
                 not torch.isfinite(actual).all()
-                or max_abs_drift > _NPU_DIT_FINAL_ADDCMUL_MAX_ABS_DRIFT
+                or max_abs_drift > drift_limit
             ):
                 raise RuntimeError(
                     "final Addcmul exceeded its startup drift bound: "
                     f"max_abs_drift={max_abs_drift:.9g}, "
-                    f"limit={_NPU_DIT_FINAL_ADDCMUL_MAX_ABS_DRIFT:.9g}"
+                    f"limit={drift_limit:.9g}"
                 )
             logger.info(
-                "Validated bounded-drift MiniCPM-o final Addcmul path; "
-                "max_abs_drift=%.9g",
+                "Validated dtype-bounded MiniCPM-o final Addcmul path; "
+                "max_abs_drift=%.9g, limit=%.9g",
                 max_abs_drift,
+                drift_limit,
             )
         except Exception:
             self._npu_dit_final_addcmul_enabled = False

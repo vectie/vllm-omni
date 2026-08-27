@@ -23,6 +23,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _dit_cache_major_post_attention_conv_mlp_residual,
     _dit_conv_mlp_residual,
     _dit_explicit_attention,
+    _dit_final_addcmul_drift_limit,
     _dit_final_cfg_euler_from_modulation,
     _dit_final_from_modulation,
     _dit_final_from_modulation_addcmul,
@@ -2094,6 +2095,13 @@ def test_dit_final_addcmul_matches_canonical_adaln():
     )
 
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_dit_final_addcmul_drift_limit_is_dtype_aware():
+    assert _dit_final_addcmul_drift_limit(torch.float32) == pytest.approx(1.0e-6)
+    assert _dit_final_addcmul_drift_limit(torch.bfloat16) == pytest.approx(
+        torch.finfo(torch.bfloat16).eps
+    )
 
 
 def test_dit_final_cfg_euler_matches_split_path():

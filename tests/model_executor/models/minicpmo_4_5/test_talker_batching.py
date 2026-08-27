@@ -73,7 +73,80 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._codec_vocab_ids = torch.arange(8)
     talker._codec_min_tokens = 50
     talker._codec_seed = 42
+    talker._fused_codec_sampler_enabled = False
+    talker._fused_codec_sampler_prepared = False
+    talker._fused_codec_sampler_request_id = None
     return talker
+
+
+def test_fused_codec_sampler_stages_fixed_request_state() -> None:
+    talker = _make_talker()
+    talker._fused_codec_sampler_enabled = True
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_uniform = torch.full((1, 1), 0.5)
+    talker._fused_codec_mask_eos = torch.ones(1, dtype=torch.bool)
+    talker._fused_codec_expired = torch.full((1, 1), -1, dtype=torch.long)
+    history = torch.tensor([0, 1, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6])
+    talker._request_audio_states["req-fused"] = {
+        "codes": history,
+        "step": 4,
+        "min_tokens": 5,
+    }
+
+    prepared = talker.prepare_fused_codec_sampler_inputs(
+        model_intermediate_buffer=[{"request_id": "req-fused"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+    )
+
+    assert prepared is True
+    assert talker._fused_codec_sampler_request_id == "req-fused"
+    assert talker._fused_codec_sampler_prepared is True
+    assert talker._fused_codec_mask_eos.item() is True
+    assert talker._fused_codec_expired.item() == 0
+    expected = torch.bincount(history, minlength=8).float().reshape(1, -1)
+    assert torch.equal(talker._fused_codec_frequencies, expected)
+    assert talker._request_repetition_frequencies["req-fused"].data_ptr() == (
+        talker._fused_codec_frequencies.data_ptr()
+    )
+
+
+def test_make_output_consumes_fused_codec_result_without_second_sampler(monkeypatch) -> None:
+    talker = _make_talker()
+    talker._fused_codec_sampler_enabled = True
+    talker._fused_codec_sampler_prepared = True
+    talker._fused_codec_sampler_request_id = "req-fused"
+    talker._fused_codec_sampled = torch.tensor([[3]])
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_next_frequencies = torch.tensor(
+        [[0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]
+    )
+    state = {"step": 0, "min_tokens": 50, "max_tokens": 64}
+    talker._request_audio_states["req-fused"] = state
+    monkeypatch.setattr(
+        talker,
+        "_sample_audio_code",
+        lambda *_args: pytest.fail("standalone sampler must be bypassed"),
+    )
+    info = {
+        "request_id": "req-fused",
+        "audio_state": state,
+        "audio_codes": {"accumulated": torch.tensor([1])},
+    }
+
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+    )
+
+    assert output.multimodal_outputs["codes"]["audio"][0].tolist() == [[3]]
+    assert talker._fused_codec_sampler_prepared is False
+    assert torch.equal(
+        talker._request_repetition_frequencies["req-fused"],
+        talker._fused_codec_next_frequencies,
+    )
 
 
 def test_talker_batches_codec_transport_at_initial_and_steady_boundaries(monkeypatch) -> None:

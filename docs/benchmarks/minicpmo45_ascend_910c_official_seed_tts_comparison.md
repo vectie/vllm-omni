@@ -5899,3 +5899,120 @@ The path was confirmed active, but TTFP rose from the prompt-cache smoke's
 stream handoff, and explicit synchronization cost more than the pageable D2H
 copy.  The implementation and profile were reverted; the artifact remains at
 `/tmp/lunanexa-bench/prompt-cache-pinned-d2h-smoke/`.
+
+### Leaderboard refresh and static steady-CFM ABI
+
+The public vLLM-Omni leaderboard was refreshed at `2026-08-27 13:15:46`.
+The team's last organizer result was seventh at 0.2423 RTF, 514.22 ms TTFP,
+and 45.72 ms TTFT.  The best individual values were 0.1278 RTF, 156.03 ms
+TTFP, and 6.37 ms TTFT.  These values come from different submissions, but
+they make the remaining priorities explicit: our TTFT is already comparable
+with the RTF leader's 47.24 ms, while RTF and TTFP remain the large gaps.
+
+The previous five-step experiment did not rebuild the serving ABI.  It entered
+the reduced-step eager path and expanded the result back into six cache slots,
+so it was slower despite performing less model arithmetic.  The new CFM4 and
+CFM3 profiles instead set the complete Token2Wav solver width before backend
+construction.  Timeline tensors, all-step AdaLN, fixed estimator K/V slabs,
+direct cache outputs and the outer steady NPUGraph are consequently native
+four- or three-slot executables.  Prompt-cache prefill and the first live
+packet remain one-step; Talker sampling and chunk boundaries are unchanged.
+
+The first CFM4 official-shape run used two warmups followed by ten Chinese
+Seed-TTS requests at concurrency one, seed zero and temperature zero.  The
+first warmup absorbed 62 seconds of ATB/NPUGraph compilation.  All ten measured
+requests completed with 100% streaming continuity.
+
+| Variant | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM6 prompt-state-cache median | 0.230909 | 271.95 ms | 78.59 ms | 1409.24 ms | - |
+| Native static CFM4 run 1 | **0.218146** | 279.26 ms | **76.77 ms** | **1228.11 ms** | 56.32 s |
+| Native static CFM3 run 1 | **0.208385** | **275.25 ms** | 77.76 ms | **1173.12 ms** | 56.32 s |
+
+Static CFM4 improves aggregate RTF by 5.53% and mean E2E by 12.85%.  Its
+2.69% TTFP movement is treated as run variance because both profiles execute
+the same prompt-CFM1 and first-packet-CFM1 path.  Unlike the prompt-state cache,
+steady step reduction changes model numerics; CFM4 and CFM3 therefore remain
+accuracy-gated until the paired Seed-TTS WER/SIM screen and the final
+Daily-Omni and Video-MME gates pass.
+
+Native CFM3 completed the same ten-request shape without a failed request or
+stream discontinuity.  Relative to the retained CFM6 median, it lowers
+aggregate RTF by 9.76% and mean E2E by 16.76%; relative to native CFM4 it lowers
+aggregate RTF by another 4.47%.  It is the performance candidate, not yet the
+submission candidate: the missing accuracy gates are intentionally not
+inferred from transport success.
+
+```text
+/tmp/lunanexa-bench/cfm4-static-official10/
+/tmp/minicpmo-cfm4-static.log
+/tmp/lunanexa-bench/cfm3-static-official10/
+/tmp/minicpmo-cfm3-static.log
+```
+
+### BF16-bounded final Addcmul gate
+
+The final DiT modulation path had already qualified an exact `addcmul`
+rewrite on a retained 32-row WER/SIM screen, but the startup parity gate still
+used a fixed FP32 `1e-6` absolute threshold.  On the live BF16 estimator the
+canonical multiply/add expression and `addcmul` differ by exactly one BF16
+storage ULP (`0.0078125`), so every service start silently disabled the
+qualified path.  The gate now keeps the FP32 bound unchanged and allows at
+most one storage epsilon for FP16/BF16.  Startup logged:
+
+```text
+Validated dtype-bounded MiniCPM-o final Addcmul path;
+max_abs_drift=0.0078125, limit=0.0078125
+```
+
+The controlled CFM3 A/B retained the same 56.32 seconds of output, 10/10
+success and 100% continuity:
+
+| CFM3 variant | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed FP32 gate, fusion disabled | 0.208385 | 275.25 ms | 77.76 ms | 1173.12 ms |
+| Dtype-aware gate, fusion active | **0.208119** | **273.43 ms** | 78.61 ms | **1171.62 ms** |
+
+The 0.13% aggregate-RTF movement is too small to call a major service gain,
+but the fix prevents an already-qualified fast path from being incorrectly
+disabled.  It also confirms that the remaining leaderboard gap is dominated
+by the Talker execution cycle, not this isolated Stage-2 launch.
+
+```text
+/tmp/lunanexa-bench/cfm3-static-addcmul-official10/
+/tmp/minicpmo-cfm3-static-addcmul.log
+```
+
+### Exact n-gram speculative Talker experiment
+
+The next isolated profile attacked the 83.5% idle fraction in the hot Talker
+trace.  It proposed three codec tokens from matching one- to three-token
+suffixes in the already-generated sequence, then verified them with the
+ordinary Talker in one wider target forward.  Rejected drafts fall back to the
+target token, so this was an exact speculative execution mechanism rather than
+a trained or approximate multi-code head.
+
+The ordinary CPU n-gram proposer was rejected by vLLM configuration because
+the retained Talker requires asynchronous scheduling.  The device n-gram
+proposer was compatible after rebuilding the Stage-1 graph ABI at width four:
+it captured successfully as `FULL_AND_PIECEWISE` and completed 10/10 measured
+requests with 100% streaming continuity.  It was nevertheless a decisive
+service regression:
+
+| Talker path | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM3 + one-token full-decode graph | **0.208119** | **273.43 ms** | **78.61 ms** | **1171.62 ms** | 56.32 s |
+| CFM3 + NGram-GPU 3-token drafts | 0.459330 | 394.86 ms | 81.22 ms | 2705.69 ms | 58.92 s |
+
+The speculative candidate regressed aggregate RTF by 120.71% and TTFP by
+44.41%.  Codec suffix acceptance cannot amortize the wider target verification
+and the loss of the specialized one-token `FULL_DECODE_ONLY` executable on
+this A2 stack.  The profile and its test were removed rather than leaving a
+dormant trap.  A useful multi-code path now requires a trained compatible
+draft/MTP head or a backend device loop that preserves the efficient one-token
+executable; prompt n-gram reuse is closed.
+
+```text
+/tmp/lunanexa-bench/cfm3-talker-ngram3-official10/
+/tmp/minicpmo-cfm3-talker-ngram3-v3.log
+```

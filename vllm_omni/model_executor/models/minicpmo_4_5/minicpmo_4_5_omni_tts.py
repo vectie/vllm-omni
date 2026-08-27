@@ -664,7 +664,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if not isinstance(info, dict):
             return False
         start, end = spans[0]
-        if int(start) >= int(end):
+        # Full-decode capture owns exactly one Talker row. The final prefill
+        # chunk can also be sample-eligible, but its wider hidden output does
+        # not execute the fused branch in forward; staging it would advance
+        # RNG and later consume a stale output slab.
+        if int(end) - int(start) != 1:
             return False
         request_id = str(info.get("request_id", 0))
         state = self._request_audio_states.get(request_id)

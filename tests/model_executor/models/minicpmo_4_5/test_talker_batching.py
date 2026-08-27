@@ -111,6 +111,30 @@ def test_fused_codec_sampler_stages_fixed_request_state() -> None:
     )
 
 
+def test_fused_codec_sampler_does_not_stage_final_prefill_chunk() -> None:
+    talker = _make_talker()
+    talker._fused_codec_sampler_enabled = True
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_uniform = torch.full((1, 1), 0.5)
+    talker._fused_codec_mask_eos = torch.ones(1, dtype=torch.bool)
+    talker._fused_codec_expired = torch.full((1, 1), -1, dtype=torch.long)
+    talker._request_audio_states["req-prefill"] = {
+        "codes": torch.empty(0, dtype=torch.long),
+        "step": 0,
+        "min_tokens": 5,
+    }
+
+    prepared = talker.prepare_fused_codec_sampler_inputs(
+        model_intermediate_buffer=[{"request_id": "req-prefill"}],
+        request_token_spans=[(0, 12)],
+        request_sample_eligible=[True],
+    )
+
+    assert prepared is False
+    assert talker._fused_codec_sampler_prepared is False
+    assert talker._request_generators == {}
+
+
 def test_make_output_consumes_fused_codec_result_without_second_sampler(monkeypatch) -> None:
     talker = _make_talker()
     talker._fused_codec_sampler_enabled = True

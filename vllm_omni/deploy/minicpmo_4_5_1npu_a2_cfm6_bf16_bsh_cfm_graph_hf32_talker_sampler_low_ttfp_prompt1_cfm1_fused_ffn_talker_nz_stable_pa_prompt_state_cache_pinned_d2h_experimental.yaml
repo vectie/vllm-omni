@@ -1,0 +1,14 @@
+# Atlas 800I A2 first-audio pinned-D2H candidate.
+#
+# Keep the retained fixed-prompt state cache, then move Stage-2 waveform output
+# into pinned host storage on the runner's copy stream before EngineCore IPC.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_stable_pa_prompt_state_cache_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE: "1"
+          VLLM_OMNI_NPU_PINNED_MM_OUTPUT_D2H: "1"

@@ -1138,27 +1138,18 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                 [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
                 dtype=np.int32,
             )
-        query_start_loc_cpu = None
-        if sparse_mm_req_ids != []:
-            # An explicit empty sparse-audio payload means this Talker step has
-            # no chunk for the downstream stage. Avoid materializing
-            # query_start_loc on the host: on Ascend its .cpu() is a full
-            # device/host synchronization, and the normal 25-frame transport
-            # otherwise pays it on all 25 autoregressive steps even though
-            # only one step publishes data.
-            query_start_loc_cpu = self.query_start_loc.cpu
-            if callable(query_start_loc_cpu):
-                query_start_loc_cpu = query_start_loc_cpu()
+        query_start_loc_cpu = self.query_start_loc.cpu
+        if callable(query_start_loc_cpu):
+            query_start_loc_cpu = query_start_loc_cpu()
 
-            self._stage_deferred_prefix_cache_mm_outputs(
-                scheduler_output=scheduler_output,
-                multimodal_outputs=multimodal_outputs,
-                query_start_loc_cpu=query_start_loc_cpu,
-            )
+        self._stage_deferred_prefix_cache_mm_outputs(
+            scheduler_output=scheduler_output,
+            multimodal_outputs=multimodal_outputs,
+            query_start_loc_cpu=query_start_loc_cpu,
+        )
 
         pooler_output: list[dict[str, object]] | None = None
         if needs_pooler_payload:
-            assert query_start_loc_cpu is not None
             combined_hidden_states = None
             combined_multimodal_outputs = None
             mm_cpu = None

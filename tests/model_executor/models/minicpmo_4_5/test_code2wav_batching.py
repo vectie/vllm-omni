@@ -3132,7 +3132,8 @@ def test_prompt_state_cache_reuses_setup_without_aliasing(monkeypatch):
     state_b = model._states["b"].token2wav
     for name in state_a.flow_cache:
         assert state_a.flow_cache[name].data_ptr() != state_b.flow_cache[name].data_ptr()
-    state_a.flow_cache["conformer_att_cache"].fill_(123)
+    with torch.inference_mode():
+        state_a.flow_cache["conformer_att_cache"].fill_(123)
     assert not torch.equal(
         state_a.flow_cache["conformer_att_cache"],
         state_b.flow_cache["conformer_att_cache"],

@@ -460,9 +460,22 @@ def _ensure_zh_asr() -> None:
             _device,
         )
         try:
-            _zh_paraformer = AutoModel(model=PARAFORMER_MODEL_ID, device=_device)
+            _zh_paraformer = AutoModel(
+                model=PARAFORMER_MODEL_ID,
+                device=_device,
+                disable_update=True,
+            )
         except TypeError:
-            _zh_paraformer = AutoModel(model=PARAFORMER_MODEL_ID)
+            try:
+                _zh_paraformer = AutoModel(
+                    model=PARAFORMER_MODEL_ID,
+                    disable_update=True,
+                )
+            except TypeError:
+                # Compatibility with older FunASR releases that predate both
+                # ``device`` and ``disable_update``. Official evaluation
+                # images ship a newer version and stay fully offline here.
+                _zh_paraformer = AutoModel(model=PARAFORMER_MODEL_ID)
 
 
 def _transcribe_en_f32_16k(wav_f32: np.ndarray) -> str:

@@ -42,8 +42,14 @@ _MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT_ENV = (
 _MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT_ENV = (
     "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT"
 )
+_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT_ENV = (
+    "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT"
+)
 _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV = (
     "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
+)
+_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES_ENV = (
+    "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"
 )
 _MINICPMO45_SINGLE_CHIP_CAPTURE_SIZES = [1]
 _MINICPMO45_SINGLE_CHIP_TALKER_ENV_DEFAULTS = {
@@ -936,7 +942,10 @@ def _apply_minicpmo45_single_chip_policy(
     to one step after the competition-protocol WER and WavLM-SIM screens passed.
     Disabling ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT`` falls back to
     the quality-gated two-step solver; disabling the CFM2 default as well
-    restores the full solver.
+    restores the full solver. The ranked profile also publishes its first 47
+    codec frames together to minimize the organizer's primary arithmetic-mean
+    chunk RTF; ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT=0``
+    restores the lower-TTFP 25-frame boundary.
     Explicit placements, compile modes, runtime settings, connector choices,
     and connector values retain authority.
     """
@@ -996,6 +1005,32 @@ def _apply_minicpmo45_single_chip_policy(
                 talker.env[name] = value
                 changed.append("talker-" + name.rsplit("_", 1)[-1].lower())
 
+        first47_raw = os.environ.get(
+            _MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT_ENV, "1"
+        ).strip().lower()
+        valid_switch_values = {
+            "0",
+            "false",
+            "no",
+            "off",
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if first47_raw not in valid_switch_values:
+            raise ValueError(
+                f"Invalid {_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT_ENV}="
+                f"{first47_raw!r}"
+            )
+        if (
+            first47_raw in {"1", "true", "yes", "on"}
+            and _MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES_ENV not in os.environ
+            and _MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES_ENV not in talker.env
+        ):
+            talker.env[_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES_ENV] = "47"
+            changed.append("talker-first47")
+
         code2wav = by_id[2]
         code2wav.env = dict(code2wav.env or {})
         for name, value in _MINICPMO45_SINGLE_CHIP_CODE2WAV_ENV_DEFAULTS.items():
@@ -1009,16 +1044,6 @@ def _apply_minicpmo45_single_chip_policy(
         cfm1_raw = os.environ.get(
             _MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT_ENV, "1"
         ).strip().lower()
-        valid_switch_values = {
-            "0",
-            "false",
-            "no",
-            "off",
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
         if cfm2_raw not in valid_switch_values:
             raise ValueError(
                 f"Invalid {_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT_ENV}={cfm2_raw!r}"

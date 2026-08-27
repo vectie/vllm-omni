@@ -6591,6 +6591,52 @@ land on an efficient static Stage-2 width.
 /tmp/minicpmo-a2-evaluator-cfm1-first5-official-server.log
 ```
 
+### Ranked first-packet RTF optimization
+
+The official rules rank the arithmetic mean of all chunk RTF values before
+TTFP. The opposite scheduling direction was therefore screened: retain more
+Talker codes in the first packet so the one-time pre-audio latency is divided
+by a longer audio duration. First-47 also combines the three-code left context
+into a natural width-50 Stage-2 input.
+
+All performance rows use the same 32 Chinese prompts, two warmups,
+concurrency one and server-default sampling. Lower is better:
+
+| Initial codec frames | Mean chunk RTF | P99 chunk RTF | Mean TTFP | Mean E2E | Decision |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 25, CFM1 control | 0.30273 | 0.63560 | **455.93 ms** | 1392.11 ms | Lower-TTFP rollback |
+| 47 | **0.27479** | **0.53501** | 646.86 ms | 1405.55 ms | Promoted after quality gate |
+| 72 | 0.26916 | 0.51272 | 879.68 ms | **1399.39 ms** | Rejected: WER failure |
+
+First-47 improves the primary mean-chunk RTF by **9.23%** and P99 RTF by
+15.82% relative to first-25. First-72 improved RTF by another 2.05%, but its
+official-protocol WER was `0.0172`, above the `0.0156` admission threshold, so
+the numerically fastest ranked candidate is not eligible.
+
+First-47 completed 32/32 quality requests, retained 100% continuity and
+158.60 seconds of audio, scored WER `0.0087`, and scored `0.83727` with the
+competition WavLM-base-plus proxy. The SIM change is about -0.76 percentage
+points from the retained CFM6 proxy, inside the two-point allowance.
+
+The evaluator-visible single-chip policy now defaults an absent
+`VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES` to `47`. An explicit launch
+or Stage-1 value remains authoritative. Setting
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT=0` restores the native
+25-frame first boundary without disabling the other exact defaults. This is a
+ranked-profile tradeoff: it improves the primary RTF metric at the cost of
+about 191 ms TTFP on this A2 host.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-official-export-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first72-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first72-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first72-official-export-zh32/
+/tmp/minicpmo-a2-evaluator-cfm1-first47-quality-server.log
+/tmp/minicpmo-a2-evaluator-cfm1-first72-official-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

@@ -1224,6 +1224,7 @@ class TestDeployConfigLoading:
             "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "1",
             "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS": "1",
             "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER": "1",
+            "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES": "47",
         }
         assert deploy.stages[1].engine_extras.get("additional_config") is None
         assert deploy.stages[2].env == {
@@ -1302,6 +1303,52 @@ class TestDeployConfigLoading:
         assert deploy.stages[2].env[
             "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
         ] == "2"
+
+    def test_minicpmo_single_chip_policy_can_disable_ranked_first47(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT", "0"
+        )
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES" not in (
+            deploy.stages[1].env or {}
+        )
+
+    def test_minicpmo_single_chip_policy_preserves_launch_first_packet(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "25")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES" not in (
+            deploy.stages[1].env or {}
+        )
 
     def test_minicpmo_single_chip_policy_can_disable_reduced_cfm_defaults(
         self, monkeypatch

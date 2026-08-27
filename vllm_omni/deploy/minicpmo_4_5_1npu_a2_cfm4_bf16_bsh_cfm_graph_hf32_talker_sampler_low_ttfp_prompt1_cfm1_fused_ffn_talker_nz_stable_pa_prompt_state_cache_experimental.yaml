@@ -1,0 +1,18 @@
+# Atlas 800I A2 static four-step steady-CFM candidate.
+#
+# Unlike the rejected reduced-step experiment, this profile changes the
+# complete Code2Wav solver ABI to four steps.  The timeline, fixed K/V slabs,
+# direct cache outputs and steady NPUGraph are therefore all captured at four
+# slots rather than running an eager reduced loop and expanding it back into
+# the six-slot serving ABI.  Prompt and first-live CFM remain one-step for the
+# already-qualified low-TTFP path.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_stable_pa_prompt_state_cache_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS: "4"
+

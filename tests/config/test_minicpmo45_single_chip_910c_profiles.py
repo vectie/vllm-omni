@@ -355,6 +355,37 @@ def test_a2_talker_stable_pa_removes_per_layer_graph_rebinding():
     assert "pa_shape_list" not in stage2.engine_extras["additional_config"]
 
 
+@pytest.mark.parametrize(
+    ("name", "steady_steps"),
+    [
+        (
+            "minicpmo_4_5_1npu_a2_cfm4_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_stable_pa_prompt_state_cache_experimental.yaml",
+            "4",
+        ),
+        (
+            "minicpmo_4_5_1npu_a2_cfm3_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_stable_pa_prompt_state_cache_experimental.yaml",
+            "3",
+        ),
+    ],
+)
+def test_a2_static_reduced_cfm_profiles_rebuild_the_complete_solver_abi(
+    name: str,
+    steady_steps: str,
+):
+    deploy = _load_profile(name)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.env["VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"] == "10"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"] == steady_steps
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_BF16_FFN"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE"] == "1"
+
+
 def test_a2_talker_nz_profiler_is_isolated_from_cfm_graph_process():
     deploy = _load_profile(
         "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_profile.yaml"

@@ -5661,3 +5661,32 @@ Artifacts:
 /tmp/lunanexa-bench/talker-batched-codec-v2-official10-repeat/
 /tmp/minicpmo-talker-batched-codec-v2.log
 ```
+
+Two subsequent scheduler-level attempts established where the remaining
+Talker bottleneck is not. First, the intermediate AR scheduler retained all
+per-token request, KV, stop, and sampling updates but suppressed token-only
+`EngineCoreOutput` messages between publishable codec boundaries. Its two
+official-shape runs measured mean RTF 0.308210 and 0.305143, for a 0.306676
+mean: 1.91% slower than the retained 0.300915 result. Mean TTFP stayed near
+349.3 ms. The async vLLM pipeline therefore uses those apparently redundant
+outputs as part of its efficient progress cadence; the experiment was fully
+removed.
+
+Second, the orchestrator polled Stage 2, then Stage 1, then Stage 0 so the
+high-frequency Talker output would not sit behind an idle Stage-0 one-ms poll.
+Two runs measured mean RTF 0.304688 and 0.302651, for a 0.303669 mean. Average
+TTFP improved by about 2.7 ms, but RTF was still 0.91% worse and mean Stage-1
+duration increased from 1.195 s to about 1.219 s. This proves the repeated
+gap is inside the Talker EngineCore/model-execution cycle rather than the
+outer orchestration polling order. The order change was also removed.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/sparse-engine-output-official10/
+/tmp/lunanexa-bench/sparse-engine-output-official10-repeat/
+/tmp/minicpmo-sparse-engine-output.log
+/tmp/lunanexa-bench/downstream-first-poll-official10/
+/tmp/lunanexa-bench/downstream-first-poll-official10-repeat/
+/tmp/minicpmo-downstream-first-poll.log
+```

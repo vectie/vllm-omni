@@ -6676,6 +6676,37 @@ rejected and is not a source default.
 /tmp/minicpmo-a2-evaluator-cfm1-first47-steady47-server.log
 ```
 
+### First-60 boundary rejection
+
+An intermediate first-packet boundary was screened after first-47 passed and
+first-72 failed WER.  It retained the 25-frame steady boundary and changed
+only the initial publication to 60 new codec frames.  The same source tree,
+32 Chinese rows, two warmups and concurrency one produced 158.60 seconds of
+audio with 100% continuity.
+
+| Initial frames | Chunks | Mean chunk RTF | First-chunk mean RTF | Terminal-chunk mean RTF | Mean TTFP |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 47 explicit control | 141 | **0.27479** | 0.37608 | - | **646.86 ms** |
+| 60 | 127 | 0.28092 | **0.33850** | 0.35453 | 758.24 ms |
+
+First-60 amortized the first packet as intended, but its mean ranked RTF was
+2.23% worse than the explicit first-47 control.  The longer first boundary
+changes the modulo-25 terminal remainder and makes the final short packet more
+expensive under the unweighted chunk mean.  Because it failed the performance
+screen, WER/SIM were not run and first-47 remains the source default.
+
+A raw official-shape diagnostic request made the mechanism concrete.  Its
+first-60 packet contained 2.24 seconds of PCM, three normal steady packets
+contained exactly 1.00 second each, and its terminal packet contained only
+0.56 second.  The terminal arrival interval was 217.30 ms, so that final packet
+alone scored RTF `0.38319`.  This motivates a quality-gated terminal-duration
+floor rather than further initial-boundary integer search.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first60-steady25-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-cfm1-first60-steady25-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

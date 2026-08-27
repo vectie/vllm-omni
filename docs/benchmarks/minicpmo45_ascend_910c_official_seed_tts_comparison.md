@@ -6072,3 +6072,18 @@ which were used for the figures above.
 /tmp/lunanexa-bench/cfm3-deferred-eos-official10/
 /tmp/minicpmo-cfm3-deferred-eos.log
 ```
+
+The follow-up request-local RNG-slab experiment replaced 140 scalar
+`uniform_` launches with one request-wide random fill and a per-step device
+slice copy.  It generated the same 59.80 seconds / 1,435,200 frames as the
+chunk-boundary-EOS control, but regressed aggregate RTF from 0.171280 to
+0.173524 (+1.31%), mean E2E from 1023.84 to 1037.17 ms (+1.30%), middle-chunk
+RTF from 0.11607 to 0.11746 (+1.19%), and TTFP by 0.50%.  The additional
+per-step copy/index dependency costs more than the eliminated random launch
+on this A2 stack.  The implementation and deployment switch were removed;
+the negative artifact remains at:
+
+```text
+/tmp/lunanexa-bench/cfm3-deferred-eos-rng-slab-official10/
+/tmp/minicpmo-cfm3-deferred-eos-rng-slab.log
+```

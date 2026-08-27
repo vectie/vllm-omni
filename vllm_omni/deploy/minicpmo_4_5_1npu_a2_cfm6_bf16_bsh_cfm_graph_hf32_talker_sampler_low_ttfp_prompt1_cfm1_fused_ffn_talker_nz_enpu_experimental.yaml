@@ -1,0 +1,22 @@
+# Atlas A2 Talker graph-parameter pipeline candidate.
+#
+# FULL decode normally synchronizes the current stream before every graph
+# replay, then updates all captured FIA tasks after execution. vLLM-Ascend's
+# ENPU soft-segmentation path updates on the dedicated stream first, records
+# its per-task events, and lets replay consume them without the global stream
+# barrier. This targets the dominant Stage-1 host/control-plane stack without
+# changing Talker arithmetic or sampling.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES: "10"
+          VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT: "1"
+          VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER: "1"
+          VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES: "25"
+          ENPU_ENABLE: "true"

@@ -71,9 +71,6 @@ _NPU_INITIAL_CFM_TIMESTEPS_ENV = (
 _NPU_PROMPT_CFM_TIMESTEPS_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS"
 )
-_NPU_LAZY_REDUCED_CFM_CACHE_ENV = (
-    "VLLM_OMNI_MINICPMO45_NPU_LAZY_REDUCED_CFM_CACHE"
-)
 _NPU_DIT_BSH_ATTENTION_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_BSH_ATTENTION"
 _NPU_DIT_BSH_ATTENTION_MAX_ABS_DRIFT = 2.0e-2
 _NPU_DIT_BSH_ATTENTION_MEAN_ABS_DRIFT = 2.0e-3
@@ -272,16 +269,6 @@ def _npu_prompt_cfm_timesteps(full_timesteps: int) -> int:
             f"integer in [1, {full_timesteps}]"
         )
     return timesteps
-
-
-def _npu_lazy_reduced_cfm_cache_enabled() -> bool:
-    """Delay the six-slot cache materialization until the first CFM6 chunk."""
-    return os.environ.get(_NPU_LAZY_REDUCED_CFM_CACHE_ENV, "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
 
 
 def _npu_cfm_cache_fill_graph_enabled() -> bool:
@@ -2288,11 +2275,6 @@ class BatchedToken2Wav(nn.Module):
         self.prompt_cfm_timesteps = _npu_prompt_cfm_timesteps(
             self.n_timesteps
         )
-        self._npu_lazy_reduced_cfm_cache_enabled = (
-            _npu_lazy_reduced_cfm_cache_enabled()
-        )
-        self._npu_lazy_reduced_cfm_cache_used = False
-        self._npu_lazy_reduced_cfm_cache_materialized = False
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
         self.register_buffer(
@@ -6023,25 +6005,6 @@ class BatchedToken2Wav(nn.Module):
         if stacked_cnn_out is not None:
             stacked_cnn = stacked_cnn_out
             stacked_att = stacked_att_out
-        elif (
-            reduced_steps
-            and steps == 1
-            and self._npu_lazy_reduced_cfm_cache_enabled
-        ):
-            # Prompt CFM1 and first-packet CFM1 produce one estimator state and
-            # historically copied it into all six solver slots immediately.
-            # The next reduced invocation only reads slot zero. Keep the
-            # singleton state until a full CFM6 chunk actually needs six
-            # independently writable slots, removing one large prompt-cache
-            # replication from the first-packet critical path.
-            stacked_cnn = next_cnn[0].unsqueeze(0)
-            stacked_att = next_att[0].unsqueeze(0)
-            if not self._npu_lazy_reduced_cfm_cache_used:
-                logger.info(
-                    "MiniCPM-o lazy reduced-CFM cache active: retaining one "
-                    "cache slot until the first full-solver chunk"
-                )
-                self._npu_lazy_reduced_cfm_cache_used = True
         elif reduced_steps:
             # The fixed serving ABI owns one cache slot per full CFM timestep.
             # Map each reduced solver cache to its nearest following full slot
@@ -6534,73 +6497,6 @@ class BatchedToken2Wav(nn.Module):
             cnn_cache_major=slabs.cnn_cache_major,
         )
 
-    def _materialize_reduced_cfm_state(
-        self,
-        state: BatchedToken2WavState,
-    ) -> BatchedToken2WavState:
-        """Expand a singleton reduced-solver cache for the first CFM6 chunk."""
-        slabs = state.estimator_kv_slabs
-        attention = state.flow_cache["estimator_att_cache"]
-        cnn = state.flow_cache["estimator_cnn_cache"]
-        if int(attention.shape[0]) == self.n_timesteps:
-            return state
-        if int(attention.shape[0]) != 1 or int(cnn.shape[0]) != 1:
-            raise RuntimeError(
-                "MiniCPMO45Code2WavBatchError "
-                f'{{"reason":"reduced_cache_slots","attention":{int(attention.shape[0])},'
-                f'"cnn":{int(cnn.shape[0])},"expected":1}}'
-            )
-
-        def expand_steps(value: torch.Tensor) -> torch.Tensor:
-            return value.expand(self.n_timesteps, *value.shape[1:]).contiguous()
-
-        if slabs is None:
-            next_attention = expand_steps(attention)
-            next_cnn = expand_steps(cnn)
-            next_slabs = None
-        else:
-            active = slabs.active_cnn_bank
-            retained = expand_steps(slabs.retained)
-            append = slabs.append.new_empty(
-                (self.n_timesteps, *slabs.append.shape[1:])
-            )
-            active_cnn = expand_steps(slabs.cnn_banks[active])
-            inactive_cnn = torch.empty_like(active_cnn)
-            cnn_banks = (
-                (active_cnn, inactive_cnn)
-                if active == 0
-                else (inactive_cnn, active_cnn)
-            )
-            next_slabs = FixedEstimatorKVSlabs(
-                retained=retained,
-                append=append,
-                cnn_banks=cnn_banks,
-                prompt_length=slabs.prompt_length,
-                logical_length=slabs.logical_length,
-                active_cnn_bank=active,
-                planar=slabs.planar,
-                bsh_attention=slabs.bsh_attention,
-                cnn_cache_major=slabs.cnn_cache_major,
-            )
-            next_attention = retained[..., : slabs.logical_length, :]
-            next_cnn = cnn_banks[active]
-
-        next_flow = dict(state.flow_cache)
-        next_flow["estimator_att_cache"] = next_attention
-        next_flow["estimator_cnn_cache"] = next_cnn
-        if not self._npu_lazy_reduced_cfm_cache_materialized:
-            logger.info(
-                "MiniCPM-o lazy reduced-CFM cache materialized at the first "
-                "full-solver chunk: slots=1->%d",
-                self.n_timesteps,
-            )
-            self._npu_lazy_reduced_cfm_cache_materialized = True
-        return BatchedToken2WavState(
-            flow_cache=next_flow,
-            hift_cache=state.hift_cache,
-            estimator_kv_slabs=next_slabs,
-        )
-
     def setup_batch(
         self,
         features: PromptFeatures,
@@ -6736,11 +6632,6 @@ class BatchedToken2Wav(nn.Module):
             if first_audio_chunk and not last_chunk
             else self.n_timesteps
         )
-        if (
-            self._npu_lazy_reduced_cfm_cache_enabled
-            and cfm_timesteps == self.n_timesteps
-        ):
-            states = [self._materialize_reduced_cfm_state(state) for state in states]
         flow_cache = self._stack_flow_cache(states)
         fixed_slabs = (
             states[0].estimator_kv_slabs

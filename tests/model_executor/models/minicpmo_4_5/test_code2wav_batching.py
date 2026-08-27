@@ -44,7 +44,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_cfm_graph_phase,
     _npu_cfm_integration_dtype,
     _npu_initial_cfm_timesteps,
-    _npu_lazy_reduced_cfm_cache_enabled,
     _npu_prompt_cfm_timesteps,
     _npu_cfm_planar_kv_slabs_enabled,
     _npu_cfm_stacked_cache_out_enabled,
@@ -538,46 +537,6 @@ def test_reduced_first_packet_solver_restores_full_cache_abi(monkeypatch) -> Non
     assert len(token2wav.flow.decoder.estimator.cfg_batches) == (
         calls_after_prompt + 3
     )
-
-
-def test_lazy_reduced_solver_materializes_only_before_full_chunk(monkeypatch) -> None:
-    monkeypatch.setenv(
-        "VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS",
-        "1",
-    )
-    monkeypatch.setenv(
-        "VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS",
-        "1",
-    )
-    monkeypatch.setenv(
-        "VLLM_OMNI_MINICPMO45_NPU_LAZY_REDUCED_CFM_CACHE",
-        "1",
-    )
-    assert _npu_lazy_reduced_cfm_cache_enabled()
-
-    token2wav = _FakeToken2Wav()
-    adapter = BatchedToken2Wav(token2wav)
-    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
-    states = adapter.setup_batch(prompt, 1)
-    assert states[0].flow_cache["estimator_att_cache"].shape[0] == 1
-
-    _, states = adapter.decode_batch(
-        torch.tensor([[10, 11]]),
-        prompt,
-        states,
-        last_chunk=False,
-    )
-    assert states[0].flow_cache["estimator_att_cache"].shape[0] == 1
-    assert states[0].flow_cache["estimator_cnn_cache"].shape[0] == 1
-
-    _, states = adapter.decode_batch(
-        torch.tensor([[12, 13]]),
-        prompt,
-        states,
-        last_chunk=False,
-    )
-    assert states[0].flow_cache["estimator_att_cache"].shape[0] == 2
-    assert states[0].flow_cache["estimator_cnn_cache"].shape[0] == 2
 
 
 def test_npu_optimized_defaults_activate_only_qualified_cfm6(monkeypatch) -> None:

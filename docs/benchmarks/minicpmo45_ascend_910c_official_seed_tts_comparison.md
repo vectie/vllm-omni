@@ -5837,3 +5837,56 @@ Artifacts:
 /tmp/lunanexa-quality/talker-stable-pa-seed10/
 /tmp/minicpmo-talker-stable-pa-host-slab.log
 ```
+
+### Main-bottleneck result: fingerprinted prompt-state templates
+
+Synchronized Stage-2 timing split the hot first-packet path into two pieces:
+prompt setup consumed about 39--41 ms (roughly 12 ms Conformer plus 26--28 ms
+prompt CFM), while the first live width-13 chunk consumed about 67--69 ms
+(roughly 12 ms encoder, 27 ms first-packet CFM, and 28 ms HiFT).  Bounding the
+DiT prompt suffix to 150 frames did not attack the dominant cost and was
+rejected at 0.237681 aggregate RTF / 320.22 ms TTFP.  Deferring reduced-CFM
+cache materialization was likewise rejected at 0.239588 RTF / 315.04 ms TTFP.
+
+The competition path repeatedly uses the same default reference-audio prompt,
+yet Stage 2 rebuilt its deterministic Conformer and prompt-CFM state for every
+request.  The retained candidate caches one immutable state template keyed by
+the complete prompt-content fingerprint.  Each request receives independent
+copies of its Conformer cache, estimator attention/CNN storage, rolling fixed
+slabs, and HiFT state; the live decoder never mutates the template or another
+request's state.  Different prompt content or paths select different cache
+entries, and the small LRU is bounded.  This changes neither solver steps nor
+tensor values; it removes repeated setup computation.
+
+Five focused cache/fixed-slab tests pass on the A2 host, including address
+non-aliasing and mutation isolation.  The first request after service startup
+still performs normal setup and graph compilation, which the declared warmup
+absorbs.  All later fixed-prompt requests clone the resident template.
+
+Three runs used the same Chinese Seed-TTS wrapper, two warmups, ten measured
+requests, concurrency one, seed zero, and temperature zero.  Lower is better.
+
+| Run | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prompt-state cache 1 | 0.228856 | 275.99 ms | 78.59 ms | 1409.24 ms | 61.60 s |
+| Prompt-state cache 2 | 0.250856 | 271.95 ms | 79.12 ms | 1467.50 ms | 58.52 s |
+| Prompt-state cache 3 | 0.230909 | 269.56 ms | 77.03 ms | 1383.11 ms | 59.92 s |
+| Three-run median | **0.230909** | **271.95 ms** | **78.59 ms** | **1409.24 ms** | - |
+
+Compared with the retained stable-PA two-run mean (0.231076 RTF, 309.36 ms
+TTFP, 77.38 ms TTFT, and 1434.66 ms E2E), median TTFP improves by 12.09% and
+median E2E by 1.77%.  Median RTF is effectively flat but 0.07% lower; TTFT is
+1.56% higher and remains within normal host variation.  The second run
+contained a 2.17-second single-request host tail, so promotion uses the
+predeclared median rather than selecting the fastest run.  Every run completed
+10/10 requests with zero failures and 100% streaming continuity.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/prompt-state-cache-smoke/
+/tmp/lunanexa-bench/prompt-state-cache-official10/
+/tmp/lunanexa-bench/prompt-state-cache-official10-repeat/
+/tmp/lunanexa-bench/prompt-state-cache-official10-third/
+/tmp/minicpmo-stable-pa-prompt-state-cache.log
+```

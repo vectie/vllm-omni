@@ -3100,11 +3100,19 @@ def test_npu_prepare_event_builds_state_and_first_chunk_reuses_it(mocker):
     assert setup.call_count == 1
 
 
-def test_prompt_state_cache_reuses_setup_without_aliasing(mocker):
+def test_prompt_state_cache_reuses_setup_without_aliasing(monkeypatch):
     model, _ = _model()
     model._prompt_prewarm_enabled = True
     model._prompt_state_cache_enabled = True
-    setup = mocker.spy(model.backend, "setup_batch")
+    setup_calls = 0
+    original_setup = model.backend.setup_batch
+
+    def counted_setup(*args, **kwargs):
+        nonlocal setup_calls
+        setup_calls += 1
+        return original_setup(*args, **kwargs)
+
+    monkeypatch.setattr(model.backend, "setup_batch", counted_setup)
 
     def prepare(request_id: str):
         return {
@@ -3118,7 +3126,7 @@ def test_prompt_state_cache_reuses_setup_without_aliasing(mocker):
     _forward(model, [prepare("a")], request_ids=["a"])
     _forward(model, [prepare("b")], request_ids=["b"])
 
-    assert setup.call_count == 1
+    assert setup_calls == 1
     assert len(model._prompt_state_templates) == 1
     state_a = model._states["a"].token2wav
     state_b = model._states["b"].token2wav

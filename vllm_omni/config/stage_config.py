@@ -39,6 +39,9 @@ _MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS_ENV = (
 _MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT_ENV = (
     "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT"
 )
+_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT_ENV = (
+    "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT"
+)
 _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV = (
     "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
 )
@@ -930,8 +933,10 @@ def _apply_minicpmo45_single_chip_policy(
     A/B: chunk-boundary codec transport, direct binary stop control, deferred
     EOS reconciliation, immutable prompt-state templates, and inference-time
     HiFT weight-norm materialization. It also defaults the native flow solver
-    to two steps after the competition-protocol WER and WavLM-SIM screens passed;
-    ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT=0`` restores the full solver.
+    to one step after the competition-protocol WER and WavLM-SIM screens passed.
+    Disabling ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT`` falls back to
+    the quality-gated two-step solver; disabling the CFM2 default as well
+    restores the full solver.
     Explicit placements, compile modes, runtime settings, connector choices,
     and connector values retain authority.
     """
@@ -1001,7 +1006,10 @@ def _apply_minicpmo45_single_chip_policy(
         cfm2_raw = os.environ.get(
             _MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT_ENV, "1"
         ).strip().lower()
-        if cfm2_raw not in {
+        cfm1_raw = os.environ.get(
+            _MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT_ENV, "1"
+        ).strip().lower()
+        valid_switch_values = {
             "0",
             "false",
             "no",
@@ -1010,21 +1018,28 @@ def _apply_minicpmo45_single_chip_policy(
             "true",
             "yes",
             "on",
-        }:
+        }
+        if cfm2_raw not in valid_switch_values:
             raise ValueError(
                 f"Invalid {_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT_ENV}={cfm2_raw!r}"
             )
+        if cfm1_raw not in valid_switch_values:
+            raise ValueError(
+                f"Invalid {_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT_ENV}={cfm1_raw!r}"
+            )
         if (
-            cfm2_raw in {"1", "true", "yes", "on"}
-            and _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV not in os.environ
+            _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV not in os.environ
             and _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV not in code2wav.env
         ):
-            # The competition Seed-TTS screen retained the exact audio length,
-            # passed WER, and stayed within the two-point WavLM-SIM allowance.
-            # Keep both launch-env and stage-env values authoritative so the
-            # full six-step solver remains a one-variable rollback.
-            code2wav.env[_MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV] = "2"
-            changed.append("code2wav-cfm2")
+            # Both reduced-step candidates passed WER and stayed within the
+            # two-point WavLM-SIM allowance. Keep explicit launch/stage values
+            # authoritative and expose a two-rung rollback ladder.
+            if cfm1_raw in {"1", "true", "yes", "on"}:
+                code2wav.env[_MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV] = "1"
+                changed.append("code2wav-cfm1")
+            elif cfm2_raw in {"1", "true", "yes", "on"}:
+                code2wav.env[_MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV] = "2"
+                changed.append("code2wav-cfm2")
 
     connectors = deploy.connectors
     if isinstance(connectors, dict):

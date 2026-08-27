@@ -1230,7 +1230,7 @@ class TestDeployConfigLoading:
             "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE": "1",
             "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM": "1",
             "VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND": "auto",
-            "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS": "2",
+            "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS": "1",
         }
 
     def test_minicpmo_single_chip_policy_preserves_explicit_authority(self):
@@ -1283,7 +1283,30 @@ class TestDeployConfigLoading:
         ] == "6"
         assert deploy.connectors["connector_of_shared_memory"]["extra"]["shm_event_notifications"] is False
 
-    def test_minicpmo_single_chip_policy_can_disable_cfm2_default(self, monkeypatch):
+    def test_minicpmo_single_chip_policy_can_fall_back_to_cfm2(self, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT", "0")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert deploy.stages[2].env[
+            "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
+        ] == "2"
+
+    def test_minicpmo_single_chip_policy_can_disable_reduced_cfm_defaults(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT", "0")
         monkeypatch.setenv("VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT", "0")
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)

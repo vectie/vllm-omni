@@ -6490,7 +6490,7 @@ while historical MiniCPM-o controls on other retained subsets were also near
 zero. Those figures are retained as cross-checks, not used as the competition
 admission metric.
 
-The evaluator-visible one-chip policy now fills an absent Stage-2
+The first evaluator-visible one-chip promotion filled an absent Stage-2
 `VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS` with `2`. An explicit stage or
 launch environment value remains authoritative. Setting
 `VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT=0` disables only this numerical
@@ -6521,6 +6521,44 @@ gain shows that Talker and per-chunk HiFT/orchestration are now a larger share
 of the critical path. A further solver-only reduction cannot close the full
 leaderboard gap by itself.
 
+### Quality-gated one-step CFM promotion
+
+The same official-protocol screen was then repeated with native CFM1. It
+completed 32/32 requests with 100% streaming continuity and passed both quality
+gates:
+
+| Solver | Concurrent duration | Mean WER | WavLM-base-plus SIM |
+| --- | ---: | ---: | ---: |
+| CFM6 retained control | 69.11 s | 0.00865 | about 0.84485 |
+| CFM2 | **40.60 s** | **0.0072** | **0.84240** |
+| CFM1 | 41.48 s | 0.0087 | 0.83694 |
+
+CFM1's SIM loss is only 0.79 percentage points relative to the retained CFM6
+proxy, inside the two-point allowance, and its WER remains below `0.0156`.
+Concurrency four did not improve because the reduced solver is no longer the
+dominant resource at that load. At concurrency one, where the leaderboard's
+per-request latency metrics are visible, it retained a smaller but measurable
+win over CFM2:
+
+| Metric | CFM2 | CFM1 | Change |
+| --- | ---: | ---: | ---: |
+| Mean flattened chunk RTF | 0.32233 | **0.30273** | **-6.08%** |
+| Median flattened chunk RTF | 0.23707 | **0.22418** | **-5.44%** |
+| P99 flattened chunk RTF | 0.72869 | **0.63560** | **-12.77%** |
+| Mean TTFP | 491.92 ms | **455.93 ms** | **-7.32%** |
+| Mean E2E | 1504.50 ms | **1392.11 ms** | **-7.47%** |
+| Complete batch duration | 48.16 s | **44.56 s** | **-7.46%** |
+
+The CFM1 performance run generated 155.72 seconds of audio versus CFM2's
+158.60 seconds, a 1.82% length difference that is inside the quality allowance
+but means the latency delta is not purely compute. The source default therefore
+uses a rollback ladder rather than deleting the safer candidate. With no
+explicit timestep value, CFM1 is selected. Setting
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT=0` falls back to CFM2; also
+setting `VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT=0` restores CFM6.
+An explicit launch or Stage-2 timestep value still wins over every default.
+The complete 2020-row official pool remains the release gate.
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/
@@ -6538,6 +6576,9 @@ leaderboard gap by itself.
 /tmp/lunanexa-bench/a2-evaluator-cfm3-safe-exact-official-quality-zh32/
 /tmp/lunanexa-bench/a2-evaluator-cfm3-safe-exact-official-export-zh32/
 /tmp/lunanexa-bench/a2-evaluator-source-default-cfm2-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-safe-exact-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-safe-exact-official-export-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-safe-exact-official-perf-zh32-conc1/
 /tmp/minicpmo-a2-evaluator-exact-defaults.log
 /tmp/minicpmo-a2-evaluator-cfm2.log
 /tmp/minicpmo-a2-evaluator-cfm5.log

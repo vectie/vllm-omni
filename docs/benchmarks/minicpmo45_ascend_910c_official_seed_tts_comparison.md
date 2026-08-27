@@ -6741,6 +6741,34 @@ source default.
 /tmp/minicpmo-a2-evaluator-cfm1-first47-terminal600-server.log
 ```
 
+### Isolated stable-PagedAttention rejection
+
+The earlier stable-input PagedAttention screen combined that graph contract
+with `weight_nz_mode=2`, so its catastrophic accuracy result did not identify
+which switch changed Talker sampling.  A new candidate isolated stable PA on
+the current first-47, CFM1 and terminal-600 source defaults without NZ weight
+preformatting.
+
+Its apparent performance was large but invalid: 32-row flattened chunk RTF
+fell from `0.26327` to `0.20155` and TTFP from `645.91` to `570.99` ms, while
+total generated audio increased from 159.68 to 200.20 seconds.  Wall-clock
+duration improved only 1.16%.  The official quality screen confirmed that the
+longer output was not a valid speedup: mean WER was `1.2856` across 31
+evaluable rows, with one ASR failure, versus the `0.0156` admission limit.
+WavLM-base-plus SIM was `0.7797`, but speaker similarity cannot compensate for
+incorrect spoken content.
+
+Stable PA is therefore rejected independently of NZ2 and is not enabled by
+the evaluator-visible policy.  Future Talker graph-input work must preserve
+the fused-attention numerical path and the codec/EOS distribution, not merely
+reduce graph-parameter maintenance.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-stable-pa-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-stable-pa-official-quality-sim-zh32/
+/tmp/minicpmo-a2-evaluator-cfm1-first47-terminal600-stable-pa-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

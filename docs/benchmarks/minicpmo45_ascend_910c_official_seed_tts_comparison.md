@@ -6164,3 +6164,31 @@ contract as both graph input and scheduler-visible request state.
 /tmp/lunanexa-bench/internal-codec-embed-official10-repeat/
 /tmp/minicpmo-cfm3-internal-codec-embed.log
 ```
+
+### Synchronous Talker scheduler rejection
+
+The post-EOS Python profile showed `EngineCore.step_with_batch_queue` on every
+codec step, so a matched candidate disabled asynchronous scheduling only for
+Stage 1.  The hypothesis was that a single-request benchmark had no second
+request whose work could justify the queue handoff.  Startup confirmed that
+Thinker remained asynchronous, Talker was synchronous, and the existing
+one-token decode graph captured and replayed normally.
+
+The queue was not wasted overhead: it overlaps CPU output processing with the
+next NPU decode.  Removing it serialized those phases and regressed the full
+10-request test despite 10/10 success and 100% streaming continuity:
+
+| Variant | Aggregate RTF | Mean reported RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained asynchronous Talker | **0.171280** | - | **267.86 ms** | 79.47 ms | **1023.84 ms** |
+| Synchronous Talker | 0.194153 | 0.196695 | 276.38 ms | **78.45 ms** | 1226.56 ms |
+
+Aggregate RTF regressed about 13.3% and E2E about 19.8%.  The profile was
+removed.  A future device-loop implementation should retain asynchronous
+request handling around the loop; eliminating the outer batch queue is not a
+substitute for amortizing multiple decode steps inside one worker execution.
+
+```text
+/tmp/lunanexa-bench/cfm3-sync-talker-official10/
+/tmp/minicpmo-cfm3-sync-talker.log
+```

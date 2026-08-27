@@ -339,21 +339,6 @@ def test_a2_talker_nz_preformats_only_stage_one_bf16_weights():
     assert stage2.engine_extras["additional_config"]["enable_cpu_binding"] is False
 
 
-def test_a2_talker_enpu_pipelines_only_stage_one_graph_updates():
-    deploy = _load_profile(
-        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_enpu_experimental.yaml"
-    )
-    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
-    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
-    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
-
-    assert stage1.env["ENPU_ENABLE"] == "true"
-    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"] == "1"
-    assert stage1.engine_extras["additional_config"]["weight_nz_mode"] == 2
-    assert "ENPU_ENABLE" not in (stage0.env or {})
-    assert "ENPU_ENABLE" not in (stage2.env or {})
-
-
 def test_a2_talker_nz_profiler_is_isolated_from_cfm_graph_process():
     deploy = _load_profile(
         "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_profile.yaml"

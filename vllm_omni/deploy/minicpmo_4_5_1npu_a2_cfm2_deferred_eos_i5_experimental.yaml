@@ -1,0 +1,15 @@
+# Atlas 800I A2 native two-step steady-CFM performance/accuracy screen.
+#
+# Rebuild the complete steady Code2Wav ABI at two Euler steps rather than
+# entering a variable-step eager fallback. Prompt prefill and the first audio
+# packet retain their one-step schedules. This profile changes synthesis
+# numerics and must pass the official Seed-TTS WER/SIM gate before submission.
+
+base_config: minicpmo_4_5_1npu_a2_cfm3_deferred_eos_i5_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS: "2"

@@ -6266,3 +6266,71 @@ per-module dtype conversion.
 /tmp/lunanexa-bench/cfm3-i5-hift-bf16-official10-repeat/
 /tmp/minicpmo-cfm3-i5-hift-bf16.log
 ```
+
+### Native static CFM2 performance/accuracy candidate
+
+The previous reduced-step rejection changed a loop bound but retained a wider
+serving ABI.  This candidate instead sets the complete steady Code2Wav solver
+width to two before backend construction.  Timeline tensors, all-step AdaLN,
+fixed estimator cache slabs, direct outputs and the outer graph are therefore
+native two-slot objects.  Prompt prefill and the first live packet retain
+their one-step schedules.
+
+Two matched runs completed 10/10 requests with 100% streaming continuity and
+produced exactly the same 56.24 and 63.20 seconds of audio as the retained
+CFM3 runs.  Lower is better:
+
+| Variant, pooled/two-run mean | Aggregate RTF | Mean reported RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained native CFM3 | 0.169000 | 0.172137 | **254.32 ms** | **79.69 ms** | 1008.77 ms |
+| Native static CFM2 | **0.161572** | **0.164286** | 260.21 ms | 80.69 ms | **964.40 ms** |
+
+Native CFM2 lowers pooled aggregate RTF by 4.40%, mean reported RTF by 4.56%
+and E2E by 4.40%.  TTFP regresses 2.32% despite using the same one-step first
+packet, and TTFT moves 1.25%; those movements confirm that steady CFM is no
+longer the dominant first-packet path.  CFM2 changes diffusion numerics and is
+retained only as a performance/accuracy candidate until official Seed-TTS
+WER/SIM passes within the two-point allowance.  It must not replace CFM3 in a
+submission based on transport success alone.
+
+```text
+/tmp/lunanexa-bench/cfm2-deferred-eos-i5-official10/
+/tmp/lunanexa-bench/cfm2-deferred-eos-i5-official10-repeat/
+/tmp/minicpmo-cfm2-deferred-eos-i5.log
+```
+
+### In-process Talker EngineCore rejection
+
+A Stage-1 architecture candidate removed the per-token ZMQ/msgpack boundary by
+hosting Talker's EngineCore on a dedicated thread in the API process.  The
+second revision also ran the complete single-request EngineCore loop on that
+thread, so codec steps no longer round-tripped through the asyncio event loop;
+only real streaming outputs were delivered back to the orchestrator.  Thinker
+and Code2Wav retained their ordinary subprocess isolation, and Talker retained
+asynchronous scheduling and the one-token decode graph.
+
+The complete-loop revision passed its cancellation/output-race tests and the
+real run completed 10/10 requests with 100% streaming continuity.  It reduced
+the first per-step inline prototype slightly, but remained decisively slower
+than the retained process-isolated stack.  Lower is better:
+
+| Variant | Aggregate RTF | Mean chunk RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained native CFM3 | **0.169000** | **0.172137** | **254.32 ms** | 79.69 ms | **1008.77 ms** |
+| Inline EngineCore, per-step event-loop handoff | 0.2733 | 0.28 | 429.28 ms | 81.83 ms | 1359.14 ms |
+| Inline EngineCore, continuous worker drain | 0.265986 | 0.276008 | 422.67 ms | **76.95 ms** | 1283.70 ms |
+
+The continuous loop proves that Python event-loop resubmission was only a
+small part of the regression.  Moving Talker's NPU runtime into the API
+process introduces more expensive GIL, host-thread and NPU-runtime contention;
+the original EngineCore subprocess already keeps its own efficient scheduler
+loop, so ZMQ is not the dominant Talker cost.  The inline runtime, profile and
+tests were removed.  A future multi-code Talker optimization must stay inside
+the isolated worker and fuse several model steps behind one engine command,
+instead of moving the entire EngineCore across the process boundary.
+
+```text
+/tmp/lunanexa-bench/cfm3-i5-talker-inline-v2-official10/
+/tmp/lunanexa-bench/cfm3-i5-talker-inline-drain-official10-valid/
+/tmp/minicpmo-cfm3-i5-talker-inline-drain.log
+```

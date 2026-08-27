@@ -432,3 +432,16 @@ def test_a2_cfm3_deferred_eos_is_scoped_to_sparse_talker_transport():
     assert stage1.env["VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES"] == "25"
     assert "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS" not in (stage2.env or {})
     assert stage2.env["VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"] == "3"
+
+
+def test_a2_cfm3_deferred_eos_profiler_keeps_stage_two_unprofiled():
+    deploy = _load_profile("minicpmo_4_5_1npu_a2_cfm3_deferred_eos_profile.yaml")
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage0.profiler_config is None
+    assert stage1.profiler_config["profiler"] == "torch"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"] == "1"
+    assert stage2.profiler_config is None
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"

@@ -6087,3 +6087,39 @@ the negative artifact remains at:
 /tmp/lunanexa-bench/cfm3-deferred-eos-rng-slab-official10/
 /tmp/minicpmo-cfm3-deferred-eos-rng-slab.log
 ```
+
+### Post-EOS trace and fixed-codec-slab rejection
+
+The retained chunk-boundary-EOS path was profiled again rather than assuming
+the previous trace still described it.  For the same 140-code hot request,
+`aclrtSynchronizeStreamWithTimeout` fell from 177.12 ms to 1.94 ms.  The
+Talker device window fell from 1066.70 to 864.79 ms, and free time from 676.25
+to 464.18 ms.  Device compute was 400.61 ms and free time remained 53.7%, so
+the dominant remaining budget is the per-code vLLM scheduler/IPC round trip,
+not scalar synchronization.  Slot mapping remained 26.69 ms, only 6.66% of
+device compute; its previously rejected isolated graph cannot close the
+remaining gap.
+
+A Python stack sample exposed recurrent sampled-code clones plus 147 Cat
+calls.  A fixed 16-code history ring and two 25-code ping-pong transport slabs
+removed those allocations and concatenations.  It passed five focused
+semantic tests and completed 10/10 requests with 100% continuity, but failed
+both structure and performance gates:
+
+| Variant | Aggregate RTF | Mean TTFP | Mean E2E | Middle-chunk RTF | Audio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained deferred EOS | **0.171280** | **267.86 ms** | **1023.84 ms** | **0.11607** | 59.80 s |
+| Fixed history/transport slabs | 0.176502 | 276.59 ms | 1046.48 ms | 0.11702 | 59.32 s |
+
+The candidate regressed RTF by 3.05%, TTFP by 3.26%, E2E by 2.21%, and also
+changed output length.  Per-token view copies/dependencies cost more than the
+removed small Cats on this A2 stack.  The implementation and profile were
+removed.  The next material architecture target is a Talker device loop or
+backend multi-step execution that amortizes scheduler crossings while
+preserving the efficient one-token Llama executable.
+
+```text
+/tmp/vllm-omni-profiles/minicpmo45/a2-cfm3-deferred-eos-stage1/
+/tmp/minicpmo-cfm3-deferred-eos-stage1.raw
+/tmp/lunanexa-bench/cfm3-fixed-codec-slabs-official10/
+```

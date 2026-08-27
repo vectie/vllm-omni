@@ -6637,6 +6637,45 @@ about 191 ms TTFP on this A2 host.
 /tmp/minicpmo-a2-evaluator-cfm1-first72-official-server.log
 ```
 
+The evaluator-visible source default was then restarted without either an
+explicit timestep or chunk-boundary override.  The same 32-row, two-warmup,
+concurrency-one protocol measured mean flattened chunk RTF `0.27780`, P99
+`0.52572`, mean TTFP `648.94 ms`, and mean E2E `1418.63 ms`.  This is within
+1.10% of the explicit first-47 candidate and proves that the submitted source,
+not only the exploratory launch environment, selects CFM1 and first-47.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-source-default-cfm1-first47-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-source-default-cfm1-first47-server.log
+```
+
+### Steady-47 fixed-width rejection
+
+The next candidate also changed every steady Talker publication from 25 to 47
+new codec frames.  With the three-frame left context this makes the normal
+Stage-2 input width 50, but it did not improve the ranked metric.  The exact
+environment was confirmed in the Stage-1 process before measurement.
+
+| Candidate | Chunks | Mean chunk RTF | P99 chunk RTF | Mean TTFP | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Source default: first 47, steady 25 | 141 | **0.27780** | **0.52572** | **648.94 ms** | **1418.63 ms** |
+| First 47, steady 47 | 98 | 0.33763 | 1.11675 | 651.50 ms | 1493.27 ms |
+
+Steady-47 regressed mean RTF by **21.54%**.  Its 66 non-terminal chunks
+already averaged `0.29689`, so the wider Stage-2 work is not cheaper per audio
+second on this A2 stack.  In addition, the 32 terminal chunks averaged
+`0.42168` and reached `1.19613`: a large publication boundary leaves a shorter
+terminal remainder whose fixed launch cost is heavily amplified by the
+organizer's unweighted mean-over-chunks metric.  Static width alone is
+therefore insufficient.  Future chunk-shape work must eliminate or cheaply
+complete short terminal packets and pass WER/SIM; this launch candidate is
+rejected and is not a source default.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-steady47-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-cfm1-first47-steady47-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

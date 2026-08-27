@@ -6016,3 +6016,59 @@ executable; prompt n-gram reuse is closed.
 /tmp/lunanexa-bench/cfm3-talker-ngram3-official10/
 /tmp/minicpmo-cfm3-talker-ngram3-v3.log
 ```
+
+### Current CFM3 Talker trace and chunk-boundary EOS candidate
+
+A fresh Stage-1-only trace was captured on the current static-CFM3 service,
+after stable PagedAttention and the fused inverse-CDF sampler had landed.  The
+1.067-second Talker window contained 390.45 ms of device compute and 676.25 ms
+of free time: the device was still idle for 63.4% of the observed interval.
+MatMulV2 and PagedAttention accounted for 40.36% and 32.90% of device compute,
+respectively, but the host trace exposed the more actionable serialization:
+
+| Host/API event | Count | Total time |
+| --- | ---: | ---: |
+| `aclrtSynchronizeStreamWithTimeout` | 229 | 177.12 ms |
+| `_local_scalar_dense` operator rows | about 141 | about one per codec step |
+| `aclnnInplaceUniform` | 140 | 10.03 ms |
+| `aclrtRandomNumAsync` | 140 | 6.65 ms |
+| `_compute_slot_mapping_kernel` | 141 | 26.66 ms device time |
+
+The ordinary Talker reads the sampled EOS scalar after every eligible codec
+token.  Sparse transport, however, makes codec output visible to Code2Wav only
+at the 10-frame initial and 25-frame steady boundaries.  The experimental
+`VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS` path therefore retains samples
+on-device, reads one vector at the existing publish boundary, finds the first
+EOS there, and publishes only the prefix before EOS.  The max-token boundary
+still drops its sampled code.  Native-duplex and non-sparse paths retain the
+ordinary immediate EOS behavior.
+
+The matched test used the same static-CFM3 base, two warmups, ten fixed Chinese
+Seed-TTS prompts, concurrency one, seed zero and temperature zero.  Both runs
+completed 10/10 with 100% continuity.
+
+| Variant | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E | Serving duration | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Per-token EOS control | 0.208119 | 273.43 ms | **78.61 ms** | 1171.62 ms | 11.721 s | 56.32 s |
+| Chunk-boundary EOS | **0.171280** | **267.86 ms** | 79.47 ms | **1023.84 ms** | **10.243 s** | 59.80 s |
+
+Lower is better except audio duration.  The candidate lowers aggregate RTF by
+17.70%, mean E2E and total serving time by 12.61%, and TTFP by 2.04%; TTFT
+moves +1.09%, inside the 2% guard.  Mean middle-chunk RTF computed directly
+from raw samples falls from 0.15341 to 0.11607 (-24.34%), and continuity stays
+at 100%.
+
+This is a real execution-speed improvement, not merely a denominator effect:
+wall-clock serving time fell even though the run generated 6.18% more audio.
+That duration change also means the optimization is not bit-exact.  It remains
+an accuracy-gated candidate until paired Seed-TTS WER/SIM, Daily-Omni and
+Video-MME stay within the competition's two-point allowance.  The missing
+derived summary fields in the candidate JSON are a benchmark-reporting issue;
+the artifact contains all ten TTFP/E2E arrays and all 70 per-chunk RTF arrays,
+which were used for the figures above.
+
+```text
+/tmp/vllm-omni-profiles/minicpmo45/a2-cfm3-current-stage1/
+/tmp/lunanexa-bench/cfm3-deferred-eos-official10/
+/tmp/minicpmo-cfm3-deferred-eos.log
+```

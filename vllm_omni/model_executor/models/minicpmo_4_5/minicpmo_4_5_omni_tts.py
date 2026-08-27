@@ -50,6 +50,7 @@ _NPU_BOUNDED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_BOUNDED_CODEC_SAMPLER
 _NPU_CODEC_SAMPLER_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"
 _NPU_FUSED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_SAMPLER"
 _NPU_BATCHED_CODEC_OUTPUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
+_NPU_DEFERRED_CHUNK_EOS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"
 _DIRECT_STOP_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER"
 _CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES"
 _INITIAL_CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"
@@ -309,6 +310,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # publishable chunk instead of one D2H for every autoregressive step.
         self.batched_codec_output = _env_enabled(
             _NPU_BATCHED_CODEC_OUTPUT_ENV,
+            default=False,
+        )
+        # In the sparse chunk transport path, an EOS decision is not visible
+        # downstream until the next publish boundary anyway.  Defer its scalar
+        # D2H read to that boundary so steady Talker decode does not serialize
+        # the NPU and Python once per codec token.  The boundary copy is also
+        # used to keep EOS and any speculative post-EOS codes out of the
+        # sequence seen by Code2Wav.
+        self.deferred_chunk_eos = self.batched_codec_output and _env_enabled(
+            _NPU_DEFERRED_CHUNK_EOS_ENV,
             default=False,
         )
         # The Talker samples codec IDs internally. Its vLLM-visible two-token
@@ -1042,6 +1053,59 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         chunks_by_request[request_id] = chunk_index + 1
         return output
 
+    def _transport_codec_delta_with_deferred_eos(
+        self,
+        request_id: str,
+        sampled: torch.Tensor,
+        *,
+        step: int,
+        min_tokens: int,
+        reached_limit: bool,
+    ) -> tuple[torch.Tensor, bool]:
+        """Publish one codec slab and reconcile EOS once per chunk.
+
+        Samples are retained on-device until the normal Code2Wav boundary.
+        At that boundary a single vector read replaces one scalar read after
+        every eligible Talker token.  If EOS occurred inside the slab, only
+        the prefix before it is published; later speculative samples are
+        discarded together with the terminal request state.
+        """
+        pending = self._request_transport_codes.setdefault(request_id, [])
+        if not reached_limit:
+            # The fused sampler graph reuses this output address on replay.
+            pending.append(sampled.reshape(-1).clone())
+
+        chunk_index = self._request_transport_chunks.get(request_id, 0)
+        default_chunk = max(1, int(os.environ.get(_CODEC_CHUNK_FRAMES_ENV, "25")))
+        initial_chunk = max(
+            1,
+            int(os.environ.get(_INITIAL_CODEC_CHUNK_FRAMES_ENV, str(default_chunk))),
+        )
+        threshold = initial_chunk if chunk_index == 0 else default_chunk
+        if not reached_limit and len(pending) < threshold:
+            return sampled.new_empty((0, 1)), False
+        if not pending:
+            return sampled.new_empty((0, 1)), False
+
+        output = torch.cat(pending).reshape(1, -1)
+        is_eos = False
+        # EOS is masked for all samples whose zero-based step is below
+        # min_tokens.  Avoid even the chunk readback at those early boundaries.
+        if reached_limit or step >= min_tokens:
+            eos_id = self._num_audio_tokens - 1
+            host_codes = output.reshape(-1).tolist()
+            try:
+                eos_offset = host_codes.index(eos_id)
+            except ValueError:
+                eos_offset = -1
+            if eos_offset >= 0:
+                output = output[:, :eos_offset]
+                is_eos = True
+
+        pending.clear()
+        self._request_transport_chunks[request_id] = chunk_index + 1
+        return output, is_eos
+
     def make_omni_output(
         self,
         model_outputs: torch.Tensor | OmniOutput,
@@ -1180,27 +1244,47 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             min_tokens = int(state.get("min_tokens", self._codec_min_tokens))
             state["step"] = step + 1
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
-            is_eos = self._sampled_code_is_eos(
-                sampled,
-                step=step,
-                min_tokens=min_tokens,
-                reached_limit=reached_limit,
+            defer_eos = (
+                getattr(self, "deferred_chunk_eos", False)
+                and getattr(self, "batched_codec_output", False)
+                and not native_duplex
             )
-            finished = is_eos or reached_limit
-            state["finished"] = finished
-            # MiniCPMTTS.generate_chunk consumes the boundary sample but
-            # returns only codes that were fed into the retained KV state.
-            if not is_eos and not reached_limit:
+            if defer_eos:
+                is_eos = False
+            else:
+                is_eos = self._sampled_code_is_eos(
+                    sampled,
+                    step=step,
+                    min_tokens=min_tokens,
+                    reached_limit=reached_limit,
+                )
+            # MiniCPMTTS.generate_chunk consumes the max-token boundary sample
+            # but returns only codes that were fed into retained KV state.
+            # Deferred EOS may feed a few terminal-tail samples speculatively;
+            # the transport boundary trims all of them from observable output.
+            if (defer_eos or not is_eos) and not reached_limit:
                 codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)])
                 delta = sampled.reshape(1, 1)
             else:
                 delta = empty_delta
-            delta = self._transport_codec_delta(
-                request_id,
-                delta,
-                finished=finished,
-                native_duplex=native_duplex,
-            )
+            if defer_eos:
+                delta, is_eos = self._transport_codec_delta_with_deferred_eos(
+                    request_id,
+                    sampled,
+                    step=step,
+                    min_tokens=min_tokens,
+                    reached_limit=reached_limit,
+                )
+                finished = is_eos or reached_limit
+            else:
+                finished = is_eos or reached_limit
+                delta = self._transport_codec_delta(
+                    request_id,
+                    delta,
+                    finished=finished,
+                    native_duplex=native_duplex,
+                )
+            state["finished"] = finished
             state["codes"] = codes
             info["audio_state"] = state
             info["audio_codes"] = {

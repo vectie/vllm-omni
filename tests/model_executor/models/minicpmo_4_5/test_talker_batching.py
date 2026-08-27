@@ -66,6 +66,10 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._stop_logits_constants = None
     talker._stop_token_constants = None
     talker.direct_stop_sampler = False
+    talker.batched_codec_output = False
+    talker.deferred_chunk_eos = False
+    talker._request_transport_codes = {}
+    talker._request_transport_chunks = {}
     talker._request_generators = {}
     talker._request_audio_states = {}
     talker._request_repetition_frequencies = {}
@@ -230,6 +234,70 @@ def test_talker_marks_only_publishable_codec_chunks_as_sparse_output(monkeypatch
     assert first.multimodal_outputs["codes"]["audio"] == []
     assert second.multimodal_outputs["meta"]["req_id"] == ["req-sparse-output"]
     assert second.multimodal_outputs["codes"]["audio"][0].tolist() == [[3, 4]]
+
+
+def test_talker_deferred_eos_trims_terminal_tail_at_chunk_boundary(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "3")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "3")
+    talker = _make_talker()
+    talker.batched_codec_output = True
+    talker.deferred_chunk_eos = True
+    samples = iter((torch.tensor(1), torch.tensor(7), torch.tensor(3)))
+    monkeypatch.setattr(talker, "_sample_audio_code", lambda *_args: next(samples))
+    monkeypatch.setattr(
+        talker,
+        "_sampled_code_is_eos",
+        lambda *_args, **_kwargs: pytest.fail("deferred EOS must avoid per-token scalar reads"),
+    )
+    info = {
+        "request_id": "req-deferred-eos",
+        "audio_state": {"step": 0, "min_tokens": 0, "max_tokens": 10},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    outputs = [
+        talker.make_omni_output(
+            torch.ones(1, 2),
+            model_intermediate_buffer=[info],
+            request_token_spans=[(0, 1)],
+        )
+        for _ in range(3)
+    ]
+
+    assert outputs[0].multimodal_outputs["codes"]["audio"] == []
+    assert outputs[1].multimodal_outputs["codes"]["audio"] == []
+    assert outputs[2].multimodal_outputs["codes"]["audio"][0].tolist() == [[1]]
+    assert outputs[2].multimodal_outputs["meta"]["finished"][0].item() is True
+    assert talker._request_transport_codes["req-deferred-eos"] == []
+
+
+def test_talker_deferred_eos_flushes_limit_without_boundary_sample(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "4")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "4")
+    talker = _make_talker()
+    talker.batched_codec_output = True
+    talker.deferred_chunk_eos = True
+    samples = iter((torch.tensor(1), torch.tensor(2), torch.tensor(6)))
+    monkeypatch.setattr(talker, "_sample_audio_code", lambda *_args: next(samples))
+    info = {
+        "request_id": "req-deferred-limit",
+        "audio_state": {"step": 0, "min_tokens": 50, "max_tokens": 3},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    outputs = [
+        talker.make_omni_output(
+            torch.ones(1, 2),
+            model_intermediate_buffer=[info],
+            request_token_spans=[(0, 1)],
+        )
+        for _ in range(3)
+    ]
+
+    assert outputs[0].multimodal_outputs["codes"]["audio"] == []
+    assert outputs[1].multimodal_outputs["codes"]["audio"] == []
+    assert outputs[2].multimodal_outputs["codes"]["audio"][0].tolist() == [[1, 2]]
+    assert outputs[2].multimodal_outputs["meta"]["finished"][0].item() is True
 
 
 def _routed(output, index: int):

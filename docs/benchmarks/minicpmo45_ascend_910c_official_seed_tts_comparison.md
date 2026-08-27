@@ -6499,6 +6499,28 @@ broader matched rollback. The complete official Seed-TTS pool remains a final
 release gate before submission; this 32-row promotion is the fail-fast screen,
 not a claim that the full pool has already run.
 
+A fresh source-visibility run then launched the generic evaluator-compatible
+deploy with no timestep override. The policy log included `code2wav-cfm2`, and
+Stage 2 reported `token2wav_n_timesteps=2`, proving that the organizer-visible
+source path—not a private profile or benchmark environment—selected the new
+solver. Its 32-row concurrency-one result is directly comparable with the
+retained CFM6 run on the same A2 host:
+
+| Metric | CFM6 | Source-default CFM2 | Change |
+| --- | ---: | ---: | ---: |
+| Mean flattened chunk RTF | 0.39525 | **0.32233** | **-18.45%** |
+| Median flattened chunk RTF | 0.25438 | **0.23707** | **-6.80%** |
+| P99 flattened chunk RTF | not retained | 0.72869 | — |
+| Mean TTFP | 621.37 ms | **491.92 ms** | **-20.83%** |
+| Mean E2E | 1797.41 ms | **1504.50 ms** | **-16.29%** |
+| Mean TTFT | 80.95 ms | **76.01 ms** | **-6.10%** |
+| Audio throughput | 2.7066 audio-s/s | **3.2933 audio-s/s** | **+21.67%** |
+
+The smaller concurrency-one gain relative to the concurrency-four duration
+gain shows that Talker and per-chunk HiFT/orchestration are now a larger share
+of the critical path. A further solver-only reduction cannot close the full
+leaderboard gap by itself.
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/
@@ -6515,6 +6537,7 @@ not a claim that the full pool has already run.
 /tmp/lunanexa-bench/a2-evaluator-cfm2-safe-exact-official-export-zh32/
 /tmp/lunanexa-bench/a2-evaluator-cfm3-safe-exact-official-quality-zh32/
 /tmp/lunanexa-bench/a2-evaluator-cfm3-safe-exact-official-export-zh32/
+/tmp/lunanexa-bench/a2-evaluator-source-default-cfm2-official-perf-zh32-conc1/
 /tmp/minicpmo-a2-evaluator-exact-defaults.log
 /tmp/minicpmo-a2-evaluator-cfm2.log
 /tmp/minicpmo-a2-evaluator-cfm5.log

@@ -1220,7 +1220,17 @@ class TestDeployConfigLoading:
             }
         connector = deploy.connectors["connector_of_shared_memory"]
         assert connector["extra"]["shm_event_notifications"] is True
-        assert deploy.stages[2].env is None
+        assert deploy.stages[1].env == {
+            "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "1",
+            "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS": "1",
+            "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER": "1",
+        }
+        assert deploy.stages[1].engine_extras.get("additional_config") is None
+        assert deploy.stages[2].env == {
+            "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE": "1",
+            "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM": "1",
+            "VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND": "auto",
+        }
 
     def test_minicpmo_single_chip_policy_preserves_explicit_authority(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -1230,6 +1240,16 @@ class TestDeployConfigLoading:
             platform="npu",
         )
         deploy.stages[0].compilation_config = {"cudagraph_mode": "NONE"}
+        deploy.stages[1].env = {
+            "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "0",
+        }
+        deploy.stages[1].engine_extras["additional_config"] = {
+            "weight_nz_mode": 0,
+            "enable_stable_pa_graph_inputs": False,
+        }
+        deploy.stages[2].env = {
+            "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE": "0",
+        }
         deploy.connectors["connector_of_shared_memory"]["extra"]["shm_event_notifications"] = False
 
         assert _apply_minicpmo45_single_chip_policy(
@@ -1244,7 +1264,46 @@ class TestDeployConfigLoading:
             "cudagraph_mode": "FULL_DECODE_ONLY",
             "cudagraph_capture_sizes": [1],
         }
+        assert deploy.stages[1].env[
+            "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
+        ] == "0"
+        assert deploy.stages[1].engine_extras["additional_config"][
+            "weight_nz_mode"
+        ] == 0
+        assert deploy.stages[1].engine_extras["additional_config"][
+            "enable_stable_pa_graph_inputs"
+        ] is False
+        assert deploy.stages[2].env[
+            "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE"
+        ] == "0"
         assert deploy.connectors["connector_of_shared_memory"]["extra"]["shm_event_notifications"] is False
+
+    def test_minicpmo_single_chip_policy_can_disable_exact_defaults(self, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS", "0")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        for stage in deploy.stages[:2]:
+            assert stage.compilation_config == {
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [1],
+            }
+        assert deploy.stages[1].env is None
+        assert deploy.stages[1].engine_extras.get("additional_config") is None
+        assert deploy.stages[2].env is None
+        connector = deploy.connectors["connector_of_shared_memory"]
+        assert connector["extra"]["shm_event_notifications"] is True
 
     def test_minicpmo_a3_policy_preserves_explicit_compile_mode(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")

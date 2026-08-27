@@ -53,6 +53,23 @@ def test_single_chip_canonical_profile_is_fp32_fixed_planar_cache_major():
     assert extra["npu_cfm_planar_kv_slabs"] is True
 
 
+def test_a2_evaluator_compat_profile_changes_capacity_not_model_numerics():
+    deploy = _load_profile("minicpmo_4_5_1npu_a2_evaluator_compat.yaml")
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+
+    assert stage0.max_num_seqs == 1
+    assert stage0.max_model_len == 8192
+    assert stage0.engine_extras["kv_cache_memory_bytes"] == 1342177280
+    assert stage0.skip_mm_profiling is True
+    assert stage1.max_num_seqs == 1
+    assert stage1.engine_extras["kv_cache_memory_bytes"] == 268435456
+    assert "token2wav_n_timesteps" not in extra
+    assert "initial_codec_chunk_frames" not in extra
+    assert not any(key.startswith("npu_") for key in extra)
+
+
 def test_single_chip_qkv_candidate_adds_only_explicit_qkv_pack():
     deploy = _load_profile(
         "minicpmo_4_5_1npu_910c_cfm6_canonical_qkv_dma_experimental.yaml"

@@ -6334,3 +6334,138 @@ instead of moving the entire EngineCore across the process boundary.
 /tmp/lunanexa-bench/cfm3-i5-talker-inline-drain-official10-valid/
 /tmp/minicpmo-cfm3-i5-talker-inline-drain.log
 ```
+
+### Evaluator-visible source policy and official-protocol qualification
+
+The organizer installs the submitted Python source but supplies
+`vllm_omni/deploy/minicpmo_4_5.yaml` from the current `minicpm-challenge`
+baseline. Candidate-only deployment profiles therefore do not affect the
+score. The single-chip source policy now fills only absent, output-preserving
+Talker and Code2Wav settings: batched codec transport, deferred chunk EOS,
+direct binary stop control, prompt-state templates, HiFT weight-normalization
+materialization, and event-backed shared-memory wakeup.
+Explicit deploy values retain authority, and
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS=0` provides a matched rollback
+without disabling the existing Stage-0/1 decode graphs or connector events.
+
+The official A3 YAML cannot initialize Stage 0 on the available 32-GiB 910B4,
+so `minicpmo_4_5_1npu_a2_evaluator_compat.yaml` changes capacity planning only.
+It deliberately carries no CFM, chunk-boundary, dtype, sampler, or model
+numeric overrides. With the source defaults and native CFM6, ten fixed Chinese
+Seed-TTS requests completed 10/10 with 100% continuity. A second service was
+then launched with
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS=0`; it retained the same
+Stage-0/1 decode graphs and event-backed shared memory, but removed only the
+new exact producer/consumer defaults. Lower is better:
+
+| CFM6 source policy | Prompts | Mean audio RTF | Mean chunk RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Exact defaults | 10 | **0.387873** | **0.404148** | **594.21 ms** | **78.34 ms** | **1758.29 ms** |
+| Exact-default rollback | 10 | 0.426696 | 0.451212 | 873.99 ms | 82.16 ms | 2035.45 ms |
+
+This exploratory matched run suggested that the bundle could improve the
+evaluator's primary all-chunk RTF by **10.43%**,
+mean request RTF by **9.10%**, TTFP by **32.01%**, TTFT by **4.65%**, and E2E
+by **13.62%**. The generated totals differ by one 1.32-second sampled audio
+chunk (46.96 versus 48.28 seconds), but both per-request RTF and the official
+flattened chunk statistic independently show a large win. This matched
+rollback justified an official-protocol follow-up; it did not qualify the
+bundle for submission.
+
+These first A2 policy runs also inherited the exploratory server flag
+`--interleave-mm-strings`. The official Seed-TTS server fixture intentionally
+omits that flag because interleaving and TTS `ref_audio` must not share the
+Daily-Omni request path. The relative exact/rollback A/B remains useful because
+both sides used the same server, but final promotion metrics and all accuracy
+screens must be repeated with only the official deploy config plus
+`--trust-remote-code`.
+
+The reduced-solver experiments use that retained exact policy:
+
+| Native solver | Prompts | Mean audio RTF | Mean chunk RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| CFM6 | 10 | 0.387873 | 0.404148 | 594.21 ms | 78.34 ms | 1758.29 ms |
+| CFM5 | 32 | 0.310151 | 0.320209 | 556.73 ms | 78.44 ms | 1710.61 ms |
+| CFM2 | 10 | 0.264708 | 0.268982 | 449.46 ms | 78.81 ms | 1209.94 ms |
+| CFM2 | 32 | **0.257140** | **0.260838** | **440.75 ms** | **76.99 ms** | **1118.29 ms** |
+
+CFM2 reduced matched ten-row RTF by 31.8%, TTFP by 24.4%, and E2E by
+31.2%, confirming that solver arithmetic—not transport microseconds—is the
+dominant remaining score budget. It remains an unqualified performance
+candidate. The first 32-row Paraformer screens used the deterministic
+performance setting `temperature=0` and reported mean WER `1.202915` for CFM2
+and `1.246473` for CFM5. A subsequent CFM6 control under that same setting also
+reported catastrophic WER (`1.3103`), proving that this screen measured an
+unusable argmax Talker codec distribution rather than reduced-CFM accuracy.
+Those WER numbers must not be used to accept or reject any solver width.
+
+The official Seed-TTS accuracy test leaves temperature unset so the server's
+model generation config controls Talker sampling, and runs concurrency four.
+CFM2 and CFM5 therefore remain opt-in research controls until they are rerun
+under that exact protocol. A distilled few-step flow map/student remains the
+safer large-gain route if the correctly controlled native reductions fail.
+
+The corrected CFM6 control, with no interleave flag, 32 fixed Chinese rows,
+two warmups, concurrency four and server-default temperature, passed the
+quality gate decisively. The first candidate also enabled Talker
+`weight_nz_mode=2` and stable PA graph inputs. That pair was rejected: it
+changed the sampled codec/audio distribution, failed WER catastrophically and
+did not improve the concurrent run. Lower is better except audio throughput:
+
+| Official-protocol CFM6 | Duration | Audio throughput | Mean chunk RTF | Mean TTFP | Mean TTFT | Mean WER |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Rollback control | 78.09 s | 2.0311 audio-s/s | 2.0222 | **3850.48 ms** | **111.20 ms** | **0.00865** |
+| NZ2 + stable-PA candidate | 85.93 s | 1.9816 audio-s/s | 2.0531 | **2917.34 ms** | 111.45 ms | 1.22731 |
+| Safe exact paths, no NZ/stable PA | **69.11 s** | **2.2950 audio-s/s** | **1.7978** | 3884.46 ms | 116.07 ms | **0.00865** |
+
+The concurrent quality run includes queue stalls in per-chunk RTF and TTFP,
+so those absolute values are not leaderboard numbers. They are valid for this
+paired rejection. The candidate generated 170.28 seconds of audio versus
+158.60 seconds for the control and missed the `0.0156` WER gate by two orders
+of magnitude. NZ2 and stable PA were therefore removed from evaluator-visible
+defaults. The remaining transport/cache/HiFT exact paths generated the same
+158.60 seconds of audio as the control and exactly matched its mean WER. They
+lowered benchmark duration by **11.50%**, mean chunk RTF by **11.10%**, and
+mean E2E latency by **11.58%**, while increasing audio throughput by
+**13.00%**. Mean TTFP moved 0.88% and TTFT 4.38% in the wrong direction, so
+those first-response movements are treated as noise/regression rather than a
+claimed win. The safe exact bundle is promoted; the rejected layout leaves
+remain experimental-only.
+
+A separate concurrency-one run of the promoted CFM6 candidate completed
+32/32 requests with 100% continuity: mean chunk RTF `0.39525`, median chunk
+RTF `0.25438`, mean TTFP `621.37 ms`, and mean TTFT `80.95 ms` on the available
+910B4. These A2 absolute numbers are not compared directly with the single
+910C leaderboard, but they provide the local target for reduced-solver
+qualification.
+
+At the 2026-08-27 23:58:38 leaderboard refresh, `向量贴贴` ranked ninth at
+RTF `0.2423`, TTFP `514.22 ms` and TTFT `45.72 ms`. The RTF leader reported
+`0.1066`, while the best observed first-response entry reported TTFP
+`156.03 ms` and TTFT `6.37 ms`. The primary gap is now Stage-2 throughput:
+closing the RTF gap requires about a 56% reduction from the submitted score,
+not another microsecond-scale transport fusion.
+
+The quality run also found that FunASR's default `AutoModel` initialization
+performs an update check even when the Paraformer checkpoint is already
+cached. The evaluator now passes `disable_update=True`, with compatibility
+fallbacks for older FunASR releases. This removes an external-network hang
+from repeatable accuracy qualification without changing ASR results.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
+/tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/
+/tmp/lunanexa-bench/a2-evaluator-cfm2-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm2-wer-fixed-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm5-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm5-wer-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm6-rollback-zh10/
+/tmp/lunanexa-bench/a2-evaluator-cfm6-rollback-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm6-exact-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm6-safe-exact-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm6-safe-exact-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-exact-defaults.log
+/tmp/minicpmo-a2-evaluator-cfm2.log
+/tmp/minicpmo-a2-evaluator-cfm5.log
+/tmp/minicpmo-a2-evaluator-cfm6-rollback.log
+```

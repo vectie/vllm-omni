@@ -33,7 +33,25 @@ _MINICPMO45_A3_PLANAR_DEFAULTS_ENV = (
 )
 _MINICPMO45_A3_FULL_DECODE_CAPTURE_SIZES = [1, 2, 4]
 _MINICPMO45_SINGLE_CHIP_POLICY_ENV = "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_POLICY"
+_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS_ENV = (
+    "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS"
+)
 _MINICPMO45_SINGLE_CHIP_CAPTURE_SIZES = [1]
+_MINICPMO45_SINGLE_CHIP_TALKER_ENV_DEFAULTS = {
+    # These paths preserve the sampled codec sequence.  They change only how
+    # often already-produced values cross the worker/orchestrator boundary.
+    "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "1",
+    "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS": "1",
+    "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER": "1",
+}
+_MINICPMO45_SINGLE_CHIP_CODE2WAV_ENV_DEFAULTS = {
+    # Immutable prompt-state templates are keyed by the complete reference
+    # content fingerprint and cloned into request-owned mutable slabs.
+    "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE": "1",
+    # Weight-normalization materialization is an exact inference rewrite.
+    "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM": "1",
+    "VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND": "auto",
+}
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
@@ -901,9 +919,12 @@ def _apply_minicpmo45_single_chip_policy(
     an event instead of the one-millisecond polling fallback.
 
     This policy intentionally does not enable the BF16/fixed-planar Stage-2
-    bundle: that bundle regressed the prior colocated one-device A/B.  Explicit
-    placements, compile modes, connector choices, and connector values retain
-    authority.
+    bundle: that bundle regressed the prior colocated one-device A/B. It does
+    enable the exact producer/consumer rewrites that won their complete-service
+    A/B: chunk-boundary codec transport, direct binary stop control, deferred
+    EOS reconciliation, immutable prompt-state templates, and inference-time
+    HiFT weight-norm materialization. Explicit placements, compile modes,
+    runtime settings, connector choices, and connector values retain authority.
     """
     if pipeline.model_type != "minicpmo_4_5":
         return False
@@ -943,6 +964,30 @@ def _apply_minicpmo45_single_chip_policy(
         )
         stage.compilation_config = compilation
         changed.append(f"stage-{stage_id}-decode-graph")
+
+    exact_raw = os.environ.get(
+        _MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS_ENV, "1"
+    ).strip().lower()
+    if exact_raw not in {"0", "false", "no", "off", "1", "true", "yes", "on"}:
+        raise ValueError(
+            f"Invalid {_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS_ENV}={exact_raw!r}"
+        )
+    exact_defaults = exact_raw in {"1", "true", "yes", "on"}
+
+    if exact_defaults:
+        talker = by_id[1]
+        talker.env = dict(talker.env or {})
+        for name, value in _MINICPMO45_SINGLE_CHIP_TALKER_ENV_DEFAULTS.items():
+            if name not in talker.env:
+                talker.env[name] = value
+                changed.append("talker-" + name.rsplit("_", 1)[-1].lower())
+
+        code2wav = by_id[2]
+        code2wav.env = dict(code2wav.env or {})
+        for name, value in _MINICPMO45_SINGLE_CHIP_CODE2WAV_ENV_DEFAULTS.items():
+            if name not in code2wav.env:
+                code2wav.env[name] = value
+                changed.append("code2wav-" + name.rsplit("_", 1)[-1].lower())
 
     connectors = deploy.connectors
     if isinstance(connectors, dict):

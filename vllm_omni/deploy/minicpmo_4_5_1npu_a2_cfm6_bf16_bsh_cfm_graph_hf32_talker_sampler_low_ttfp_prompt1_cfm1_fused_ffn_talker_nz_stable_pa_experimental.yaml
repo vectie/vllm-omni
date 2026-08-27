@@ -1,0 +1,21 @@
+# Atlas 800I A2 Talker stable-input PagedAttention candidate.
+#
+# Stage 1 decodes one token at a time with fixed model-runner input buffers.
+# PagedAttention reads block tables and context lengths from tensors, unlike
+# FIA's host-valued sequence-length attributes. The matching vLLM-Ascend
+# opt-in therefore replays the captured PA tasks directly and removes twenty
+# per-layer task rebuilds from every Talker decode step.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        additional_config:
+          enable_cpu_binding: false
+          weight_nz_mode: 2
+          pa_shape_list: [1]
+          enable_stable_pa_graph_inputs: true
+          ascend_compilation_config:
+            fuse_norm_quant: false

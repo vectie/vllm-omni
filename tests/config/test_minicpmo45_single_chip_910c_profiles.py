@@ -339,6 +339,22 @@ def test_a2_talker_nz_preformats_only_stage_one_bf16_weights():
     assert stage2.engine_extras["additional_config"]["enable_cpu_binding"] is False
 
 
+def test_a2_talker_stable_pa_removes_per_layer_graph_rebinding():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_stable_pa_experimental.yaml"
+    )
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    additional_config = stage1.engine_extras["additional_config"]
+    assert additional_config["pa_shape_list"] == [1]
+    assert additional_config["enable_stable_pa_graph_inputs"] is True
+    assert additional_config["weight_nz_mode"] == 2
+    assert "pa_shape_list" not in stage0.engine_extras["additional_config"]
+    assert "pa_shape_list" not in stage2.engine_extras["additional_config"]
+
+
 def test_a2_talker_nz_profiler_is_isolated_from_cfm_graph_process():
     deploy = _load_profile(
         "minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_profile.yaml"

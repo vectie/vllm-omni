@@ -5762,3 +5762,17 @@ vLLM-visible stop channel changes implementation.
 /tmp/lunanexa-bench/talker-static-stop-buffers-official10/
 /tmp/minicpmo-static-stop-buffers.log
 ```
+
+A subsequent sparse-output sentinel experiment was rejected. It reused one
+resident empty NPU tensor for all non-publishable codec steps and represented
+terminal metadata as Python booleans until a chunk boundary. Despite removing
+two empty-tensor allocations per code, the same-duration benchmark regressed
+RTF from 0.280486 to 0.286711 (+2.22%), TTFP from 343.61 to 351.87 ms, and hot
+Stage-1 ITL from 8.238 to 8.359 ms/code (+1.47%). The stable empty-tensor
+address likely introduced alias/event dependencies that outweighed allocator
+work. The implementation was fully removed; only the result artifact remains:
+
+```text
+/tmp/lunanexa-bench/talker-resident-empty-output-official10/
+/tmp/minicpmo-resident-empty-output.log
+```

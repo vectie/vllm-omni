@@ -6232,3 +6232,37 @@ first HiFT partition must be covered by the same end-to-end audio screen.
 /tmp/lunanexa-bench/cfm3-deferred-eos-i5-official10-repeat/
 /tmp/minicpmo-cfm3-deferred-eos-i5.log
 ```
+
+### Selective-BF16 HiFT rejection on A2
+
+The next Stage-2 candidate moved HiFT's F0 predictor, pre-convolution,
+upsamplers, source downsamplers, residual blocks and final convolution to
+BF16.  Harmonic-source construction, phase accumulation, STFT/ISTFT and the
+published waveform remained FP32 precision islands.  Startup confirmed that
+the candidate was active rather than silently falling back.
+
+Two matched runs used the retained native-CFM3, deferred-EOS and five-code
+first-packet stack.  They produced exactly the same 56.24 and 63.20 seconds of
+audio as the two retained control runs, completed 10/10 requests, and kept
+100% streaming continuity.  Lower is better:
+
+| Variant, pooled/two-run mean | Aggregate RTF | Mean reported RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained FP32 HiFT | **0.169000** | **0.172137** | 254.32 ms | 79.69 ms | **1008.77 ms** |
+| Selective BF16 HiFT | 0.171575 | 0.174798 | **252.88 ms** | **77.66 ms** | 1024.16 ms |
+
+Selective BF16 improves mean TTFP by only 0.57% and TTFT by 2.55%, while
+regressing pooled aggregate RTF by 1.52%, mean reported RTF by 1.55%, and E2E
+by 1.53%.  The first run is an especially clean paired comparison because its
+audio length is identical: serving time rose from 9.713 to 9.944 seconds and
+aggregate RTF regressed 2.37%.  A2's BF16 convolution path does not amortize
+the boundary casts and backend/layout overhead at these small batch-one HiFT
+shapes.  The implementation and profile were removed; future lower-precision
+HiFT work must use a graph-visible, layout-propagated boundary rather than
+per-module dtype conversion.
+
+```text
+/tmp/lunanexa-bench/cfm3-i5-hift-bf16-official10/
+/tmp/lunanexa-bench/cfm3-i5-hift-bf16-official10-repeat/
+/tmp/minicpmo-cfm3-i5-hift-bf16.log
+```

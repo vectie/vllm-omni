@@ -5776,3 +5776,58 @@ work. The implementation was fully removed; only the result artifact remains:
 /tmp/lunanexa-bench/talker-resident-empty-output-official10/
 /tmp/minicpmo-resident-empty-output.log
 ```
+
+### Main-bottleneck result: stable-input PagedAttention replay
+
+A low-rate Stage-1 host profile identified graph-parameter maintenance as the
+largest active Python stack: `update_full_graph_params` rebuilt twenty FIA
+tasks after every Talker token because FIA represents query and KV lengths as
+host-valued attributes. Reordering that work with ENPU was rejected at
+0.308473 aggregate RTF, 12.00% slower than the retained 0.275414 control,
+because it moved the same twenty updates onto the replay dependency path.
+
+The retained candidate changes the operator contract instead. Stage-1
+batch-one decode uses PagedAttention for capture size one. Its block table and
+context-length tensor are fixed runner-owned buffers whose contents are
+updated in place. With `enable_stable_pa_graph_inputs`, graph capture omits the
+per-layer update handles and events, and replay executes the already captured
+PA tasks directly. The opt-in is disabled by default and is paired with
+`pa_shape_list: [1]` in the dedicated MiniCPM-o profile.
+
+An attempted device-resident context-length variant was rejected during graph
+capture: Atlas A2 ATB reported `PagedAttentionOperation setup failed`. The
+compatible implementation therefore retains the existing pinned host length
+slab. Two warmups and ten measured requests with varying generated lengths
+confirmed that replay observes its in-place contents; all requests completed
+with 100% streaming continuity.
+
+Both official-shape repeats used concurrency one, seed zero, and temperature
+zero. Aggregate RTF is wall-clock benchmark duration divided by actual audio
+duration, so stochastic output length is normalized. Lower is better.
+
+| Variant | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous retained static-control profile | 0.275414 | 343.61 ms | 79.13 ms | 1698.25 ms | 61.68 s |
+| Stable PA run 1 | 0.233829 | 312.12 ms | 77.45 ms | 1426.80 ms | 61.04 s |
+| Stable PA run 2 | 0.228323 | 306.59 ms | 77.31 ms | 1442.52 ms | 63.20 s |
+| Stable PA two-run mean | **0.231076** | **309.36 ms** | **77.38 ms** | **1434.66 ms** | - |
+
+The two-run mean improves aggregate RTF by 16.10%, TTFP by 9.97%, TTFT by
+2.21%, and E2E by 15.52% relative to the retained profile. The first PA
+request after process startup incurred about 62 seconds of ATB compilation;
+the competition's declared warmup requests absorb this one-time cost, while
+subsequent requests were stable at roughly 1.0--1.75 seconds E2E.
+
+This is the first Talker change in this series that removes the profiled
+twenty-layer control-plane mechanism rather than making each update slightly
+cheaper. It remains an experimental submission candidate until the matched
+official Seed-TTS WER/SIM gate is rerun; the current server lacks `funasr`, so
+the performance run cannot substitute for that accuracy result.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/talker-stable-pa-official10/
+/tmp/lunanexa-bench/talker-stable-pa-official10-repeat/
+/tmp/minicpmo-talker-stable-pa-host-slab.log
+```

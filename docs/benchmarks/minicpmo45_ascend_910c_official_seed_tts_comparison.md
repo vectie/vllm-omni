@@ -5736,3 +5736,29 @@ Artifacts:
 /tmp/lunanexa-bench/talker-direct-stop-official10-run2/
 /tmp/minicpmo-direct-stop.log
 ```
+
+The retained follow-up also removes construction of the deterministic logits
+row. It keeps resident continue/stop logits views beside the resident token-ID
+views, and uses one boolean control list as the source of truth for canonical
+fallback, batched fast path, and the batch-one fast path. This also fixes the
+edge case where a terminal request observed for one additional scheduler step
+could previously be represented as continue by the direct sampler.
+
+The cleanest comparison used the same 61.68 seconds / 1,480,320 generated
+frames in both runs:
+
+| Same-duration candidate | Mean RTF | Mean TTFP | Mean TTFT | Mean E2E | Stage-1 ITL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Direct token ID only | 0.286807 | 350.88 ms | 79.53 ms | 1740.69 ms | 8.435 ms/code |
+| Static logits + token IDs | **0.280486** | **343.61 ms** | **79.13 ms** | **1698.25 ms** | **8.238 ms/code** |
+
+Static control buffers reduce RTF by another 2.20%, TTFP by 2.07%, E2E by
+2.44%, and Stage-1 ITL by 2.34%. Relative to the original 9.284-ms/code
+matched control, the complete direct-control path reduces hot Talker ITL by
+11.27%. It remains sequence-preserving: only the already deterministic
+vLLM-visible stop channel changes implementation.
+
+```text
+/tmp/lunanexa-bench/talker-static-stop-buffers-official10/
+/tmp/minicpmo-static-stop-buffers.log
+```

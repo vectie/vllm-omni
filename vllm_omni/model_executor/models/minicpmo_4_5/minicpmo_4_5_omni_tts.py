@@ -284,6 +284,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         self._batch_stop_logits: torch.Tensor | None = None
         self._batch_stop_token_ids: torch.Tensor | None = None
+        self._stop_logits_constants: tuple[torch.Tensor, torch.Tensor] | None = None
         self._stop_token_constants: tuple[torch.Tensor, torch.Tensor] | None = None
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
@@ -934,6 +935,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
+
+        def append_stop_control(stop: bool) -> None:
+            finished_rows.append(stop)
+            if not self.direct_stop_sampler:
+                stop_rows.append(
+                    hidden.new_tensor([float("-inf"), 0.0] if stop else [0.0, float("-inf")])
+                )
+
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             request_id = str(info_dict.get("request_id", index))
@@ -981,18 +990,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
 
             if not isinstance(info, dict):
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
-                finished_rows.append(False)
+                append_stop_control(False)
                 continue
             start, end = spans[index]
             end = min(int(end), int(hidden.shape[0]))
             if int(start) >= end:
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
-                finished_rows.append(False)
+                append_stop_control(False)
                 continue
             request_states = getattr(self, "_request_audio_states", None)
             if request_states is None:
@@ -1003,19 +1010,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state = dict(info.get("audio_state", {}) or {})
                 request_states[request_id] = state
             if state.get("finished"):
-                stop_rows.append(hidden.new_tensor([float("-inf"), 0.0]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
-                finished_rows.append(False)
+                append_stop_control(True)
                 continue
             if not sample_eligible[index]:
                 # vLLM computes a logit row for incomplete chunked prefills but
                 # discards its sampled token. Advancing codec/RNG state here
                 # would make output depend on prefill chunking and compaction.
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
-                finished_rows.append(False)
+                append_stop_control(False)
                 continue
             codes = state.get("codes")
             if not isinstance(codes, torch.Tensor):
@@ -1058,29 +1063,47 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             }
             codec_deltas.append(delta)
             terminal_flags.append(torch.tensor(finished, dtype=torch.bool))
-            finished_rows.append(finished)
-            stop_rows.append(hidden.new_tensor([float("-inf"), 0.0] if finished else [0.0, float("-inf")]))
+            append_stop_control(finished)
 
-        self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         self._batch_stop_token_ids = None
         if self.direct_stop_sampler and finished_rows:
-            constants = self._stop_token_constants
-            if constants is None or constants[0].device != hidden.device:
-                constants = (
-                    hidden.new_zeros((1, 1), dtype=torch.int32),
-                    hidden.new_ones((1, 1), dtype=torch.int32),
+            logits_constants = self._stop_logits_constants
+            token_constants = self._stop_token_constants
+            if (
+                logits_constants is None
+                or logits_constants[0].device != hidden.device
+                or logits_constants[0].dtype != hidden.dtype
+                or token_constants is None
+                or token_constants[0].device != hidden.device
+            ):
+                logits_rows = hidden.new_tensor(
+                    [[0.0, float("-inf")], [float("-inf"), 0.0]],
                 )
-                self._stop_token_constants = constants
+                token_rows = hidden.new_tensor([[0], [1]], dtype=torch.int32)
+                logits_constants = (logits_rows[0:1], logits_rows[1:2])
+                token_constants = (token_rows[0:1], token_rows[1:2])
+                self._stop_logits_constants = logits_constants
+                self._stop_token_constants = token_constants
             if len(finished_rows) == 1:
                 # The competition profile is max_num_seqs=1. Returning an
-                # immutable resident tensor makes this path allocation- and
-                # kernel-free after its first use.
-                self._batch_stop_token_ids = constants[int(finished_rows[0])]
+                # immutable pair of resident views makes compute_logits and
+                # sample allocation- and kernel-free after their first use.
+                stop_index = int(finished_rows[0])
+                self._batch_stop_logits = logits_constants[stop_index]
+                self._batch_stop_token_ids = token_constants[stop_index]
             else:
+                self._batch_stop_logits = hidden.new_tensor(
+                    [
+                        [float("-inf"), 0.0] if stop else [0.0, float("-inf")]
+                        for stop in finished_rows
+                    ]
+                )
                 self._batch_stop_token_ids = hidden.new_tensor(
                     finished_rows,
                     dtype=torch.int32,
                 ).reshape(-1, 1)
+        else:
+            self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
         meta_outputs = {"finished": terminal_flags}

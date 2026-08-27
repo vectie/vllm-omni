@@ -63,6 +63,7 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._num_audio_tokens = 8
     talker._batch_stop_logits = None
     talker._batch_stop_token_ids = None
+    talker._stop_logits_constants = None
     talker._stop_token_constants = None
     talker.direct_stop_sampler = False
     talker._request_generators = {}
@@ -394,12 +395,22 @@ def test_direct_stop_sampler_reuses_model_continue_and_stop_decisions(monkeypatc
     second_logits = talker.compute_logits(second.text_hidden_states)
     second_sample = talker.sample(second_logits, sampling_metadata)
 
+    third = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+    third_logits = talker.compute_logits(third.text_hidden_states)
+    third_sample = talker.sample(third_logits, sampling_metadata)
+
     assert sample_calls == 2
     assert first_logits.argmax(dim=-1).tolist() == [0]
     assert first_sample.sampled_token_ids.tolist() == [[0]]
     assert first_sample.sampled_token_ids is first_constant
     assert second_logits.argmax(dim=-1).tolist() == [1]
     assert second_sample.sampled_token_ids.tolist() == [[1]]
+    assert third_logits is second_logits
+    assert third_sample.sampled_token_ids is second_sample.sampled_token_ids
 
 
 def test_pre_minimum_codec_steps_do_not_read_sample_back_to_host(mocker) -> None:

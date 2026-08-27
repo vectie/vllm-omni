@@ -3099,6 +3099,37 @@ def test_npu_prepare_event_builds_state_and_first_chunk_reuses_it(mocker):
     assert model._states["a"].chunk_seq is None
     assert setup.call_count == 1
 
+
+def test_prompt_state_cache_reuses_setup_without_aliasing(mocker):
+    model, _ = _model()
+    model._prompt_prewarm_enabled = True
+    model._prompt_state_cache_enabled = True
+    setup = mocker.spy(model.backend, "setup_batch")
+
+    def prepare(request_id: str):
+        return {
+            "meta": {
+                "request_id": request_id,
+                "lifecycle_event": "prepare",
+                "lifecycle_generation": 0,
+            }
+        }
+
+    _forward(model, [prepare("a")], request_ids=["a"])
+    _forward(model, [prepare("b")], request_ids=["b"])
+
+    assert setup.call_count == 1
+    assert len(model._prompt_state_templates) == 1
+    state_a = model._states["a"].token2wav
+    state_b = model._states["b"].token2wav
+    for name in state_a.flow_cache:
+        assert state_a.flow_cache[name].data_ptr() != state_b.flow_cache[name].data_ptr()
+    state_a.flow_cache["conformer_att_cache"].fill_(123)
+    assert not torch.equal(
+        state_a.flow_cache["conformer_att_cache"],
+        state_b.flow_cache["conformer_att_cache"],
+    )
+
     first = _forward(model, [_info("a", 0, [1, 2])], request_ids=["a"])
 
     assert first.multimodal_outputs["model_outputs"][0].numel() > 0

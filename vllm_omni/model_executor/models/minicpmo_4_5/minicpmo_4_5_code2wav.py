@@ -42,6 +42,9 @@ _MINICPMO45_NPU_PLANAR_DEFAULTS_ENV = (
 _MINICPMO45_CODE2WAV_PROMPT_PREWARM_ENV = (
     "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_PREWARM"
 )
+_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE_ENV = (
+    "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE"
+)
 
 _MINICPMO45_NPU_OPTIMIZED_DEFAULTS: dict[str, Any] = {
     # Six CFM steps passed the complete Chinese Seed-TTS quality gate. Keep
@@ -320,6 +323,23 @@ class MiniCPMO45Code2Wav(nn.Module):
             "no",
             "off",
         }
+        state_cache_value = os.environ.get(
+            _MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE_ENV,
+            str(extra.get("code2wav_prompt_state_cache", "0")),
+        )
+        self._prompt_state_cache_enabled = state_cache_value.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._prompt_state_cache_limit = max(
+            1,
+            int(extra.get("code2wav_prompt_state_cache_limit", 4)),
+        )
+        self._prompt_state_templates: OrderedDict[
+            tuple[str, str, str], BatchedToken2WavState
+        ] = OrderedDict()
 
     @property
     def _default_prompt_wav(self) -> str:
@@ -335,6 +355,35 @@ class MiniCPMO45Code2Wav(nn.Module):
         else:
             extra = getattr(connector, "extra", None)
         return dict(extra) if isinstance(extra, Mapping) else {}
+
+    def _setup_prompt_states(
+        self,
+        features: Any,
+        count: int,
+        *,
+        prompt_cache_id: str,
+        prompt_wav: str,
+        prompt_fingerprint: str,
+    ) -> list[BatchedToken2WavState]:
+        """Reuse deterministic single-request prompt setup by fingerprint."""
+        if not self._prompt_state_cache_enabled or count != 1:
+            return self.backend.setup_batch(features, count)
+
+        key = (prompt_cache_id, prompt_wav, prompt_fingerprint)
+        template = self._prompt_state_templates.get(key)
+        if template is None:
+            template = self.backend.setup_batch(features, 1)[0]
+            self._prompt_state_templates[key] = template
+            while len(self._prompt_state_templates) > self._prompt_state_cache_limit:
+                self._prompt_state_templates.popitem(last=False)
+            logger.info(
+                "MiniCPM-o prompt-state template cached: cache_id=%s, entries=%d",
+                prompt_cache_id,
+                len(self._prompt_state_templates),
+            )
+        else:
+            self._prompt_state_templates.move_to_end(key)
+        return [self.backend.clone_prompt_state(template)]
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.numel(), 1), device=input_ids.device, dtype=torch.float32)
@@ -954,7 +1003,13 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
                 )
-                states = self.backend.setup_batch(features, len(bucket))
+                states = self._setup_prompt_states(
+                    features,
+                    len(bucket),
+                    prompt_cache_id=bucket[0].prompt_cache_id,
+                    prompt_wav=bucket[0].prompt_wav,
+                    prompt_fingerprint=bucket[0].prompt_fingerprint,
+                )
             except Exception as exc:
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
                     raise
@@ -1006,7 +1061,13 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
                 )
-                states = self.backend.setup_batch(features, len(bucket))
+                states = self._setup_prompt_states(
+                    features,
+                    len(bucket),
+                    prompt_cache_id=bucket[0].prompt_cache_id,
+                    prompt_wav=bucket[0].prompt_wav,
+                    prompt_fingerprint=bucket[0].prompt_fingerprint,
+                )
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -1042,7 +1103,13 @@ class MiniCPMO45Code2Wav(nn.Module):
                     bucket[0].prompt_wav,
                 )
                 if bucket[0].previous is None:
-                    states = self.backend.setup_batch(features, batch_size)
+                    states = self._setup_prompt_states(
+                        features,
+                        batch_size,
+                        prompt_cache_id=bucket[0].prompt_cache_id,
+                        prompt_wav=bucket[0].prompt_wav,
+                        prompt_fingerprint=bucket[0].prompt_fingerprint,
+                    )
                 else:
                     states = [item.previous.token2wav for item in bucket if item.previous is not None]
                 tokens = torch.stack([item.tokens for item in bucket], dim=0)

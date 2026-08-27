@@ -6450,6 +6450,63 @@ class BatchedToken2Wav(nn.Module):
         }
 
     @staticmethod
+    def clone_prompt_state(state: BatchedToken2WavState) -> BatchedToken2WavState:
+        """Materialize a request-owned copy of a cached prompt state.
+
+        Prompt setup is deterministic for a given reference-audio fingerprint,
+        but every live decode mutates its rolling attention/CNN slabs.  Keep one
+        immutable template and clone only its tensors instead of rerunning the
+        Conformer and prompt CFM for every request.
+        """
+        slabs = state.estimator_kv_slabs
+        if slabs is None:
+            flow_cache = {
+                name: value.detach().clone()
+                for name, value in state.flow_cache.items()
+            }
+            cloned_slabs = None
+        else:
+            retained = slabs.retained.detach().clone()
+            append = torch.empty_like(slabs.append)
+            cnn_banks = tuple(
+                bank.detach().clone()
+                if index == slabs.active_cnn_bank
+                else torch.empty_like(bank)
+                for index, bank in enumerate(slabs.cnn_banks)
+            )
+            cloned_slabs = FixedEstimatorKVSlabs(
+                retained=retained,
+                append=append,
+                cnn_banks=cnn_banks,
+                prompt_length=slabs.prompt_length,
+                logical_length=slabs.logical_length,
+                active_cnn_bank=slabs.active_cnn_bank,
+                planar=slabs.planar,
+                bsh_attention=slabs.bsh_attention,
+                cnn_cache_major=slabs.cnn_cache_major,
+            )
+            flow_cache = {
+                name: value.detach().clone()
+                for name, value in state.flow_cache.items()
+                if name not in {"estimator_att_cache", "estimator_cnn_cache"}
+            }
+            flow_cache["estimator_att_cache"] = retained[
+                ..., : slabs.logical_length, :
+            ]
+            flow_cache["estimator_cnn_cache"] = cnn_banks[
+                slabs.active_cnn_bank
+            ]
+
+        return BatchedToken2WavState(
+            flow_cache=flow_cache,
+            hift_cache={
+                name: value.detach().clone()
+                for name, value in state.hift_cache.items()
+            },
+            estimator_kv_slabs=cloned_slabs,
+        )
+
+    @staticmethod
     def _make_fixed_estimator_kv_slabs(
         cache: torch.Tensor,
         cnn_cache: torch.Tensor,

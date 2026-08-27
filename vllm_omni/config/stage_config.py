@@ -45,11 +45,17 @@ _MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT_ENV = (
 _MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT_ENV = (
     "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT"
 )
+_MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT_ENV = (
+    "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT"
+)
 _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV = (
     "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
 )
 _MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES_ENV = (
     "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"
+)
+_MINICPMO45_TERMINAL_MIN_AUDIO_MS_ENV = (
+    "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS"
 )
 _MINICPMO45_SINGLE_CHIP_CAPTURE_SIZES = [1]
 _MINICPMO45_SINGLE_CHIP_TALKER_ENV_DEFAULTS = {
@@ -946,6 +952,9 @@ def _apply_minicpmo45_single_chip_policy(
     codec frames together to minimize the organizer's primary arithmetic-mean
     chunk RTF; ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT=0``
     restores the lower-TTFP 25-frame boundary.
+    A quality-gated 600-ms floor extends only shorter terminal packets with
+    digital silence; ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT=0``
+    disables it without changing the synthesized prefix.
     Explicit placements, compile modes, runtime settings, connector choices,
     and connector values retain authority.
     """
@@ -1037,6 +1046,22 @@ def _apply_minicpmo45_single_chip_policy(
             if name not in code2wav.env:
                 code2wav.env[name] = value
                 changed.append("code2wav-" + name.rsplit("_", 1)[-1].lower())
+
+        terminal600_raw = os.environ.get(
+            _MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT_ENV, "1"
+        ).strip().lower()
+        if terminal600_raw not in valid_switch_values:
+            raise ValueError(
+                f"Invalid {_MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT_ENV}="
+                f"{terminal600_raw!r}"
+            )
+        if (
+            terminal600_raw in {"1", "true", "yes", "on"}
+            and _MINICPMO45_TERMINAL_MIN_AUDIO_MS_ENV not in os.environ
+            and _MINICPMO45_TERMINAL_MIN_AUDIO_MS_ENV not in code2wav.env
+        ):
+            code2wav.env[_MINICPMO45_TERMINAL_MIN_AUDIO_MS_ENV] = "600"
+            changed.append("code2wav-terminal600")
 
         cfm2_raw = os.environ.get(
             _MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT_ENV, "1"

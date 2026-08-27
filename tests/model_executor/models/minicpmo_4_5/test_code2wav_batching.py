@@ -2850,6 +2850,51 @@ def test_model_preserves_output_slots_and_prefers_runtime_codes():
     assert token2wav.flow.encoder.calls[-1] == 2
 
 
+def test_terminal_min_audio_padding_only_extends_final_chunk(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS",
+        raising=False,
+    )
+    control, _ = _model()
+    infos = [
+        _info("streaming", 0, [10, 11]),
+        _info("terminal", 0, [20, 21], last_chunk=True),
+    ]
+    control_output = _forward(control, infos)
+
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS",
+        "100",
+    )
+    candidate, _ = _model()
+    candidate_output = _forward(candidate, infos)
+
+    control_streaming, control_terminal = control_output.multimodal_outputs[
+        "model_outputs"
+    ]
+    candidate_streaming, candidate_terminal = candidate_output.multimodal_outputs[
+        "model_outputs"
+    ]
+    assert torch.equal(candidate_streaming, control_streaming)
+    assert candidate_terminal.numel() == 2_400
+    assert torch.equal(
+        candidate_terminal[: control_terminal.numel()],
+        control_terminal,
+    )
+    assert torch.count_nonzero(
+        candidate_terminal[control_terminal.numel() :]
+    ).item() == 0
+
+
+def test_terminal_min_audio_padding_rejects_negative_duration(monkeypatch):
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS",
+        "-1",
+    )
+    with pytest.raises(ValueError, match="must be non-negative"):
+        MiniCPMO45Code2Wav(vllm_config=_config())
+
+
 def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     model, token2wav = _model()
     segment = _info("duplex", 0, [10, 11])

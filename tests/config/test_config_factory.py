@@ -1231,6 +1231,7 @@ class TestDeployConfigLoading:
             "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE": "1",
             "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM": "1",
             "VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND": "auto",
+            "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS": "600",
             "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS": "1",
         }
 
@@ -1303,6 +1304,52 @@ class TestDeployConfigLoading:
         assert deploy.stages[2].env[
             "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
         ] == "2"
+
+    def test_minicpmo_single_chip_policy_can_disable_ranked_terminal600(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT", "0"
+        )
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS" not in (
+            deploy.stages[2].env or {}
+        )
+
+    def test_minicpmo_single_chip_policy_preserves_launch_terminal_floor(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS", "400")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS" not in (
+            deploy.stages[2].env or {}
+        )
 
     def test_minicpmo_single_chip_policy_can_disable_ranked_first47(
         self, monkeypatch

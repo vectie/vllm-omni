@@ -45,6 +45,9 @@ _MINICPMO45_CODE2WAV_PROMPT_PREWARM_ENV = (
 _MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE_ENV = (
     "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE"
 )
+_MINICPMO45_TERMINAL_MIN_AUDIO_MS_ENV = (
+    "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS"
+)
 
 _MINICPMO45_NPU_OPTIMIZED_DEFAULTS: dict[str, Any] = {
     # Six CFM steps passed the complete Chinese Seed-TTS quality gate. Keep
@@ -337,6 +340,20 @@ class MiniCPMO45Code2Wav(nn.Module):
             1,
             int(extra.get("code2wav_prompt_state_cache_limit", 4)),
         )
+        terminal_min_audio_ms = int(
+            os.environ.get(
+                _MINICPMO45_TERMINAL_MIN_AUDIO_MS_ENV,
+                str(extra.get("terminal_min_audio_ms", 0)),
+            )
+        )
+        if terminal_min_audio_ms < 0:
+            raise ValueError(
+                "MiniCPM-o terminal_min_audio_ms must be non-negative, got "
+                f"{terminal_min_audio_ms}"
+            )
+        self._terminal_min_audio_samples = (
+            terminal_min_audio_ms * 24_000 + 999
+        ) // 1_000
         self._prompt_state_templates: OrderedDict[
             tuple[str, str, str], BatchedToken2WavState
         ] = OrderedDict()
@@ -1138,7 +1155,29 @@ class MiniCPMO45Code2Wav(nn.Module):
                     states=len(next_states),
                 )
             for item, audio, next_state in zip(bucket, audios, next_states, strict=True):
-                outputs[item.output_index] = audio.reshape(-1).to(dtype=torch.float32)
+                output_audio = audio.reshape(-1).to(dtype=torch.float32)
+                if (
+                    item.last_chunk
+                    and self._terminal_min_audio_samples
+                    and output_audio.numel() < self._terminal_min_audio_samples
+                ):
+                    # A short terminal remainder is valid but is also the most
+                    # likely packet to underrun a real-time sink.  An explicit
+                    # deployment policy may extend only that final packet with
+                    # digital silence.  The synthesized prefix, model state,
+                    # and every non-terminal packet remain bit-identical.  The
+                    # feature is disabled unless it passes the serving
+                    # profile's WER/SIM gate.
+                    output_audio = torch.cat(
+                        (
+                            output_audio,
+                            output_audio.new_zeros(
+                                self._terminal_min_audio_samples
+                                - output_audio.numel()
+                            ),
+                        )
+                    )
+                outputs[item.output_index] = output_audio
                 pending[item.state_id] = (
                     None
                     if item.last_chunk

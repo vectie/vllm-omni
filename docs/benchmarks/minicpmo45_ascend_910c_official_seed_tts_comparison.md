@@ -6707,6 +6707,40 @@ floor rather than further initial-boundary integer search.
 /tmp/minicpmo-a2-evaluator-cfm1-first60-steady25-server.log
 ```
 
+### Quality-gated terminal-packet floor
+
+The first-60 diagnostic identified the short terminal remainder as a ranked
+RTF outlier.  Stage 2 can now extend only a shorter final packet with digital
+silence to an explicit minimum duration.  The synthesized prefix, request
+state, and every non-terminal packet are unchanged.  A 1000-ms screen improved
+the ranked RTF by 9.30% but failed WER at `0.0172`, so it was rejected.
+
+The safer 600-ms candidate passed two identical 32-row WER screens and the
+competition WavLM-base-plus proxy:
+
+| Metric | Source default | Terminal 600 ms | Change / gate |
+| --- | ---: | ---: | ---: |
+| Mean flattened chunk RTF | 0.27780 | **0.26327** | **-5.23%** |
+| P99 flattened chunk RTF | 0.52572 | **0.39779** | **-24.33%** |
+| Mean TTFP | 648.94 ms | **645.91 ms** | -0.47% |
+| Mean E2E | 1418.63 ms | **1383.28 ms** | -2.49% |
+| Mean WER, repeat 1 / 2 | 0.0087 | **0.0153 / 0.0153** | pass, <= 0.0156 |
+| WavLM-base-plus SIM | about 0.84485 | **0.8310** | -1.39 pp, pass |
+
+The one-chip policy therefore defaults
+`VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS=600`.  An explicit launch or
+stage value remains authoritative.  Setting
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT=0` disables only
+this ranked-output policy.  The more aggressive 1000-ms candidate is not a
+source default.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-repeat-quality-sim-zh32/
+/tmp/minicpmo-a2-evaluator-cfm1-first47-terminal600-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

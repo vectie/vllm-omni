@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import time
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -74,6 +75,7 @@ _NPU_PROMPT_CFM_TIMESTEPS_ENV = (
 _NPU_PROMPT_CACHE_MAX_FRAMES_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_PROMPT_CACHE_MAX_FRAMES"
 )
+_NPU_STAGE2_TIMING_ENV = "VLLM_OMNI_MINICPMO45_NPU_STAGE2_TIMING"
 _NPU_DIT_BSH_ATTENTION_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIT_BSH_ATTENTION"
 _NPU_DIT_BSH_ATTENTION_MAX_ABS_DRIFT = 2.0e-2
 _NPU_DIT_BSH_ATTENTION_MEAN_ABS_DRIFT = 2.0e-3
@@ -292,6 +294,16 @@ def _npu_prompt_cache_max_frames() -> int | None:
             "positive integer"
         )
     return frames
+
+
+def _npu_stage2_timing_enabled() -> bool:
+    """Enable synchronizing diagnostic timers outside submission profiles."""
+    return os.environ.get(_NPU_STAGE2_TIMING_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _npu_cfm_cache_fill_graph_enabled() -> bool:
@@ -2300,6 +2312,7 @@ class BatchedToken2Wav(nn.Module):
         )
         self._npu_prompt_cache_max_frames = _npu_prompt_cache_max_frames()
         self._npu_prompt_cache_limit_used = False
+        self._npu_stage2_timing_enabled = _npu_stage2_timing_enabled()
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
         self.register_buffer(
@@ -4531,6 +4544,13 @@ class BatchedToken2Wav(nn.Module):
         cache_key = (prompt_cache_id, prompt_wav)
         cached = self._prompt_features.get(cache_key)
         if cached is None:
+            timing = (
+                self._npu_stage2_timing_enabled
+                and self.speech_window.device.type == "npu"
+            )
+            if timing:
+                torch.npu.synchronize()
+                timing_start = time.perf_counter()
             # The generation runner may wrap model.forward in bf16 autocast,
             # and vLLM constructs the model under a bf16 default dtype, while
             # S3Tokenizer prompt extraction uses fp32 convolution weights.
@@ -4555,6 +4575,15 @@ class BatchedToken2Wav(nn.Module):
                 mels=values[3],
             )
             self._prompt_features[cache_key] = cached
+            if timing:
+                torch.npu.synchronize()
+                logger.info(
+                    "MiniCPM-o Stage-2 timing: prompt_features=%.3fms, "
+                    "speech_tokens=%d, mels=%d",
+                    (time.perf_counter() - timing_start) * 1000.0,
+                    int(cached.speech_tokens.shape[1]),
+                    int(cached.mels.shape[1]),
+                )
         return cached
 
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
@@ -6533,6 +6562,10 @@ class BatchedToken2Wav(nn.Module):
             (batch_size, 3 if lookahead_width is None else lookahead_width),
             _SILENCE_TOKEN,
         )
+        timing = self._npu_stage2_timing_enabled and prompt_tokens.device.type == "npu"
+        if timing:
+            torch.npu.synchronize()
+            timing_start = time.perf_counter()
         with self._autocast(prompt_tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 torch.cat((prompt_tokens, lookahead), dim=1),
@@ -6540,6 +6573,9 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=None,
                 att_cache=None,
             )
+            if timing:
+                torch.npu.synchronize()
+                timing_encode = time.perf_counter()
             estimator_hidden = hidden
             estimator_prompt_mels = prompt_mels
             prompt_cache_limit = self._npu_prompt_cache_max_frames
@@ -6571,6 +6607,9 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=None,
                 num_timesteps=self.prompt_cfm_timesteps,
             )
+            if timing:
+                torch.npu.synchronize()
+                timing_cfm = time.perf_counter()
             if (
                 self.prompt_cfm_timesteps != self.n_timesteps
                 and not self._npu_prompt_cfm_used
@@ -6627,6 +6666,18 @@ class BatchedToken2Wav(nn.Module):
                 },
                 estimator_kv_slabs=slabs,
             ))
+        if timing:
+            torch.npu.synchronize()
+            timing_state = time.perf_counter()
+            logger.info(
+                "MiniCPM-o Stage-2 timing: prompt_setup encode=%.3fms, "
+                "cfm=%.3fms, state=%.3fms, total=%.3fms, width=%d",
+                (timing_encode - timing_start) * 1000.0,
+                (timing_cfm - timing_encode) * 1000.0,
+                (timing_state - timing_cfm) * 1000.0,
+                (timing_state - timing_start) * 1000.0,
+                int(estimator_hidden.shape[1]),
+            )
         return states
 
     @staticmethod
@@ -6675,6 +6726,14 @@ class BatchedToken2Wav(nn.Module):
         first_audio_chunk = all(
             int(state.hift_cache["mel"].shape[-1]) == 0 for state in states
         )
+        timing = (
+            self._npu_stage2_timing_enabled
+            and first_audio_chunk
+            and tokens.device.type == "npu"
+        )
+        if timing:
+            torch.npu.synchronize()
+            timing_start = time.perf_counter()
         cfm_timesteps = (
             self.initial_cfm_timesteps
             if first_audio_chunk and not last_chunk
@@ -6694,6 +6753,9 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=flow_cache["conformer_cnn_cache"],
                 att_cache=flow_cache["conformer_att_cache"],
             )
+            if timing:
+                torch.npu.synchronize()
+                timing_encode = time.perf_counter()
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
             cnn_output = None
             att_output = None
@@ -6738,6 +6800,9 @@ class BatchedToken2Wav(nn.Module):
                 steady_graph=steady_graph,
                 num_timesteps=cfm_timesteps,
             )
+            if timing:
+                torch.npu.synchronize()
+                timing_cfm = time.perf_counter()
             if (
                 cfm_timesteps != self.n_timesteps
                 and not self._npu_initial_cfm_used
@@ -6811,6 +6876,9 @@ class BatchedToken2Wav(nn.Module):
         old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
         speech, source = self.hift(mel, old_source)
+        if timing:
+            torch.npu.synchronize()
+            timing_hift = time.perf_counter()
         if old_speech.shape[-1] > 0:
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
             speech = self._fade_in_out(speech, old_speech, window)
@@ -6829,4 +6897,17 @@ class BatchedToken2Wav(nn.Module):
             for row in range(batch_size)
         ]
         audios = [emitted[row].reshape(-1).to(dtype=torch.float32) for row in range(batch_size)]
+        if timing:
+            torch.npu.synchronize()
+            timing_state = time.perf_counter()
+            logger.info(
+                "MiniCPM-o Stage-2 timing: first_chunk encode=%.3fms, "
+                "cfm=%.3fms, hift=%.3fms, state=%.3fms, total=%.3fms, width=%d",
+                (timing_encode - timing_start) * 1000.0,
+                (timing_cfm - timing_encode) * 1000.0,
+                (timing_hift - timing_cfm) * 1000.0,
+                (timing_state - timing_hift) * 1000.0,
+                (timing_state - timing_start) * 1000.0,
+                int(tokens.shape[1]),
+            )
         return audios, next_states

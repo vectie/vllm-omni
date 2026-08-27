@@ -6461,6 +6461,44 @@ cached. The evaluator now passes `disable_update=True`, with compatibility
 fallbacks for older FunASR releases. This removes an external-network hang
 from repeatable accuracy qualification without changing ASR results.
 
+### Correct-protocol two-step CFM promotion
+
+The reduced native solvers were rerun without `--interleave-mm-strings`, with
+server-default temperature, two warmups, concurrency four, and the same 32
+fixed Chinese Seed-TTS rows. Each run generated the same 158.60 seconds of
+audio as the retained CFM6 control and completed 32/32 requests with 100%
+streaming continuity. Higher is better for throughput and SIM; lower is better
+for the other columns:
+
+| Solver | Duration | Audio throughput | Mean TTFT | Mean WER | WavLM-base-plus SIM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM6 retained control | 69.11 s | 2.295 audio-s/s | 116.07 ms | 0.00865 | prior retained screens about 0.845 |
+| CFM3 | 41.55 s | 3.82 audio-s/s | 96.39 ms | 0.0101 | **0.84858** |
+| CFM2 | **40.60 s** | **3.91 audio-s/s** | **96.26 ms** | **0.0072** | 0.84240 |
+
+Relative to CFM6, CFM2 reduced the complete concurrent batch duration by
+**41.25%** and increased generated-audio throughput by **70.37%**, without
+shortening the output. Its WER is below the organizer's `0.0156` gate and its
+WavLM-base-plus similarity is 15.34 points above the `0.689` gate. CFM3 passed
+too, but was slower and had worse WER on the same screen, so it is not the
+submission default.
+
+The upstream Seed-TTS fine-tuned WavLM-SV protocol was also run for diagnostic
+parity. Its absolute scores are not comparable with the competition's `0.689`
+WavLM-base-plus threshold: CFM2 scored `0.25287` and CFM3 scored `0.27367`,
+while historical MiniCPM-o controls on other retained subsets were also near
+zero. Those figures are retained as cross-checks, not used as the competition
+admission metric.
+
+The evaluator-visible one-chip policy now fills an absent Stage-2
+`VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS` with `2`. An explicit stage or
+launch environment value remains authoritative. Setting
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT=0` disables only this numerical
+default; setting `VLLM_OMNI_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS=0` retains the
+broader matched rollback. The complete official Seed-TTS pool remains a final
+release gate before submission; this 32-row promotion is the fail-fast screen,
+not a claim that the full pool has already run.
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/
@@ -6473,6 +6511,10 @@ from repeatable accuracy qualification without changing ASR results.
 /tmp/lunanexa-bench/a2-evaluator-cfm6-exact-official-quality-zh32/
 /tmp/lunanexa-bench/a2-evaluator-cfm6-safe-exact-official-quality-zh32/
 /tmp/lunanexa-bench/a2-evaluator-cfm6-safe-exact-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm2-safe-exact-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm2-safe-exact-official-export-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm3-safe-exact-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm3-safe-exact-official-export-zh32/
 /tmp/minicpmo-a2-evaluator-exact-defaults.log
 /tmp/minicpmo-a2-evaluator-cfm2.log
 /tmp/minicpmo-a2-evaluator-cfm5.log

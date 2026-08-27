@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
@@ -48,6 +49,7 @@ _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 _NPU_BOUNDED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_BOUNDED_CODEC_SAMPLER"
 _NPU_CODEC_SAMPLER_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"
 _NPU_BATCHED_CODEC_OUTPUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
+_DIRECT_STOP_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER"
 _CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES"
 _INITIAL_CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"
 
@@ -281,6 +283,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.config = config
         self.vllm_config = vllm_config
         self._batch_stop_logits: torch.Tensor | None = None
+        self._batch_stop_token_ids: torch.Tensor | None = None
+        self._stop_token_constants: tuple[torch.Tensor, torch.Tensor] | None = None
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._request_repetition_frequencies: dict[str, torch.Tensor] = {}
@@ -293,6 +297,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # publishable chunk instead of one D2H for every autoregressive step.
         self.batched_codec_output = _env_enabled(
             _NPU_BATCHED_CODEC_OUTPUT_ENV,
+            default=False,
+        )
+        # The Talker samples codec IDs internally. Its vLLM-visible two-token
+        # head is only a deterministic continue/stop control channel. Reuse
+        # that decision instead of running the generic logits-processor and
+        # sampler stack a second time on every codec step.
+        self.direct_stop_sampler = _env_enabled(
+            _DIRECT_STOP_SAMPLER_ENV,
             default=False,
         )
         self.omni_pooler_payload_include_hidden = not self.batched_codec_output
@@ -1050,6 +1062,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             stop_rows.append(hidden.new_tensor([float("-inf"), 0.0] if finished else [0.0, float("-inf")]))
 
         self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
+        self._batch_stop_token_ids = None
+        if self.direct_stop_sampler and finished_rows:
+            constants = self._stop_token_constants
+            if constants is None or constants[0].device != hidden.device:
+                constants = (
+                    hidden.new_zeros((1, 1), dtype=torch.int32),
+                    hidden.new_ones((1, 1), dtype=torch.int32),
+                )
+                self._stop_token_constants = constants
+            if len(finished_rows) == 1:
+                # The competition profile is max_num_seqs=1. Returning an
+                # immutable resident tensor makes this path allocation- and
+                # kernel-free after its first use.
+                self._batch_stop_token_ids = constants[int(finished_rows[0])]
+            else:
+                self._batch_stop_token_ids = hidden.new_tensor(
+                    finished_rows,
+                    dtype=torch.int32,
+                ).reshape(-1, 1)
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
         meta_outputs = {"finished": terminal_flags}
@@ -1160,6 +1191,19 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return logits
 
     def sample(self, logits, sampling_metadata):
+        stop_token_ids = self._batch_stop_token_ids
+        self._batch_stop_token_ids = None
+        if (
+            self.direct_stop_sampler
+            and stop_token_ids is not None
+            and stop_token_ids.shape[0] == logits.shape[0]
+            and getattr(sampling_metadata, "max_num_logprobs", None) is None
+            and not getattr(sampling_metadata, "logprob_token_ids", None)
+        ):
+            return SamplerOutput(
+                sampled_token_ids=stop_token_ids,
+                logprobs_tensors=None,
+            )
         return Sampler()(logits, sampling_metadata)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

@@ -5690,3 +5690,49 @@ Artifacts:
 /tmp/lunanexa-bench/downstream-first-poll-official10-repeat/
 /tmp/minicpmo-downstream-first-poll.log
 ```
+
+### Main-bottleneck result: remove the redundant Talker stop sampler
+
+The next trace-level target was the generic vLLM sampler invoked after every
+codec step. `make_omni_output` already decides whether the request must
+continue or stop, then exposes deterministic logits `[0, -inf]` or
+`[-inf, 0]`. Running the generic logits processor and argmax on that binary
+control head repeated work already completed by the model roughly 120--200
+times per request.
+
+The retained fast path returns the existing continue/stop decision directly
+as a `SamplerOutput`. For the competition's batch-one path, immutable int32
+continue and stop tensors are allocated once and reused. Requests asking for
+log probabilities, and configurations that do not explicitly enable the
+feature, retain the canonical sampler. Codec sampling, RNG state, generated
+codec IDs, chunk boundaries, CFM, and HiFT are unchanged. A focused parity
+test covers both continue and max-token stop decisions and verifies resident
+buffer reuse.
+
+Fresh tests used the newly extracted Chinese Seed-TTS set, two warmups, ten
+measured requests, and concurrency one. Talker output duration is stochastic,
+so whole-audio RTF is reported alongside the less ambiguous per-token Stage-1
+ITL. Lower is better throughout.
+
+| Run | Mean RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Matched retained control | 0.299441 | 364.00 ms | 79.39 ms | 1848.64 ms | 62.68 s |
+| Direct stop run 1 | 0.286807 | 350.88 ms | 79.53 ms | 1740.69 ms | 61.68 s |
+| Direct stop run 2 | 0.297673 | 346.15 ms | 77.22 ms | 1625.63 ms | 56.72 s |
+| Direct stop two-run mean | **0.292240** | **348.51 ms** | **78.37 ms** | **1683.16 ms** | - |
+
+The two-run mean RTF is 2.40% below the matched control and mean TTFP is
+4.25% lower. More importantly, the ten hot main-run Stage-1 ITL samples fell
+from 9.284 ms/code in the control to 8.435 ms/code, a 9.14% reduction. This is
+a direct measurement of the autoregressive loop and is not biased by output
+audio length. The result confirms that eliminating repeated framework work is
+currently more valuable than another isolated Stage-2 microkernel.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/stage-isolated-numa-control-official10/
+/tmp/lunanexa-bench/talker-direct-stop-official10-run1/
+/tmp/lunanexa-bench/talker-direct-stop-official10-run2/
+/tmp/minicpmo-direct-stop.log
+```

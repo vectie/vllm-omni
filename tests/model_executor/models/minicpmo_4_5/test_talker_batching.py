@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -60,6 +62,9 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     nn.Module.__init__(talker)
     talker._num_audio_tokens = 8
     talker._batch_stop_logits = None
+    talker._batch_stop_token_ids = None
+    talker._stop_token_constants = None
+    talker.direct_stop_sampler = False
     talker._request_generators = {}
     talker._request_audio_states = {}
     talker._request_repetition_frequencies = {}
@@ -349,6 +354,52 @@ def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> N
     assert _routed(output, 0)["meta"]["finished"].item() is False
     assert set(output.multimodal_outputs["meta"]) == {"finished"}
     assert talker.compute_logits(output.text_hidden_states).argmax(dim=-1).tolist() == [0, 0]
+
+
+def test_direct_stop_sampler_reuses_model_continue_and_stop_decisions(monkeypatch) -> None:
+    talker = _make_talker()
+    talker.direct_stop_sampler = True
+    sampling_metadata = SimpleNamespace(
+        max_num_logprobs=None,
+        logprob_token_ids={},
+    )
+    sample_calls = 0
+
+    def sample(*_args) -> torch.Tensor:
+        nonlocal sample_calls
+        sample_calls += 1
+        return torch.tensor(3)
+
+    monkeypatch.setattr(talker, "_sample_audio_code", sample)
+    info = {
+        "request_id": "req-direct-stop",
+        "audio_state": {"step": 0, "min_tokens": 0, "max_tokens": 2},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    first = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+    first_logits = talker.compute_logits(first.text_hidden_states)
+    first_sample = talker.sample(first_logits, sampling_metadata)
+    first_constant = first_sample.sampled_token_ids
+
+    second = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+    second_logits = talker.compute_logits(second.text_hidden_states)
+    second_sample = talker.sample(second_logits, sampling_metadata)
+
+    assert sample_calls == 2
+    assert first_logits.argmax(dim=-1).tolist() == [0]
+    assert first_sample.sampled_token_ids.tolist() == [[0]]
+    assert first_sample.sampled_token_ids is first_constant
+    assert second_logits.argmax(dim=-1).tolist() == [1]
+    assert second_sample.sampled_token_ids.tolist() == [[1]]
 
 
 def test_pre_minimum_codec_steps_do_not_read_sample_back_to_host(mocker) -> None:

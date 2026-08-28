@@ -1,0 +1,11 @@
+# Single-chip A2 isolation profile for device-side FULL-graph replay fencing.
+# The Talker update stream waits on the previous replay's completion event
+# instead of forcing a host current-stream synchronize before every token.
+# Keep opt-in until official-shape RTF, TTFP and quality gates pass.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_experimental.yaml
+
+stages:
+  - stage_id: 1
+    env:
+      VLLM_ASCEND_FULL_GRAPH_ASYNC_REPLAY_FENCE: "1"

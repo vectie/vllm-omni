@@ -1,0 +1,14 @@
+# Calibration-only overlay for MiniCPM-o 4.5 Talker static W8A8.
+#
+# Python module hooks do not run during NPUGraph replay.  Keep only Stage 1 in
+# eager mode while collecting projection-input maxima; Stage 0 and Code2Wav
+# retain the evaluator-compatible execution policy.  This profile must never
+# be used for performance measurements or submission serving.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        enforce_eager: true

@@ -7267,6 +7267,41 @@ continues to use NPUGraph_ex without static-kernel materialization.
 /tmp/minicpmo-a2-talker-static-kernel-20260828-server.log
 ```
 
+### Talker FP16 rejection
+
+The next isolation run changed only the Stage-1 model and decode graph from
+BF16 to FP16.  Stage 0 remained BF16 and Stage 2 retained its established
+mixed-precision path.  Startup logs confirmed `dtype=torch.float16` for the
+Talker, a fresh graph capture completed, and a second fully hot four-request
+smoke excluded the first run's lazy-shape compilation outlier.
+
+The complete 32-request run passed serving continuity but regressed the ranked
+mean and every aggregate/first-packet latency guard.  Its 159.96 seconds / 145
+chunks are close to the control's existing stochastic output clusters, so the
+normalized RTFs—not raw output length—reject the candidate.
+
+| Metric, lower is better | BF16 control | FP16 Talker | Change |
+| --- | ---: | ---: | ---: |
+| Overall audio RTF | **0.221284** | 0.225080 | +1.72% |
+| Mean chunk RTF | **0.206408** | 0.212361 | +2.88% |
+| P99 chunk RTF | 0.329015 | **0.327209** | -0.55% |
+| Mean audio TTFP | **543.215 ms** | 545.474 ms | +0.42% |
+| Mean E2E | **1112.290 ms** | 1124.623 ms | +1.11% |
+| Benchmark duration | **35.609 s** | 36.004 s | +1.11% |
+
+The small P99 movement does not offset regressions in the primary mean, TTFP,
+E2E, and total duration.  The experimental profile was removed.  Lower
+precision for the Talker's dominant small GEMMs now requires a calibrated
+static W8A8 graph that uses A2's INT8 Cube path; merely exchanging BF16 for
+FP16 does not provide that acceleration.
+
+```text
+/tmp/talker-fp16-smoke-20260828/
+/tmp/talker-fp16-smoke-repeat-20260828/
+/tmp/talker-fp16-official-perf-20260828/
+/tmp/minicpmo-a2-talker-fp16-20260828-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

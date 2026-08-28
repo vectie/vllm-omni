@@ -7036,6 +7036,34 @@ remained 0.8259, exactly matching the previous accepted quality gate.
 /tmp/minicpmo-a2-fia-bucket16-slotfast-dirtybt-metacache-fusedscalar-multigroup-server.log
 ```
 
+### Isolated Talker FRACTAL_NZ rejection
+
+The current hot trace attributes 45.821% of Stage-1 device time to
+`MatMulV2`, so Stage 1 was rerun with only its immutable BF16 linear weights
+preformatted as FRACTAL_NZ (`weight_nz_mode=2`).  CFM1, first-47,
+terminal-600, FIA bucket16, scalar slot mapping and fused resident metadata
+were unchanged.  The 32-request result exactly matched the control's 161.04
+seconds of audio and 145 chunks, but did not improve the primary metric:
+
+| Metric, lower is better | ND control | FRACTAL_NZ | Change |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF | **0.208516** | 0.209138 | +0.30% |
+| P99 chunk RTF | 0.331753 | **0.327603** | -1.25% |
+| Mean audio TTFP | **544.965 ms** | 549.391 ms | +0.81% |
+| Mean E2E | **1120.094 ms** | 1124.911 ms | +0.43% |
+| Stage-1 ITL | **6.7004 ms** | 6.7046 ms | +0.06% |
+
+The small P99 movement does not compensate for regressions in the ranked
+mean, TTFP, E2E and total duration.  On this graph, GE's existing weight-format
+selection is already at least as effective as whole-layer NZ preformatting.
+The isolation profile was removed and the source default remains unchanged.
+
+```text
+/tmp/fusedscalar-nz-smoke-20260828/
+/tmp/fusedscalar-nz-official-perf-20260828/
+/tmp/minicpmo-a2-fia-bucket16-fusedscalar-nz-server.log
+```
+
 ### ENPU update-before-replay rejection
 
 The safe FIA configuration was also launched with vLLM-Ascend's internal

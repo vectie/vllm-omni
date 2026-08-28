@@ -6782,7 +6782,7 @@ reduce graph-parameter maintenance.
 /tmp/minicpmo-a2-evaluator-cfm1-first47-terminal600-stable-pa-server.log
 ```
 
-### FIA sequence-length bucket rejection
+### FIA sequence-length bucket: initial rejection and corrected promotion
 
 A second Talker experiment retained fused-infer-attention rather than changing
 to PagedAttention.  It rounded each decode KV length to a 16-token bucket,
@@ -6818,6 +6818,55 @@ synchronization with error 107027 (`stream is captured`), so this path cannot
 provide dynamic device lengths on the competition runtime and is also not
 promoted.
 
+The final correction identified two independent full-graph bugs that the
+operator-only probes could not expose. First, the reuse key contained only the
+rounded sequence length, so a new request could reuse tasks bound to the prior
+request's block-table buffers. The key now includes every captured layer's
+block-table address. Second, the initial tail-mask fill ran while the outer
+NPUGraph was capturing; replay therefore overwrote every runtime mask with the
+capture-time mask immediately before FIA. Capture now allocates the stable mask
+without recording a write, and the task-update stream produces the runtime mask
+before signaling the captured FIA groups.
+
+Real 910B4 checks then proved both levels independently: rounded FIA with the
+three-dimensional tail mask was bit-identical to exact-length sparse-mode-3
+FIA, and a captured single-FIA task remained bit-identical while crossing
+16-token buckets and reusing a bucket. The corrected complete service restored
+the expected output geometry instead of the rejected 202.32-second trajectory.
+The evaluator-visible source policy, using the generic A2 compatibility YAML
+with no private bucket override, reproduced the win:
+
+| Metric, lower is better | Safe control | Source-default bucket16 | Improvement |
+| --- | ---: | ---: | ---: |
+| Mean flattened chunk RTF | 0.263267 | **0.222028** | **15.66%** |
+| P99 flattened chunk RTF | 0.397793 | **0.334418** | **15.93%** |
+| Mean audio TTFP | 645.915 ms | **563.890 ms** | **12.70%** |
+| Mean E2E | 1383.281 ms | **1166.872 ms** | **15.64%** |
+
+The source-default run completed 32/32 requests, generated 158.20 seconds / 142
+chunks, and retained 100% streaming continuity. Two independent performance
+launches measured mean chunk RTF 0.22295 and 0.22203, so the result is not tied
+to the isolation profile.
+
+Three official-protocol 32-row WER screens scored `0.017020`, `0.013400`, and
+`0.017020`; all completed 32/32 with no request, PCM, ASR, or scoring failure.
+The stricter local `0.0156` early-screen boundary lies inside that run-to-run
+range, while the maximum degradation from the matched safe `0.0153` control is
+only 0.17 percentage points, inside the competition's two-point allowance.
+The WavLM-base-plus proxy scored `0.8260` versus the safe control's `0.8310`, a
+0.50-point loss, with 32/32 embeddings and no failures. The one-chip source
+policy therefore defaults `fia_graph_seq_len_bucket_size=16` only for Stage 1.
+An explicit Stage-1 additional-config value remains authoritative, and
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT=0` restores exact-length
+task updates.
+
+torch-npu's outer `auto_dispatch_capture` FIA handler was also evaluated and
+removed. The fused unified-attention custom-op boundary produced zero native
+dispatch records even though twenty Talker layers were captured. Its apparent
+0.188 chunk RTF came from replaying capture-time KV lengths and failed WER
+catastrophically; a larger outer handler cannot see through that compiled-op
+boundary on this stack.
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-fia-bucket16-v2-official-perf-zh32-conc1/
 /tmp/minicpmo-a2-evaluator-fia-bucket16-v2-server.log
@@ -6825,6 +6874,12 @@ promoted.
 /tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-fia-bucket16-update-stream-wer-only-zh32/
 /tmp/minicpmo-a2-evaluator-fia-bucket16-update-stream-server.log
 /tmp/minicpmo-a2-evaluator-fia-v2-stable-v3-server.log
+/tmp/fia-bucket16-capture-safe-perf-20260828/
+/tmp/fia-bucket16-capture-safe-wer-20260828/
+/tmp/source-default-fia-bucket16-perf-20260828/
+/tmp/source-default-fia-bucket16-wer-repeat-20260828/
+/tmp/source-default-fia-bucket16-sim-20260828/
+/tmp/minicpmo-a2-source-default-fia-bucket16-server.log
 ```
 
 ### ENPU update-before-replay rejection

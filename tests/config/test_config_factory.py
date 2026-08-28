@@ -1226,7 +1226,9 @@ class TestDeployConfigLoading:
             "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER": "1",
             "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES": "47",
         }
-        assert deploy.stages[1].engine_extras.get("additional_config") is None
+        assert deploy.stages[1].engine_extras["additional_config"] == {
+            "fia_graph_seq_len_bucket_size": 16,
+        }
         assert deploy.stages[2].env == {
             "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE": "1",
             "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM": "1",
@@ -1249,6 +1251,7 @@ class TestDeployConfigLoading:
         deploy.stages[1].engine_extras["additional_config"] = {
             "weight_nz_mode": 0,
             "enable_stable_pa_graph_inputs": False,
+            "fia_graph_seq_len_bucket_size": 0,
         }
         deploy.stages[2].env = {
             "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE": "0",
@@ -1277,6 +1280,9 @@ class TestDeployConfigLoading:
         assert deploy.stages[1].engine_extras["additional_config"][
             "enable_stable_pa_graph_inputs"
         ] is False
+        assert deploy.stages[1].engine_extras["additional_config"][
+            "fia_graph_seq_len_bucket_size"
+        ] == 0
         assert deploy.stages[2].env[
             "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE"
         ] == "0"
@@ -1304,6 +1310,28 @@ class TestDeployConfigLoading:
         assert deploy.stages[2].env[
             "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
         ] == "2"
+
+    def test_minicpmo_single_chip_policy_can_disable_fia_bucket16(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT", "0"
+        )
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert deploy.stages[1].engine_extras.get("additional_config") is None
 
     def test_minicpmo_single_chip_policy_can_disable_ranked_terminal600(
         self, monkeypatch

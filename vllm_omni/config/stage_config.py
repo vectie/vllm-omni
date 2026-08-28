@@ -48,6 +48,9 @@ _MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT_ENV = (
 _MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT_ENV = (
     "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT"
 )
+_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT_ENV = (
+    "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT"
+)
 _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV = (
     "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
 )
@@ -955,6 +958,10 @@ def _apply_minicpmo45_single_chip_policy(
     A quality-gated 600-ms floor extends only shorter terminal packets with
     digital silence; ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT=0``
     disables it without changing the synthesized prefix.
+    The Talker uses a validated 16-token FIA sequence-length bucket so graph
+    task rebinding occurs only when the rounded length or block-table address
+    changes. ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT=0``
+    restores exact-length task updates on every token.
     Explicit placements, compile modes, runtime settings, connector choices,
     and connector values retain authority.
     """
@@ -1014,8 +1021,8 @@ def _apply_minicpmo45_single_chip_policy(
                 talker.env[name] = value
                 changed.append("talker-" + name.rsplit("_", 1)[-1].lower())
 
-        first47_raw = os.environ.get(
-            _MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT_ENV, "1"
+        fia_bucket16_raw = os.environ.get(
+            _MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT_ENV, "1"
         ).strip().lower()
         valid_switch_values = {
             "0",
@@ -1027,6 +1034,26 @@ def _apply_minicpmo45_single_chip_policy(
             "yes",
             "on",
         }
+        if fia_bucket16_raw not in valid_switch_values:
+            raise ValueError(
+                f"Invalid {_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT_ENV}="
+                f"{fia_bucket16_raw!r}"
+            )
+        talker.engine_extras = dict(talker.engine_extras or {})
+        talker_additional_config = dict(
+            talker.engine_extras.get("additional_config") or {}
+        )
+        if (
+            fia_bucket16_raw in {"1", "true", "yes", "on"}
+            and "fia_graph_seq_len_bucket_size" not in talker_additional_config
+        ):
+            talker_additional_config["fia_graph_seq_len_bucket_size"] = 16
+            talker.engine_extras["additional_config"] = talker_additional_config
+            changed.append("talker-fia-bucket16")
+
+        first47_raw = os.environ.get(
+            _MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT_ENV, "1"
+        ).strip().lower()
         if first47_raw not in valid_switch_values:
             raise ValueError(
                 f"Invalid {_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT_ENV}="

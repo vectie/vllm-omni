@@ -1,0 +1,15 @@
+# A2 evaluator-compatible Talker candidate using FIA-v2's device-tensor
+# sequence lengths. Unlike the rejected bucketed path, this keeps sparse mode
+# 3 and the original attention mask/math while eliminating host task rebinding.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_compat.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        additional_config:
+          enable_cpu_binding: false
+          ascend_compilation_config:
+            fuse_norm_quant: false
+          enable_stable_fia_v2_graph_inputs: true

@@ -70,6 +70,28 @@ def test_a2_evaluator_compat_profile_changes_capacity_not_model_numerics():
     assert not any(key.startswith("npu_") for key in extra)
 
 
+def test_a2_evaluator_fia_bucket_candidate_targets_only_talker():
+    deploy = _load_profile("minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_experimental.yaml")
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.engine_extras["additional_config"]["fia_graph_seq_len_bucket_size"] == 16
+    assert "fia_graph_seq_len_bucket_size" not in stage0.engine_extras["additional_config"]
+    assert "fia_graph_seq_len_bucket_size" not in stage2.engine_extras["additional_config"]
+
+
+def test_a2_evaluator_stable_fia_v2_candidate_targets_only_talker():
+    deploy = _load_profile("minicpmo_4_5_1npu_a2_evaluator_fia_v2_stable_experimental.yaml")
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.engine_extras["additional_config"]["enable_stable_fia_v2_graph_inputs"] is True
+    assert "enable_stable_fia_v2_graph_inputs" not in stage0.engine_extras["additional_config"]
+    assert "enable_stable_fia_v2_graph_inputs" not in stage2.engine_extras["additional_config"]
+
+
 def test_single_chip_qkv_candidate_adds_only_explicit_qkv_pack():
     deploy = _load_profile(
         "minicpmo_4_5_1npu_910c_cfm6_canonical_qkv_dma_experimental.yaml"

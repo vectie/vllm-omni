@@ -6727,6 +6727,19 @@ competition WavLM-base-plus proxy:
 | Mean WER, repeat 1 / 2 | 0.0087 | **0.0153 / 0.0153** | pass, <= 0.0156 |
 | WavLM-base-plus SIM | about 0.84485 | **0.8310** | -1.39 pp, pass |
 
+Two narrower offline boundary screens confirmed that 600 ms is the largest
+jointly admissible floor on this sample.  They appended only digital silence
+to the exact terminal-600 exports, then reran the same per-row Paraformer and
+WavLM-base-plus code paths:
+
+| Floor | Mean WER | WavLM SIM | Result |
+| --- | ---: | ---: | --- |
+| 700 ms | 0.01587 | 0.82620 | reject: WER > 0.0156 |
+| 800 ms | 0.01391 | 0.81891 | reject: SIM is -2.59 pp vs CFM6 |
+
+The two metrics bind in opposite directions near the boundary, so neither
+candidate is promoted without a larger official rerun demonstrating margin.
+
 The one-chip policy therefore defaults
 `VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS=600`.  An explicit launch or
 stage value remains authoritative.  Setting
@@ -6767,6 +6780,73 @@ reduce graph-parameter maintenance.
 /tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-stable-pa-official-perf-zh32-conc1/
 /tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-stable-pa-official-quality-sim-zh32/
 /tmp/minicpmo-a2-evaluator-cfm1-first47-terminal600-stable-pa-server.log
+```
+
+### FIA sequence-length bucket rejection
+
+A second Talker experiment retained fused-infer-attention rather than changing
+to PagedAttention.  It rounded each decode KV length to a 16-token bucket,
+masked the not-yet-valid tail, and attempted to reuse the twenty captured FIA
+tasks inside a bucket.  Standalone 910B4 probes were bit-identical in BF16
+(maximum absolute error 0.0), including the real Talker shape (12 heads,
+64-dimensional heads, a three-dimensional KV-cache view and a 4096-slot block
+table).
+
+The full graph did not preserve that result.  The candidate completed the
+32-row performance run, but generated 202.32 seconds of audio in 186 chunks,
+versus 159.68 seconds and 141 chunks for the safe control.  Its apparent
+flattened chunk RTF of 0.19541 is therefore invalid; the Talker sampling/EOS
+path had drifted.  This isolates the failure to captured CANN task reuse rather
+than the eager attention arithmetic.  The bucket profile remains experimental
+and is not part of evaluator-visible defaults.
+
+A follow-up fixed the original mask-producer race by enqueueing the tail-mask
+writes on the task-update stream before signaling each captured FIA group.  A
+hot single request then matched the control's five chunks and 5.68-second
+audio duration, while E2E fell from 1.504 to 1.266 seconds.  The complete
+32-row run nevertheless reproduced 202.32 seconds and 186 chunks.  Its mean
+chunk RTF was 0.19643 (25.4% below the safe 0.26327), but the official WER-only
+screen rejected it decisively: mean WER was 1.7680, only seven rows were
+evaluable and 25 ASR/WER rows failed.  Stream ordering was therefore a real
+bug, but not the numerical cause of the invalid autoregressive trajectory.
+
+FIA-v2 separately demonstrated bit-identical eager output while accepting a
+fixed-address device sequence-length tensor.  On the installed A2 CANN 9.0 /
+torch-npu stack, both its workspace helper and the FIA-v2 task itself extract a
+local scalar from that tensor.  NPUGraph capture rejects the required stream
+synchronization with error 107027 (`stream is captured`), so this path cannot
+provide dynamic device lengths on the competition runtime and is also not
+promoted.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-fia-bucket16-v2-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-fia-bucket16-v2-server.log
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-fia-bucket16-update-stream-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-fia-bucket16-update-stream-wer-only-zh32/
+/tmp/minicpmo-a2-evaluator-fia-bucket16-update-stream-server.log
+/tmp/minicpmo-a2-evaluator-fia-v2-stable-v3-server.log
+```
+
+### ENPU update-before-replay rejection
+
+The safe FIA configuration was also launched with vLLM-Ascend's internal
+`ENPU_ENABLE=true` lifecycle path.  This preserves the exact attention
+operator and sequence lengths, but synchronizes the current stream, updates
+captured task parameters and only then enqueues graph replay.  That ordering is
+covered by upstream graph-mode tests for other models, but it is incompatible
+with MiniCPM-o's asynchronous three-stage execution on this stack.  The first
+request remained in Stage-1 replay for more than two minutes with only 2%
+AICore utilization and never produced a first audio packet.  The control's
+cold request completes in about 68 seconds and subsequent requests in about
+1.3 seconds.  The ENPU process was stopped and the safe post-replay external-
+event ordering restored.
+
+The next exact-math direction is therefore reducing the number of host task-
+group begin/end/update operations without changing their event ordering, not
+moving all updates ahead of replay.
+
+```text
+/tmp/minicpmo-a2-evaluator-source-default-enpu-server.log
 ```
 
 ```text

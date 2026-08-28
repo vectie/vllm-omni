@@ -1,0 +1,15 @@
+# A2 evaluator-compatible profile for the opt-in FIA sequence-length bucket
+# experiment.  Stage 1 (Talker) keeps a fixed tail mask and only rebinds its
+# captured attention tasks when a request crosses a 16-token boundary.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_compat.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        additional_config:
+          enable_cpu_binding: false
+          ascend_compilation_config:
+            fuse_norm_quant: false
+          fia_graph_seq_len_bucket_size: 16

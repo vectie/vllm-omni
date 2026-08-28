@@ -7432,6 +7432,47 @@ that correctness fix is independent of the rejected optimization.
 /tmp/minicpmo-a2-direct-decode-embed-fixed-20260828-server.log
 ```
 
+### Talker replay-fence rejection and clean-cache A2 compatibility
+
+A fresh isolated vLLM-Ascend tree first exposed a deployment correctness
+problem hidden by the long-lived control's compiled graph cache.  CANN 9.0 on
+this 910B4 registers the custom-op wrapper, but its operator package does not
+contain `aclnnAddRmsNormBias`; a fresh Stage-0 graph therefore failed during
+warmup.  A narrow `VLLM_ASCEND_ENABLE_ADD_RMS_NORM_BIAS=0` control now
+decomposes only that operation to `npu_add_rms_norm`.  It does not disable the
+MiniCPM QKV, convolution, AdaLN, or other custom kernels.
+
+The subsequent performance experiment attempted to replace the broad
+per-token model-stream synchronize before Talker FULL-graph replay.  A first
+device-only update-stream fence deadlocked because `graph_task_update_begin`
+mutates captured tasks on the host immediately; queuing a device wait cannot
+delay that host mutation.  The corrected candidate retained a host barrier but
+waited on an event recorded immediately after the prior replay, excluding
+later model-stream work.  It served 32/32 requests with 100% streaming
+continuity, but failed the performance gate:
+
+| Metric, lower is better | Retained BF16 | Precise replay event | Change |
+| --- | ---: | ---: | ---: |
+| Overall audio RTF | **0.221284** | 0.232503 | +5.07% |
+| Mean chunk RTF | **0.206408** | 0.219432 | +6.31% |
+| P99 chunk RTF | 0.329015 | **0.322421** | -2.00% |
+| Mean audio TTFP | 543.215 ms | **539.777 ms** | -0.63% |
+| Mean TTFT | **75.057 ms** | 76.209 ms | +1.53% |
+
+The small TTFP and tail improvements do not compensate for the 5--6% primary
+RTF regressions.  Both replay-fence variants and their deploy profile were
+removed.  This result also confirms that graph-task rebinding is an opaque
+host mutation boundary on this torch-npu release; eliminating the barrier
+requires fixed graph-visible attention inputs or an upstream task-update API
+with explicit asynchronous lifetime semantics, not a different stream wait.
+
+```text
+/tmp/talker-async-replay-fence-smoke-v3-20260829.log
+/tmp/talker-precise-replay-fence-smoke-v4-20260829/
+/tmp/talker-precise-replay-fence-official-v4-20260829/
+/tmp/minicpmo-a2-talker-precise-replay-fence-v4-20260829-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

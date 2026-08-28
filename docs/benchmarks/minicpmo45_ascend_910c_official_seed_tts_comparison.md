@@ -7353,6 +7353,48 @@ another runtime-only dtype experiment.
 /tmp/minicpmo-a2-talker-gateup-w8a8-fixedpath-20260828-server.log
 ```
 
+### Talker calibrated static-W8A8 rejection
+
+An eager-only calibration run collected nonzero gate/up input maxima for all
+20 Talker layers over 32 Seed-TTS requests.  The observed maxima increased
+plausibly with residual depth, from 3.359375 in layer 0 to 30.25 in layer 19.
+Graph-mode calibration was explicitly discarded because Python forward hooks
+do not execute during NPUGraph replay.  The valid eager artifact then drove a
+per-tensor static activation scale (5% headroom) and per-output-channel INT8
+weights for each `[6144,768]` gate/up projection.
+
+The first candidate used graph-visible fixed quantization and the second also
+enabled vLLM-Ascend's RMSNorm/activation-quant fusion passes.  Startup
+confirmed 20 converted projections, 91.03 MiB of persistent parameters, a
+fresh compile-cache-disabled graph, and successful NPUGraph capture.  Both
+served 4/4 requests with 100% streaming continuity.  Fusion did not recover
+the small batch-one GEMM overhead:
+
+| Metric, lower is better | BF16 smoke control | Static W8A8 | Static W8A8 + norm-quant |
+| --- | ---: | ---: | ---: |
+| Overall audio RTF | **0.237039** | 0.277713 | 0.280000 |
+| Mean audio TTFP | **551.967 ms** | 589.660 ms | 594.580 ms |
+| Mean E2E | **1084.984 ms** | 967.960 ms | 974.330 ms |
+| Benchmark duration | 4.343 s | 3.870 s | 3.900 s |
+| Generated audio | **18.32 s** | 13.96 s | 13.96 s |
+
+The normalized RTF regressed by 18.1% and TTFP by 7.7% in the fully hot fused
+run.  More importantly, both static candidates changed the output trajectory
+and generated 23.8% less audio than the exact BF16 smoke.  They therefore fail
+both the performance and exact-math promotion gates; no 32-request quality run
+was spent.  The inference conversion and fusion profile were removed.  The
+eager calibration/export adapter remains as development tooling for future
+offline-quantized checkpoints, but it is inactive in serving.
+
+```text
+/tmp/minicpmo45-talker-gateup-calibration-20260828-v2.json
+/tmp/talker-static-w8a8-gateup-smoke-repeat-20260828/
+/tmp/talker-static-w8a8-normquant-smoke-20260828/
+/tmp/talker-static-w8a8-normquant-smoke-repeat-20260828/
+/tmp/minicpmo-a2-talker-static-w8a8-calibration-eager-20260828-server.log
+/tmp/minicpmo-a2-talker-static-w8a8-normquant-20260828-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

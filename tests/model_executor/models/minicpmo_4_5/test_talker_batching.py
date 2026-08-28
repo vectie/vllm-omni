@@ -24,7 +24,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _load_talker_static_w8a8_scales,
     _max_audio_tokens,
     _prepare_talker_static_w8a8_calibration,
-    _quantize_talker_static_w8a8_weight,
     _restore_weight_norm_weight,
     _talker_static_w8a8_suffixes,
 )
@@ -97,18 +96,6 @@ def test_talker_static_w8a8_target_validation() -> None:
     )
     with pytest.raises(ValueError, match="expected qkv, gate_up"):
         _talker_static_w8a8_suffixes("down")
-
-
-def test_talker_static_w8a8_weight_is_per_output_channel() -> None:
-    weight = torch.tensor([[1.0, -2.0, 0.5], [0.25, -0.5, 0.125]])
-
-    quantized, scale = _quantize_talker_static_w8a8_weight(weight)
-
-    assert quantized.dtype == torch.int8
-    assert quantized.shape == (3, 2)
-    assert torch.allclose(scale, torch.tensor([2.0 / 127.0, 0.5 / 127.0]))
-    restored = quantized.t().float() * scale[:, None]
-    assert torch.allclose(restored, weight, atol=float(scale.max()))
 
 
 def test_talker_static_w8a8_calibration_collects_projection_inputs(tmp_path) -> None:

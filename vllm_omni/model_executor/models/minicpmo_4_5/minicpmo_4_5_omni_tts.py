@@ -22,7 +22,6 @@ import torch.nn.functional as F
 from transformers import LlamaConfig
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
@@ -59,12 +58,8 @@ _INITIAL_CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAM
 _NPU_TALKER_STATIC_W8A8_CALIBRATION_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_TALKER_STATIC_W8A8_CALIBRATION"
 )
-_NPU_TALKER_STATIC_W8A8_ENV = "VLLM_OMNI_MINICPMO45_NPU_TALKER_STATIC_W8A8"
 _NPU_TALKER_STATIC_W8A8_TARGETS_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_TALKER_STATIC_W8A8_TARGETS"
-)
-_NPU_TALKER_STATIC_W8A8_HEADROOM_ENV = (
-    "VLLM_OMNI_MINICPMO45_NPU_TALKER_STATIC_W8A8_HEADROOM"
 )
 
 
@@ -81,60 +76,6 @@ def _talker_static_w8a8_suffixes(targets: str) -> tuple[str, ...]:
             "expected qkv, gate_up, or both"
         )
     return tuple(target_map[target] for target in requested)
-
-
-def _quantize_talker_static_w8a8_weight(
-    weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return an Ascend-ready ``[in,out]`` INT8 matrix and output scales."""
-    if weight.ndim != 2:
-        raise ValueError(
-            f"Talker static W8A8 requires a matrix, got shape={tuple(weight.shape)}"
-        )
-    source = weight.detach().to(dtype=torch.float32)
-    scale = source.abs().amax(dim=1).clamp_min(torch.finfo(torch.float32).tiny) / 127.0
-    quantized = torch.round(source / scale[:, None]).clamp_(-127, 127).to(torch.int8)
-    return quantized.transpose(0, 1).contiguous(), scale.contiguous()
-
-
-class _TalkerStaticW8A8LinearMethod(QuantizeMethodBase):
-    """Fixed-scale W8A8 method for post-load Talker conversion.
-
-    Unlike the rejected dynamic candidate, this path performs no per-token
-    reduction.  ``vllm.quantize`` is intentionally graph-visible so
-    vLLM-Ascend can fuse an upstream RMSNorm with the fixed quantizer.
-    """
-
-    def create_weights(self, layer: nn.Module, *args, **kwargs) -> None:
-        del layer, args, kwargs
-        raise RuntimeError("Talker static W8A8 is installed after weight loading")
-
-    def process_weights_after_loading(self, layer: nn.Module) -> None:
-        del layer
-
-    def apply(
-        self,
-        layer: nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        output_shape = (*x.shape[:-1], layer.weight.shape[-1])
-        x_2d = x.reshape(-1, x.shape[-1])
-        quantized_x = torch.ops.vllm.quantize(
-            x_2d,
-            layer.aclnn_input_scale,
-            layer.aclnn_input_scale_reciprocal,
-            layer.aclnn_input_offset,
-        )
-        quant_bias = layer.quant_bias if bias is None else bias
-        output = torch.ops.npu.npu_quant_matmul(
-            quantized_x,
-            layer.weight,
-            layer.deq_scale,
-            bias=quant_bias,
-            output_dtype=x.dtype,
-        )
-        return output.reshape(output_shape)
 
 
 def _prepare_talker_static_w8a8_calibration(
@@ -183,81 +124,6 @@ def _load_talker_static_w8a8_scales(path: str) -> dict[str, float]:
             raise ValueError(f"Talker static W8A8 calibration for {name!r} is not positive")
         scales[str(name)] = value
     return scales
-
-
-def _prepare_talker_static_w8a8(
-    model: nn.Module,
-    calibration_path: str,
-    targets: str,
-    headroom: float,
-) -> tuple[int, int]:
-    """Convert calibrated Talker projections to fixed-scale Ascend W8A8."""
-    if headroom < 1.0:
-        raise ValueError("Talker static W8A8 headroom must be at least 1.0")
-    calibrated_absmax = _load_talker_static_w8a8_scales(calibration_path)
-    selected_suffixes = _talker_static_w8a8_suffixes(targets)
-    converted = 0
-    parameter_bytes = 0
-    for name, layer in model.named_modules():
-        if not name.endswith(selected_suffixes):
-            continue
-        if name not in calibrated_absmax:
-            raise ValueError(f"Talker static W8A8 calibration is missing {name!r}")
-        weight = getattr(layer, "weight", None)
-        if not isinstance(weight, nn.Parameter) or weight.ndim != 2:
-            raise ValueError(f"Talker static W8A8 target {name!r} has no matrix weight")
-        quantized, weight_scale = _quantize_talker_static_w8a8_weight(weight)
-        input_scale_value = calibrated_absmax[name] * headroom / 127.0
-        input_scale = torch.full(
-            (weight.shape[1],),
-            input_scale_value,
-            device=weight.device,
-            dtype=weight.dtype,
-        )
-        weight.requires_grad_(False)
-        weight.data = quantized
-        layer.register_parameter(
-            "aclnn_input_scale",
-            nn.Parameter(input_scale, requires_grad=False),
-        )
-        layer.register_parameter(
-            "aclnn_input_scale_reciprocal",
-            nn.Parameter(input_scale.reciprocal(), requires_grad=False),
-        )
-        layer.register_parameter(
-            "aclnn_input_offset",
-            nn.Parameter(torch.zeros_like(input_scale), requires_grad=False),
-        )
-        layer.register_parameter(
-            "deq_scale",
-            nn.Parameter(weight_scale * input_scale_value, requires_grad=False),
-        )
-        layer.register_parameter(
-            "quant_bias",
-            nn.Parameter(
-                torch.zeros(weight.shape[-1], device=weight.device, dtype=torch.int32),
-                requires_grad=False,
-            ),
-        )
-        layer.quant_method = _TalkerStaticW8A8LinearMethod()
-        custom_op = getattr(layer, "custom_op", None)
-        if custom_op is not None:
-            custom_op.update_attrs()
-        converted += 1
-        parameter_bytes += sum(
-            parameter.numel() * parameter.element_size()
-            for parameter in (
-                weight,
-                layer.aclnn_input_scale,
-                layer.aclnn_input_scale_reciprocal,
-                layer.aclnn_input_offset,
-                layer.deq_scale,
-                layer.quant_bias,
-            )
-        )
-    if converted == 0:
-        raise ValueError("Talker static W8A8 found no eligible projections")
-    return converted, parameter_bytes
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
@@ -1744,14 +1610,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             _NPU_TALKER_STATIC_W8A8_CALIBRATION_ENV,
             "",
         ).strip()
-        static_w8a8_path = os.environ.get(
-            _NPU_TALKER_STATIC_W8A8_ENV,
-            "",
-        ).strip()
-        if calibration_path and static_w8a8_path:
-            raise ValueError(
-                "Talker static W8A8 calibration and inference cannot be enabled together"
-            )
         static_targets = os.environ.get(
             _NPU_TALKER_STATIC_W8A8_TARGETS_ENV,
             "gate_up",
@@ -1768,24 +1626,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 len(self._static_w8a8_collectors),
                 calibration_path,
             )
-        elif static_w8a8_path:
-            headroom = float(
-                os.environ.get(_NPU_TALKER_STATIC_W8A8_HEADROOM_ENV, "1.05")
-            )
-            converted, parameter_bytes = _prepare_talker_static_w8a8(
-                self.tts_model,
-                static_w8a8_path,
-                static_targets,
-                headroom,
-            )
-            logger.info(
-                "MiniCPM-o Talker selective static W8A8 active: "
-                "%d projections, %.2f MiB persistent parameters, headroom=%.3f",
-                converted,
-                parameter_bytes / (1024 * 1024),
-                headroom,
-            )
-
         if head_g is None or head_v is None:
             raise ValueError("MiniCPM-o checkpoint is missing weight-norm Talker head parameters")
         restored = _restore_weight_norm_weight(head_g, head_v)

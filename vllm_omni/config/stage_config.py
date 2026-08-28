@@ -51,6 +51,12 @@ _MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT_ENV = (
 _MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT_ENV = (
     "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT"
 )
+_MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT_ENV = (
+    "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT"
+)
+_MINICPMO45_ASCEND_SINGLE_TOKEN_SLOT_GRAPH_ENV = (
+    "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"
+)
 _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV = (
     "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
 )
@@ -962,6 +968,10 @@ def _apply_minicpmo45_single_chip_policy(
     task rebinding occurs only when the rounded length or block-table address
     changes. ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT=0``
     restores exact-length task updates on every token.
+    Batch-one Talker decode also maps only its live KV slot instead of clearing
+    the maximum slot slab on every token;
+    ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT=0`` restores the
+    generic slot-mapping kernel.
     Explicit placements, compile modes, runtime settings, connector choices,
     and connector values retain authority.
     """
@@ -1021,8 +1031,8 @@ def _apply_minicpmo45_single_chip_policy(
                 talker.env[name] = value
                 changed.append("talker-" + name.rsplit("_", 1)[-1].lower())
 
-        fia_bucket16_raw = os.environ.get(
-            _MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT_ENV, "1"
+        slot_fastpath_raw = os.environ.get(
+            _MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT_ENV, "1"
         ).strip().lower()
         valid_switch_values = {
             "0",
@@ -1034,6 +1044,22 @@ def _apply_minicpmo45_single_chip_policy(
             "yes",
             "on",
         }
+        if slot_fastpath_raw not in valid_switch_values:
+            raise ValueError(
+                f"Invalid {_MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT_ENV}="
+                f"{slot_fastpath_raw!r}"
+            )
+        if (
+            slot_fastpath_raw in {"1", "true", "yes", "on"}
+            and _MINICPMO45_ASCEND_SINGLE_TOKEN_SLOT_GRAPH_ENV not in os.environ
+            and _MINICPMO45_ASCEND_SINGLE_TOKEN_SLOT_GRAPH_ENV not in talker.env
+        ):
+            talker.env[_MINICPMO45_ASCEND_SINGLE_TOKEN_SLOT_GRAPH_ENV] = "1"
+            changed.append("talker-slot-fastpath")
+
+        fia_bucket16_raw = os.environ.get(
+            _MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT_ENV, "1"
+        ).strip().lower()
         if fia_bucket16_raw not in valid_switch_values:
             raise ValueError(
                 f"Invalid {_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT_ENV}="

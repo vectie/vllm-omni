@@ -6867,6 +6867,55 @@ dispatch records even though twenty Talker layers were captured. Its apparent
 catastrophically; a larger outer handler cannot see through that compiled-op
 boundary on this stack.
 
+A wider 32-token bucket was then screened twice to test whether remaining task
+rebinding was still the dominant cost. Against bucket16 with the same
+161.04-second output signature, bucket32 reduced mean chunk RTF from 0.22295 to
+0.22222, only 0.33%, while P99 RTF regressed by 0.15%. With the alternate
+158.20-second signature it reduced mean RTF from 0.22203 to 0.22003, but TTFP
+regressed from 563.89 to 572.39 ms and P99 RTF from 0.33442 to 0.33973. The
+sub-one-percent mean gain is below the promotion threshold and loses both tail
+latency guards, so bucket16 remains the source default. Task rebinding is no
+longer the primary Talker bottleneck; the next trace targets in-block layout
+conversion and small operators.
+
+### Bucket16 hot trace and scalar decode slot mapping
+
+The refreshed Stage-1-only trace covered ten official-shape requests after the
+capture-safe bucket16 promotion. Unlike the older layout trace, it contained no
+material `TransData` or `Transpose` budget. `MatMulV2` accounted for 45.821% of
+device time and FIA for 20.732%. The next discrete hotspot was instead the
+generic `_compute_slot_mapping_kernel`: 1,288 launches, 243.294 ms total,
+188.892 us average and 8.972% of all Stage-1 device time. The kernel clears the
+maximum slot slab on every call even though batch-one Talker decode consumes
+only slot zero; the runner separately pads the much smaller active graph view.
+
+The retained vLLM-Ascend path is an opt-in scalar Triton kernel for exactly one
+request, one live token and DCP world size one. It reads the stable position,
+performs the same physical-to-logical hybrid-block mapping, writes slot zero,
+and leaves prefill, batching, DCP and every disabled case on the canonical
+kernel. `VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH=0` or
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT=0` restores the generic
+path. This is distinct from the previously rejected nested-NPUGraph prototype:
+the scalar kernel has no inner graph replay boundary.
+
+Three 32-row runs completed without request or streaming failures. The two
+runs with the same 158.20-second / 142-chunk output signature measured mean
+chunk RTF 0.219961 and 0.218859, versus 0.222028 for the retained bucket16
+control. Their mean is 0.219410, 1.18% lower. Server-side Stage-1 ITL over the
+last 32 requests fell from 7.3313 ms to 7.1977 ms, or 1.82%. The best matched
+run also reduced mean TTFP from 563.890 to 562.778 ms and mean E2E from
+1166.872 to 1154.089 ms. P99 chunk RTF was 0.335229 versus 0.334418, a 0.24%
+tail change; the alternate 160.92-second signature improved P99 from the
+matching 0.350188 control to 0.343646.
+
+The official quality gates preserved the output trajectory: WER was 0.0170
+over 32/32 rows with zero request, PCM, ASR or scoring failures, and WavLM
+speaker SIM was 0.82583 over 32/32 embeddings with zero failures. Those match
+the retained bucket16 ranges (WER 0.0134--0.01702 and SIM 0.8260) and remain
+well inside the competition's two-percentage-point allowance. The single-chip
+source policy therefore enables the scalar path only for the Talker stage and
+keeps both an explicit rollback and an isolation profile.
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-fia-bucket16-v2-official-perf-zh32-conc1/
 /tmp/minicpmo-a2-evaluator-fia-bucket16-v2-server.log
@@ -6880,6 +6929,14 @@ boundary on this stack.
 /tmp/source-default-fia-bucket16-wer-repeat-20260828/
 /tmp/source-default-fia-bucket16-sim-20260828/
 /tmp/minicpmo-a2-source-default-fia-bucket16-server.log
+/tmp/fia-bucket32-perf-20260828/
+/tmp/fia-bucket32-perf-repeat-20260828/
+/tmp/minicpmo-a2-fia-bucket32-server.log
+/tmp/vllm-omni-profiles/minicpmo45/a2-fia-bucket16-stage1/
+/tmp/slotfast-official-perf-20260828/
+/tmp/slotfast-official-wer-20260828/
+/tmp/slotfast-official-sim-20260828/
+/tmp/minicpmo-a2-fia-bucket16-slotfast-server.log
 ```
 
 ### ENPU update-before-replay rejection

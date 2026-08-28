@@ -81,6 +81,43 @@ def test_a2_evaluator_fia_bucket_candidate_targets_only_talker():
     assert "fia_graph_seq_len_bucket_size" not in stage2.engine_extras["additional_config"]
 
 
+def test_a2_evaluator_fia_bucket32_candidate_targets_only_talker():
+    deploy = _load_profile("minicpmo_4_5_1npu_a2_evaluator_fia_bucket32_experimental.yaml")
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.engine_extras["additional_config"]["fia_graph_seq_len_bucket_size"] == 32
+    assert "fia_graph_seq_len_bucket_size" not in stage0.engine_extras["additional_config"]
+    assert "fia_graph_seq_len_bucket_size" not in stage2.engine_extras["additional_config"]
+
+
+def test_a2_evaluator_fia_bucket16_slotfast_targets_only_talker():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_slotfast_experimental.yaml"
+    )
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.engine_extras["additional_config"]["fia_graph_seq_len_bucket_size"] == 16
+    assert stage1.env["VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"] == "1"
+    assert "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH" not in (stage0.env or {})
+    assert "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH" not in (stage2.env or {})
+
+
+def test_a2_evaluator_fia_bucket16_profiler_targets_only_talker():
+    deploy = _load_profile("minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_talker_profile.yaml")
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.profiler_config is not None
+    assert stage1.profiler_config.profiler == "torch"
+    assert stage0.profiler_config is None
+    assert stage2.profiler_config is None
+
+
 def test_a2_evaluator_stable_fia_v2_candidate_targets_only_talker():
     deploy = _load_profile("minicpmo_4_5_1npu_a2_evaluator_fia_v2_stable_experimental.yaml")
     stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)

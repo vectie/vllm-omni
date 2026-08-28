@@ -37,6 +37,15 @@ from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
 
+_MINICPMO45_TALKER_IPC_COALESCE_ENV = "VLLM_OMNI_MINICPMO45_TALKER_IPC_COALESCE"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 
 class SampledLogprobContractError(RuntimeError):
     """The model runner returned unusable sampled-token logprobs."""
@@ -128,6 +137,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        self._talker_ipc_coalesce = (
+            _env_flag(_MINICPMO45_TALKER_IPC_COALESCE_ENV)
+            and getattr(model_config, "stage_id", None) == 1
+            and str(getattr(model_config, "engine_output_type", "")).lower()
+            == "audio"
+        )
+        self._talker_ipc_pending_token_ids: dict[str, list[int]] = {}
+
+    def _coalesce_talker_ipc_tokens(
+        self,
+        request_id: str,
+        new_token_ids: list[int],
+        *,
+        publish: bool,
+    ) -> list[int]:
+        """Keep token-only Talker updates inside the scheduler process.
+
+        MiniCPM-o's NPU Talker already emits sparse codec payloads only at the
+        first/steady chunk boundaries.  Sending the otherwise empty engine
+        output after every codec token still pays msgpack, ZMQ and frontend
+        processing costs.  Accumulate those token ids locally and attach them
+        to the next real payload or terminal output.  Sampling and request
+        state advance normally on every step; this only coalesces transport.
+        """
+        pending = self._talker_ipc_pending_token_ids
+        if new_token_ids:
+            pending.setdefault(request_id, []).extend(new_token_ids)
+        if not publish:
+            return []
+        return pending.pop(request_id, [])
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -701,6 +740,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            if getattr(self, "_talker_ipc_coalesce", False) and new_logprobs is None:
+                new_token_ids = self._coalesce_talker_ipc_tokens(
+                    req_id,
+                    new_token_ids,
+                    publish=(
+                        mm_output is not None
+                        or pooler_output is not None
+                        or kv_transfer_params is not None
+                        or stopped
+                    ),
+                )
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
@@ -986,6 +1036,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         assert request.is_finished()
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
+        getattr(self, "_talker_ipc_pending_token_ids", {}).pop(request.request_id, None)
 
         # [Upstream compat] Discard request from in-flight prefills set added
         # upstream for routed-experts in-flight reservation tracking.

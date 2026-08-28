@@ -83,6 +83,7 @@ _MINICPMO45_SINGLE_CHIP_TALKER_ENV_DEFAULTS = {
     # These paths preserve the sampled codec sequence.  They change only how
     # often already-produced values cross the worker/orchestrator boundary.
     "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "1",
+    "VLLM_OMNI_MINICPMO45_TALKER_IPC_COALESCE": "1",
     "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS": "1",
     "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER": "1",
 }

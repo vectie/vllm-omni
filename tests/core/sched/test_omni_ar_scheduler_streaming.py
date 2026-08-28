@@ -36,6 +36,28 @@ def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     return sched
 
 
+def test_talker_ipc_coalesce_publishes_all_tokens_at_sparse_audio_boundary() -> None:
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._talker_ipc_pending_token_ids = {}
+
+    assert sched._coalesce_talker_ipc_tokens("req", [10], publish=False) == []
+    assert sched._coalesce_talker_ipc_tokens("req", [11], publish=False) == []
+    assert sched._coalesce_talker_ipc_tokens("req", [12], publish=True) == [
+        10,
+        11,
+        12,
+    ]
+    assert sched._talker_ipc_pending_token_ids == {}
+
+
+def test_talker_ipc_coalesce_flushes_terminal_step_without_new_token() -> None:
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._talker_ipc_pending_token_ids = {"req": [10, 11]}
+
+    assert sched._coalesce_talker_ipc_tokens("req", [], publish=True) == [10, 11]
+    assert sched._talker_ipc_pending_token_ids == {}
+
+
 def _make_request() -> Request:
     return Request(
         request_id="req-ar-streaming-test",

@@ -1226,6 +1226,7 @@ class TestDeployConfigLoading:
             "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING": "1",
             "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "1",
             "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "1",
+            "VLLM_OMNI_MINICPMO45_TALKER_IPC_COALESCE": "1",
             "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS": "1",
             "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER": "1",
             "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES": "47",
@@ -1255,6 +1256,7 @@ class TestDeployConfigLoading:
             "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING": "0",
             "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "0",
             "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "0",
+            "VLLM_OMNI_MINICPMO45_TALKER_IPC_COALESCE": "0",
         }
         deploy.stages[1].engine_extras["additional_config"] = {
             "weight_nz_mode": 0,
@@ -1293,6 +1295,9 @@ class TestDeployConfigLoading:
         ] == "0"
         assert deploy.stages[1].env[
             "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
+        ] == "0"
+        assert deploy.stages[1].env[
+            "VLLM_OMNI_MINICPMO45_TALKER_IPC_COALESCE"
         ] == "0"
         assert deploy.stages[1].engine_extras["additional_config"][
             "weight_nz_mode"

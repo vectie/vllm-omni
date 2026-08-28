@@ -7117,6 +7117,48 @@ moving all updates ahead of replay.
 /tmp/minicpmo-a2-evaluator-source-default-enpu-server.log
 ```
 
+### Talker token-only IPC coalescing
+
+The retained sparse codec path already advances sampling and scheduler state
+inside the Stage-1 engine process on every codec token, but it still serialized
+and sent an otherwise empty `EngineCoreOutput` through ZMQ after every step.
+The promoted scheduler path accumulates only those token ids locally and
+attaches them to the next real codec payload, stop, or transfer boundary.  It
+does not batch model execution, speculate tokens, reorder sampling, or change
+the codec/CFM/HiFT tensors.  Requests that ask for token log probabilities and
+all non-audio/non-Stage-1 configurations remain on the canonical path.
+
+Two consecutive 32-row, concurrency-one runs completed 32/32 requests with
+100% streaming continuity.  Talker output length is stochastic on this stack:
+the runs landed in the already-observed 160.92-second/144-chunk and
+158.20-second/142-chunk clusters respectively.  The former cluster also
+occurred in the retained slot-fast control and the latter in the dirty-table
+and metadata-cache controls, so the length change is not attributed to IPC
+coalescing.
+
+| Metric, lower is better | Fused-metadata control | IPC coalesce run 1 | IPC coalesce run 2 |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF | 0.208516 | **0.206408** | 0.207337 |
+| P99 chunk RTF | 0.331753 | 0.327476 | **0.323383** |
+| Mean audio TTFP | 544.965 ms | 543.215 ms | **542.227 ms** |
+| Mean E2E | 1120.094 ms | 1112.290 ms | **1095.828 ms** |
+| Benchmark duration | 35.857 s | 35.609 s | **35.083 s** |
+| Stage-1 ITL | 6.7004 ms | - | **6.6502 ms** |
+
+Against the strongest prior run, the first candidate lowers mean chunk RTF by
+1.01%, P99 by 1.29%, audio TTFP by 0.32%, E2E by 0.70%, and total duration by
+0.69%.  The last 32 server-side Stage-1 samples lower ITL by 0.75%.  Because
+the optimization changes transport frequency only, the previously accepted
+WER/SIM model-output gate remains applicable; the two performance runs also
+validate request completion and PCM streaming.
+
+```text
+/tmp/fusedscalar-ipccoalesce-smoke-20260828/
+/tmp/fusedscalar-ipccoalesce-official-perf-20260828/
+/tmp/fusedscalar-ipccoalesce-official-perf-repeat-20260828/
+/tmp/minicpmo-a2-fusedscalar-ipccoalesce-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

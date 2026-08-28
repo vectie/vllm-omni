@@ -7302,6 +7302,57 @@ FP16 does not provide that acceleration.
 /tmp/minicpmo-a2-talker-fp16-20260828-server.log
 ```
 
+### Talker dynamic-W8A8 projection rejection
+
+The next experiment attacked the latest Stage-1 trace's dominant
+`MatMulV2` budget with graph-visible A2 INT8 Cube operations.  Symmetric
+per-output-channel INT8 weights were prepared once after checkpoint loading;
+activations were quantized per token inside the graph.  RMSNorm, attention,
+row projections, codec sampling, Stage 0 and Stage 2 retained their proven
+BF16/FP32 paths.  The Ascend compiler confirmed that `norm_quant` fusion was
+enabled and a fresh cache-disabled graph was captured.
+
+Two target sets were measured.  Quantizing all 20 fused QKV and 20 fused
+gate/up projections reduced Talker model memory to 0.5221 GB, with 124.39 MiB
+of persistent INT8 parameters.  A second candidate retained BF16 QKV and only
+quantized the larger `[6144,768]` gate/up projection in each layer: 20
+projections, 90.47 MiB INT8, and 0.5549 GB total Talker model memory.  Both
+served 4/4 requests with 100% streaming continuity after a 68-second first
+graph compile.
+
+Fully hot four-request smoke results rejected both candidates:
+
+| Metric, lower is better | BF16 smoke control | QKV + gate/up W8A8 | Gate/up-only W8A8 |
+| --- | ---: | ---: | ---: |
+| Overall audio RTF | **0.237039** | 0.247373 | 0.238995 |
+| Mean chunk RTF | 0.224442 | 0.227800 | **0.223403** |
+| Mean audio TTFP | **551.967 ms** | 590.037 ms | 573.866 ms |
+| Mean E2E | **1084.984 ms** | 1152.197 ms | 1151.511 ms |
+| Benchmark duration | **4.343 s** | 4.611 s | 4.608 s |
+| Generated audio / chunks | 18.32 s / 17 | 18.64 s / 17 | 19.28 s / 18 |
+
+Gate/up-only recovered most of the dual-target loss and improved mean chunk
+RTF by 0.46%, but regressed overall RTF by 0.83%, TTFP by 3.97% and E2E by
+6.13%.  Dynamic per-token activation scale calculation and the additional
+graph work still exceed the Cube saving for concurrency-one autoregressive
+decode.  No 32-request or quality run was spent on either losing candidate.
+The runtime conversion and deploy profile were removed.
+
+The remaining INT8 path is offline calibrated static W8A8: precompute
+activation scales, retain higher precision for RMSNorm/attention/sampling, and
+compile the quantized projection graph without a per-layer dynamic-scale
+kernel.  That requires a MiniCPM Talker calibration/export adapter rather than
+another runtime-only dtype experiment.
+
+```text
+/tmp/talker-selective-w8a8-smoke-20260828/
+/tmp/talker-selective-w8a8-smoke-repeat-20260828/
+/tmp/talker-gateup-w8a8-smoke-20260828/
+/tmp/talker-gateup-w8a8-smoke-repeat-20260828/
+/tmp/minicpmo-a2-talker-selective-w8a8-20260828-server.log
+/tmp/minicpmo-a2-talker-gateup-w8a8-fixedpath-20260828-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

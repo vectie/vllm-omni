@@ -54,8 +54,17 @@ _MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT_ENV = (
 _MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT_ENV = (
     "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT"
 )
+_MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT_ENV = (
+    "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT"
+)
 _MINICPMO45_ASCEND_SINGLE_TOKEN_SLOT_GRAPH_ENV = (
     "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"
+)
+_MINICPMO45_ASCEND_DIRTY_BLOCK_TABLE_COMMIT_ENV = (
+    "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT"
+)
+_MINICPMO45_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE_ENV = (
+    "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE"
 )
 _MINICPMO45_TOKEN2WAV_N_TIMESTEPS_ENV = (
     "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
@@ -972,6 +981,10 @@ def _apply_minicpmo45_single_chip_policy(
     the maximum slot slab on every token;
     ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT=0`` restores the
     generic slot-mapping kernel.
+    Stable batch-one decode metadata and unchanged KV block-table rows remain
+    resident on the NPU instead of being uploaded after every codec token;
+    ``VLLM_OMNI_MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT=0`` restores
+    the canonical per-step uploads.
     Explicit placements, compile modes, runtime settings, connector choices,
     and connector values retain authority.
     """
@@ -1056,6 +1069,23 @@ def _apply_minicpmo45_single_chip_policy(
         ):
             talker.env[_MINICPMO45_ASCEND_SINGLE_TOKEN_SLOT_GRAPH_ENV] = "1"
             changed.append("talker-slot-fastpath")
+
+        decode_metadata_raw = os.environ.get(
+            _MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT_ENV, "1"
+        ).strip().lower()
+        if decode_metadata_raw not in valid_switch_values:
+            raise ValueError(
+                f"Invalid {_MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT_ENV}="
+                f"{decode_metadata_raw!r}"
+            )
+        if decode_metadata_raw in {"1", "true", "yes", "on"}:
+            for name in (
+                _MINICPMO45_ASCEND_DIRTY_BLOCK_TABLE_COMMIT_ENV,
+                _MINICPMO45_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE_ENV,
+            ):
+                if name not in os.environ and name not in talker.env:
+                    talker.env[name] = "1"
+                    changed.append("talker-decode-metadata")
 
         fia_bucket16_raw = os.environ.get(
             _MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT_ENV, "1"

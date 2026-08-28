@@ -1221,6 +1221,8 @@ class TestDeployConfigLoading:
         connector = deploy.connectors["connector_of_shared_memory"]
         assert connector["extra"]["shm_event_notifications"] is True
         assert deploy.stages[1].env == {
+            "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT": "1",
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE": "1",
             "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "1",
             "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "1",
             "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS": "1",
@@ -1247,6 +1249,8 @@ class TestDeployConfigLoading:
         )
         deploy.stages[0].compilation_config = {"cudagraph_mode": "NONE"}
         deploy.stages[1].env = {
+            "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT": "0",
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE": "0",
             "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "0",
             "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "0",
         }
@@ -1275,6 +1279,12 @@ class TestDeployConfigLoading:
         }
         assert deploy.stages[1].env[
             "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"
+        ] == "0"
+        assert deploy.stages[1].env[
+            "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT"
+        ] == "0"
+        assert deploy.stages[1].env[
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE"
         ] == "0"
         assert deploy.stages[1].env[
             "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
@@ -1359,6 +1369,32 @@ class TestDeployConfigLoading:
         )
 
         assert "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH" not in deploy.stages[1].env
+
+    def test_minicpmo_single_chip_policy_can_disable_decode_metadata(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT", "0"
+        )
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT" not in deploy.stages[1].env
+        assert (
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE"
+            not in deploy.stages[1].env
+        )
 
     def test_minicpmo_single_chip_policy_can_disable_ranked_terminal600(
         self, monkeypatch

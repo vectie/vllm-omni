@@ -76,7 +76,10 @@ def test_a2_evaluator_fia_bucket_candidate_targets_only_talker():
     stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
     stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
 
-    assert stage1.engine_extras["additional_config"]["fia_graph_seq_len_bucket_size"] == 16
+    assert (
+        stage1.engine_extras["additional_config"]["fia_graph_seq_len_bucket_size"]
+        == 16
+    )
     assert "fia_graph_seq_len_bucket_size" not in stage0.engine_extras["additional_config"]
     assert "fia_graph_seq_len_bucket_size" not in stage2.engine_extras["additional_config"]
 
@@ -104,6 +107,27 @@ def test_a2_evaluator_fia_bucket16_slotfast_targets_only_talker():
     assert stage1.env["VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"] == "1"
     assert "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH" not in (stage0.env or {})
     assert "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH" not in (stage2.env or {})
+
+
+def test_a2_evaluator_metacache_targets_only_talker():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_slotfast_metacache_experimental.yaml"
+    )
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.engine_extras["additional_config"]["fia_graph_seq_len_bucket_size"] == 16
+    assert stage1.env["VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"] == "1"
+    assert stage1.env["VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT"] == "1"
+    assert stage1.env["VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE"] == "1"
+    for name in (
+        "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH",
+        "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT",
+        "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE",
+    ):
+        assert name not in (stage0.env or {})
+        assert name not in (stage2.env or {})
 
 
 def test_a2_evaluator_fia_bucket16_profiler_targets_only_talker():

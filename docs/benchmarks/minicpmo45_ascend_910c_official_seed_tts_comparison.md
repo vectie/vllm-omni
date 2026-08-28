@@ -6939,6 +6939,67 @@ keeps both an explicit rollback and an isolation profile.
 /tmp/minicpmo-a2-fia-bucket16-slotfast-server.log
 ```
 
+### Persistent Talker decode metadata
+
+The Stage-1 trace also showed that the batch-one decode runner retransmitted
+metadata whose values do not change between codec tokens. In particular, it
+uploaded the active KV block-table row on every step even though allocation
+changes occur only at block boundaries, and it recopied the same
+`query_start_loc`, request index, query offset, one-token schedule length,
+discard mask, and all-ones accepted-token slab. These tiny copies create host
+dispatch, H2D copy, fill, and event work around a decode graph whose tensor
+addresses are already stable.
+
+The retained vLLM-Ascend implementation has two independently reversible
+parts. Block-table rows are dirty-tracked by every append, clear, move and swap
+mutation and are uploaded only when an active row changed. The batch-one,
+non-speculative, non-DCP decode path fingerprints its invariant metadata and
+leaves matching slabs resident at their graph-visible NPU addresses. Prefill,
+batching, speculative decode, DCP, GDN, shape transitions, and disabled cases
+invalidate the fingerprints and use the canonical uploads. The source-default
+single-chip policy scopes both switches to the Talker stage. Set
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT=0` to disable both,
+or set `VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT=0` and
+`VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE=0` independently.
+
+Dirty block-table submission alone reduced matched Stage-1 ITL from 7.1977 to
+7.0845 ms, but its 158.20-second whole-service run was neutral: mean chunk RTF
+was 0.219477 versus the slot-fast two-run mean of 0.219410. It therefore was
+not promoted by itself. Adding invariant metadata residency produced two
+same-direction official-shape runs and improved both output signatures.
+
+| Metric, lower is better | Slot-fast matched control | Persistent metadata | Improvement |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF, 158.20 s / 142 chunks | 0.219410 | **0.216392** | **1.38%** |
+| P99 chunk RTF | 0.336446 | **0.333836** | **0.78%** |
+| Mean audio TTFP | 562.852 ms | **553.566 ms** | **1.65%** |
+| Mean E2E | 1155.853 ms | **1138.786 ms** | **1.48%** |
+| Stage-1 ITL | 7.1977 ms | **6.9858 ms** | **2.94%** |
+
+The independent 161.04-second / 145-chunk repeat also improved every guarded
+metric versus dirty-only: mean chunk RTF 0.222004 to 0.216280, P99 0.346446 to
+0.334312, TTFP 568.236 to 556.054 ms, E2E 1188.152 to 1158.536 ms, and
+Stage-1 ITL 7.1777 to 7.0034 ms. All 96 measured requests across performance
+and quality runs completed with continuous streaming and no request or PCM
+failure.
+
+The exact quality gate remained unchanged. Seed-TTS WER was 0.0170 over 32/32
+utterances with zero ASR failures. Offline-cache WavLM SIM was 0.8259 over
+32/32 embeddings with zero failures, matching the prior 0.82583 result. The
+first combined WER/SIM invocation recorded 32 SIM infrastructure failures
+because Hugging Face HEAD requests were reset; forcing `HF_HUB_OFFLINE=1`
+loaded the already cached identical WavLM checkpoint and completed the gate.
+
+```text
+/tmp/dirtybt-official-perf-20260828/
+/tmp/dirtybt-official-perf-repeat-20260828/
+/tmp/metacache-official-perf-20260828/
+/tmp/metacache-official-perf-repeat-20260828/
+/tmp/metacache-official-quality-20260828/
+/tmp/metacache-official-sim-offline-20260828/
+/tmp/minicpmo-a2-fia-bucket16-slotfast-dirtybt-metacache-server.log
+```
+
 ### ENPU update-before-replay rejection
 
 The safe FIA configuration was also launched with vLLM-Ascend's internal

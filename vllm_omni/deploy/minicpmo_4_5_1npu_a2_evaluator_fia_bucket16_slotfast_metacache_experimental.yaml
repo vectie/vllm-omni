@@ -1,0 +1,13 @@
+# A2 evaluator-compatible isolation profile for the quality-gated persistent
+# Talker decode metadata path. Stable scalar metadata and unchanged KV block
+# rows stay resident at their graph-visible NPU addresses between codec tokens.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_slotfast_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT: "1"
+          VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE: "1"

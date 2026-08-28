@@ -93,7 +93,7 @@ below.
 | Delta-cache candidate 3 | 323.45 ms | 983.58 ms | 0.4513 | 0.4836 | 1901.00 ms |
 
 | Metric | Stable baseline mean | Candidate mean | Change |
-| --- | ---: | ---: | ---: |
+| --- | ---: | ---: | ---: | ---: |
 | TTFT | 319.94 ms | 312.02 ms | -2.47% |
 | Audio TTFP | 988.16 ms | 951.95 ms | -3.66% |
 | Whole-audio RTF | 0.4536 | 0.4441 | -2.08% |
@@ -1285,7 +1285,7 @@ a coarser two-program tiling were tested after warmup. The coarser result is
 shown with two stock alternatives:
 
 | Projection path | Mean | P50 | P99 | Max abs delta |
-| --- | ---: | ---: | ---: | ---: |
+| --- | ---: | ---: | ---: |
 | Native concat + view + linear | 94.14 us | 94.74 us | 110.80 us | 0 |
 | Triton virtual concat, coarse | 927.89 us | 926.96 us | 951.61 us | 0.5 |
 | Four split native linears + sum | 214.03 us | 212.25 us | 241.73 us | 0.5 |
@@ -7449,28 +7449,162 @@ mutates captured tasks on the host immediately; queuing a device wait cannot
 delay that host mutation.  The corrected candidate retained a host barrier but
 waited on an event recorded immediately after the prior replay, excluding
 later model-stream work.  It served 32/32 requests with 100% streaming
-continuity, but failed the performance gate:
+continuity.
 
-| Metric, lower is better | Retained BF16 | Precise replay event | Change |
-| --- | ---: | ---: | ---: |
-| Overall audio RTF | **0.221284** | 0.232503 | +5.07% |
-| Mean chunk RTF | **0.206408** | 0.219432 | +6.31% |
-| P99 chunk RTF | 0.329015 | **0.322421** | -2.00% |
-| Mean audio TTFP | 543.215 ms | **539.777 ms** | -0.63% |
-| Mean TTFT | **75.057 ms** | 76.209 ms | +1.53% |
+The first comparison against the historical cached control was confounded:
+the historical run generated 160.92 seconds / 144 chunks, while the new
+isolated runs generated roughly 137 seconds / 119 chunks.  That output-length
+change must not be attributed to the A2 compatibility decomposition without a
+matched control; it can also arise from the sampled Talker trajectory and
+benchmark protocol.  The candidate was therefore compared with two no-fence
+runs from the same isolated source, graph cache, request settings and
+compatibility path.  That strict A/B rejected it as benchmark noise rather than
+a repeatable mean-speed improvement:
 
-The small TTFP and tail improvements do not compensate for the 5--6% primary
-RTF regressions.  Both replay-fence variants and their deploy profile were
-removed.  This result also confirms that graph-task rebinding is an opaque
-host mutation boundary on this torch-npu release; eliminating the barrier
-requires fixed graph-visible attention inputs or an upstream task-update API
-with explicit asynchronous lifetime semantics, not a different stream wait.
+| Metric, lower is better | No-fence control 1 | No-fence control 2 | Precise replay event |
+| --- | ---: | ---: | ---: | ---: |
+| Overall audio RTF | 0.234059 | **0.231018** | 0.232503 |
+| Mean chunk RTF | 0.220769 | **0.215947** | 0.219432 |
+| P99 chunk RTF | 0.329353 | 0.329028 | **0.322421** |
+| Mean audio TTFP | 544.587 ms | 542.012 ms | **539.777 ms** |
+| Mean E2E | 1003.611 ms | **990.620 ms** | 992.775 ms |
+| Mean TTFT | 76.782 ms | 76.787 ms | **76.209 ms** |
+
+The candidate's primary RTF values fall inside the control's 1.3--2.2%
+run-to-run spread.  TTFP improved by only 0.4--0.9% and P99 chunk RTF by about
+2%, while mean chunk RTF was 1.6% slower than the faster control repeat.  That
+is not enough to justify another execution path.  Both replay-fence variants
+and their deploy profile were removed.
+
+The experiment confirms that graph-task rebinding is an opaque host mutation
+boundary on this torch-npu release; eliminating the barrier requires fixed
+graph-visible attention inputs or an upstream task-update API with explicit
+asynchronous lifetime semantics, not a different stream wait.
 
 ```text
 /tmp/talker-async-replay-fence-smoke-v3-20260829.log
 /tmp/talker-precise-replay-fence-smoke-v4-20260829/
 /tmp/talker-precise-replay-fence-official-v4-20260829/
+/tmp/cleancompile-control-official-v5-20260829/
+/tmp/cleancompile-control-repeat-official-v5-20260829/
 /tmp/minicpmo-a2-talker-precise-replay-fence-v4-20260829-server.log
+/tmp/minicpmo-a2-cleancompile-control-v5-20260829-server.log
+```
+
+### FIA-v2 device-length rejection and graph-cache isolation
+
+A follow-up attempted to remove FIA task rebinding entirely by binding Stage
+1 attention to the model runner's persistent NPU sequence-length tensor, then
+skipping the conservative pre-replay host synchronize.  This is not supported
+by the installed torch-npu 2.10 operator contract.  Both
+`actual_seq_qlen` and `actual_seq_kvlen` are `SymInt[]`, not Tensor inputs.
+Passing the NPU tensor makes the wrapper extract a scalar through
+`LocalScalarDenseNpu`; capture then fails because that extraction calls
+`aclrtSynchronizeStream` on the captured stream (`107027`, followed by
+capture-end `107033`).  The experimental async-replay code and profile were
+removed.
+
+The failed launch exposed a separate persistent-cache correctness issue.  The
+A2 capability switch for the unavailable `aclnnAddRmsNormBias` changes the FX
+graph, but neither vLLM's global AOT key nor vLLM-Ascend's backend key included
+that switch.  A graph traced with the optional A3-capable path could therefore
+be reused on A2.  The normalized capability is now included in both cache
+layers.  Focused remote tests passed (8 passed), and clean Stage-0 and Stage-1
+compilation produced distinct A2 cache keys and completed both FULL decode
+graph captures.
+
+The fully warm 32-request control below uses the same evaluator-compatible
+source policy, Stage-1 bucket16 FIA, conservative replay fence, local model
+overlay, concurrency one and deterministic benchmark sampling as the strict
+controls above.  It completed 32/32 with 100% streaming continuity:
+
+| Metric, lower is better | Clean-cache control 1 | Clean-cache control 2 | Capability-key control |
+| --- | ---: | ---: | ---: |
+| Overall audio RTF | 0.234059 | **0.231018** | 0.233979 |
+| Mean chunk RTF | 0.220769 | **0.215947** | 0.220094 |
+| P99 chunk RTF | 0.329353 | 0.329028 | **0.317693** |
+| Mean audio TTFP | 544.587 ms | 542.012 ms | **537.419 ms** |
+| Mean E2E | 1003.611 ms | **990.620 ms** | 1003.283 ms |
+| Mean TTFT | 76.782 ms | 76.787 ms | **75.469 ms** |
+
+The primary means remain inside ordinary run variance, as expected for a cache
+correctness fix.  The first request after process startup spent 68.40 seconds
+in lazy Code2Wav/operator initialization, so that cold run is recorded but not
+mixed into the fully warm serving comparison.  Local checkpoint staging also
+reduced Stage-0 weight loading from roughly 350--390 seconds on the remote
+filesystem to 3--12 seconds; this is deployment startup improvement, not a
+ranked steady-state RTF claim.
+
+```text
+/tmp/cachefixed-control-official-v11-20260829/
+/tmp/cachefixed-control-repeat-official-v11-20260829/
+/tmp/minicpmo-a2-stable-fia-v2-async-v8-local-20260829-server.log
+/tmp/minicpmo-a2-cachefixed-control-v11-local-20260829-server.log
+```
+
+### Bucket-stable FIA replay preflight
+
+The rejected replay-fence experiments above still synchronized before every
+FULL graph replay because they could not prove whether `graph_task_update`
+would rebind FIA metadata.  The revised opt-in path performs a conservative
+preflight using the rounded sequence-length bucket plus every block-table
+address.  It skips the host fence only when all captured FIA tasks can be
+reused.  A ping-pong completion event protects the shared tail mask; bucket,
+request, speculative and unrecognized transitions keep the existing host
+synchronize.
+
+Focused vLLM-Ascend tests pass (64 passed).  In the Stage-1 trace this reduced
+`aclrtSynchronizeStreamWithTimeout` calls from 386 to 29, but the removed calls
+accounted for only about 1.5 ms per request.  Consequently this remains an
+experimental, explicitly enabled optimization rather than a claimed major RTF
+gain.  The resident repetition-penalty fix below dominates the measured
+combined result.
+
+```text
+vllm_omni/deploy/minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_experimental.yaml
+vllm_omni/deploy/minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_talker_profile.yaml
+```
+
+### Resident Talker repetition-penalty scalar
+
+A Stage-1 stack trace found that 140 of 153 host stream synchronizations in a
+representative Talker request came from the codec repetition-penalty helper.
+Every generated codec token called `torch.as_tensor(1.05, device="npu")`,
+which synchronously materialized the same Python scalar on the NPU.  Those 140
+calls accounted for 145.628 ms of host-side synchronization time.
+
+The Talker already owns `_fused_codec_penalty` as a registered tensor buffer.
+The hot path now reuses that resident buffer and retains the scalar fallback
+for standalone callers.  The penalty value, frequency accumulation, sampling
+distribution, CFM step count and model weights are unchanged.  A focused test
+also fails if the resident-tensor path calls `torch.as_tensor`; the four
+relevant remote tests pass.
+
+Two fully warm 32-request Seed-TTS runs completed 32/32 with 100% streaming
+continuity.  The comparison uses the three-run median of the immediately
+preceding capability-key controls as the baseline.  For the two new runs, the
+reported candidate is their median (the average of the two middle values):
+
+| Metric, lower is better | Control median | Resident scalar median | Improvement |
+| --- | ---: | ---: | ---: |
+| Overall audio RTF | 0.233979 | 0.191745 | 18.05% |
+| Mean chunk RTF | 0.220094 | 0.179135 | 18.61% |
+| P99 chunk RTF | 0.329028 | 0.282424 | 14.16% |
+| Mean audio TTFP | 542.012 ms | 474.117 ms | 12.53% |
+| Mean E2E | 1003.283 ms | 963.326 ms | 3.98% |
+| Mean TTFT | 76.782 ms | 75.673 ms | 1.44% |
+
+The individual candidate runs produced mean chunk RTF 0.180403 / 0.177868
+and mean TTFP 475.414 / 472.820 ms, so the gain reproduced across both full
+runs.  Output durations were 162.24 and 159.44 seconds; per-request RTF and
+chunk RTF remain normalized for output duration.  This optimization is exact
+at the repetition-penalty expression level, but the official three-benchmark
+accuracy gate still remains required before submission.
+
+```text
+/tmp/lunanexa-bench/resident-penalty-v20-official32/
+/tmp/lunanexa-bench/resident-penalty-v20-repeat-official32/
+/tmp/vllm-omni-profiles/minicpmo45/a2-fia-bucket16-async-stage1/stage1_rank0/9af131f15bd4_1670738_20260828213004818_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json
 ```
 
 ```text

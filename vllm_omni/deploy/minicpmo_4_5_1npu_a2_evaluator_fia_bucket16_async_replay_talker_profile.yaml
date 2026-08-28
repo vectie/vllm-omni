@@ -1,0 +1,12 @@
+# Development-only Stage-1 profiler overlay for bucket-async replay.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_experimental.yaml
+
+stages:
+  - stage_id: 1
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /tmp/vllm-omni-profiles/minicpmo45/a2-fia-bucket16-async-stage1
+      torch_profiler_record_shapes: true
+      torch_profiler_with_memory: false
+      torch_profiler_with_stack: false

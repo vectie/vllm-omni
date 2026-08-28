@@ -1,0 +1,18 @@
+# A2 single-chip isolation profile for host-barrier-free Talker replay.
+# Within a stable 16-token FIA bucket, replay i+1 is queued immediately while
+# the update stream waits for replay i's completion event before changing the
+# shared tail mask. Bucket/request transitions retain the conservative host
+# synchronization because they rebind captured task metadata.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        additional_config:
+          enable_cpu_binding: false
+          ascend_compilation_config:
+            fuse_norm_quant: false
+          fia_graph_seq_len_bucket_size: 16
+          enable_fia_bucket_async_replay: true

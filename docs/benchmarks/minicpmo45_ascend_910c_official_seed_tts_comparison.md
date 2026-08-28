@@ -7233,6 +7233,40 @@ compilation for any legitimate weight-quantized graph.
 /tmp/minicpmo-a2-talker-w8a16-viewcompat-20260828-server.log
 ```
 
+### Talker static-kernel rejection
+
+The fixed token-one Stage-1 graph was also compiled with NPUGraph_ex static
+ACLNN kernels while retaining BF16 weights, FIA bucket16, scalar-slot mapping,
+fused resident metadata, and token-only IPC coalescing.  The launch log
+confirmed a fresh graph cache key with `enable_static_kernel=true`, built and
+installed the generated kernel package, and completed a real cold request.
+The package was removed automatically when the candidate process exited.
+
+Static compilation did not preserve the Talker output trajectory on this A2
+stack.  The same 32 prompts produced 202.32 seconds / 186 chunks instead of the
+control's 160.92 seconds / 144 chunks.  Consequently a lower normalized
+per-chunk number was a false win: the service performed substantially more
+autoregressive work and regressed request latency and total duration.
+
+| Metric, lower is better | NPUGraph_ex control | Static kernel | Change |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF | 0.206408 | **0.185415** | -10.17% |
+| P99 chunk RTF | 0.329015 | **0.328123** | -0.27% |
+| Mean audio TTFP | **543.215 ms** | 549.840 ms | +1.22% |
+| Mean E2E | **1112.290 ms** | 1279.052 ms | +14.99% |
+| Benchmark duration | **35.609 s** | 40.945 s | +14.98% |
+| Generated audio | **160.92 s / 144 chunks** | 202.32 s / 186 chunks | +25.73% audio |
+
+The output-shape mismatch fails the exact-math gate before any official
+WER/SIM run.  The deploy profile was removed and the retained Stage-1 graph
+continues to use NPUGraph_ex without static-kernel materialization.
+
+```text
+/tmp/talker-static-kernel-smoke-20260828/
+/tmp/talker-static-kernel-official-perf-20260828/
+/tmp/minicpmo-a2-talker-static-kernel-20260828-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

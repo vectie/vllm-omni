@@ -7188,6 +7188,51 @@ path continues to signal one event per FIA layer.
 /tmp/minicpmo-a2-fusedscalar-ipccoalesce-eventgroup2-server.log
 ```
 
+### Talker runtime W8A16 rejection
+
+The Stage-1 trace attributes 45.821% of device time to `MatMulV2`, so a
+runtime-only W8A16 experiment quantized all 80 Talker Llama linear weights
+with symmetric per-output-channel scales.  Activations, RMSNorm, attention
+probabilities, codec projection, Stage 0, CFM and HiFT stayed BF16/FP32.  The
+post-load conversion reduced Stage-1 model weights from about 0.93 GB to
+0.4674 GB.
+
+The first launch exposed a stale-cache hazard: runtime quantization was not
+represented in vLLM's AOT/NPUGraph cache key, so a cached BF16 graph expected
+the pre-quantization weight layout.  A cache-disabled diagnostic forced fresh
+compilation.  That compilation then exposed a torch_npu 2.10 packaging defect:
+`npu_fx_compiler` disables `enable_view_optimize` for
+`npu_weight_quant_batchmatmul`, but the matching NPUGraph experimental config
+omits the option.  vLLM-Ascend now repairs that missing option only on affected
+packages.  With the compatibility repair, W8A16 compiled, completed cold
+warmup and served 32/32 requests with 100% streaming continuity.
+
+It was nevertheless slower than the retained full-precision path:
+
+| Metric, lower is better | IPC-coalesced BF16 | Talker W8A16 | Change |
+| --- | ---: | ---: | ---: |
+| Overall audio RTF | **0.221284** | 0.238195 | +7.64% |
+| Mean chunk RTF | **0.206408** | 0.223413 | +8.24% |
+| P99 chunk RTF | **0.329015** | 0.345386 | +4.98% |
+| Mean audio TTFP | **543.215 ms** | 575.535 ms | +5.95% |
+| Mean E2E | **1112.290 ms** | 1203.883 ms | +8.23% |
+| Benchmark duration | **35.609 s** | 38.540 s | +8.23% |
+
+The candidate generated 161.80 seconds of audio and 145 chunks versus the
+control's already-observed 160.92-second/144-chunk stochastic cluster; the
+normalized RTF and per-chunk regressions independently reject it.  At
+concurrency one, A2's small decode GEMMs do not amortize weight dequantization
+and layout overhead.  The runtime quantization code and deploy profile were
+fully removed, and no quality run was spent on a performance-losing candidate.
+The generic NPUGraph compatibility repair remains because it fixes fresh
+compilation for any legitimate weight-quantized graph.
+
+```text
+/tmp/talker-w8a16-smoke-20260828/
+/tmp/talker-w8a16-official-perf-20260828/
+/tmp/minicpmo-a2-talker-w8a16-viewcompat-20260828-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

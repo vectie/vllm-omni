@@ -7607,6 +7607,47 @@ accuracy gate still remains required before submission.
 /tmp/vllm-omni-profiles/minicpmo45/a2-fia-bucket16-async-stage1/stage1_rank0/9af131f15bd4_1670738_20260828213004818_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json
 ```
 
+A post-fix warm trace confirms the intended mechanism.  Only 13 plain stream
+synchronizations and 9 timed stream synchronizations remain; their combined
+runtime is 0.480 ms.  The old 140 per-token scalar-materialization syncs are
+absent.  The remaining Stage-1 budget is dominated by autoregressive launch
+gaps plus the eager head/filter/multinomial chain rather than that scalar.
+
+### Resident scalar plus inverse-CDF sampler graph
+
+The existing fixed-shape inverse-CDF sampler was then layered on the new
+resident-scalar and bucket-async baseline.  It captures the codec head,
+frequency penalty, bounded top-k/top-p, draw and rolling frequency update in a
+small graph.  One focused deploy-config test passes, and three fully warm
+32-request runs completed 32/32 with 100% streaming continuity.  The final
+run enabled the complete official metric set:
+
+| Metric, lower is better | Resident scalar median | Sampler graph | Improvement |
+| --- | ---: | ---: | ---: |
+| Overall audio RTF | 0.191745 | 0.159988 | 16.56% |
+| Mean audio RTF | 0.194141 | 0.164302 | 15.37% |
+| Mean chunk RTF | 0.179135 | 0.146645 | 18.14% |
+| P99 chunk RTF | 0.282424 | 0.263500 | 6.70% |
+| Mean audio TTFP | 474.117 ms | 436.852 ms | 7.86% |
+| Mean E2E | 963.326 ms | 938.292 ms | 2.60% |
+| Mean TTFT | 75.673 ms | 74.779 ms | 1.18% |
+
+This is a real normalized speed gain, but it is not yet the submission
+default.  Inverse-CDF preserves the categorical distribution but changes the
+seed-to-code mapping relative to `torch.multinomial`; the measured run
+generated 187.76 seconds of audio versus 159.44--162.24 seconds for the eager
+sampler runs.  The competition's Seed-TTS WER/SIM, Daily-Omni and Video-MME
+accuracy gate must therefore approve it before promotion.  The profile name
+keeps the risk explicit.
+
+```text
+vllm_omni/deploy/minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_sampler_graph_experimental.yaml
+/tmp/lunanexa-bench/resident-sampler-v22-official32/
+/tmp/lunanexa-bench/resident-sampler-v22-repeat-official32/
+/tmp/lunanexa-bench/resident-sampler-v22-metrics-official32/
+/tmp/vllm-omni-profiles/minicpmo45/a2-fia-bucket16-async-stage1/stage1_rank0/9af131f15bd4_1681277_20260828220213179_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

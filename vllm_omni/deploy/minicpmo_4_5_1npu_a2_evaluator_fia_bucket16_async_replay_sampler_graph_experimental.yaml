@@ -1,0 +1,14 @@
+# A2 single-chip score candidate combining bucket-stable FIA replay with the
+# fixed-shape Talker codec sampler graph.  The latter replaces the eager
+# head/filter/AICPU-multinomial chain with an inverse-CDF graph.  It preserves
+# the sampling distribution but not the generator seed-to-code mapping, so it
+# must pass the official accuracy gate before becoming a submission default.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH: "1"

@@ -714,13 +714,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         code = current.to(device=weight.device, dtype=torch.long).reshape(1)
         try:
-            torch.index_select(weight, 0, code, out=output_embeds)
+            torch.index_select(weight.detach(), 0, code, out=output_embeds)
         except (RuntimeError, TypeError):
             # Some torch_npu releases do not implement the ``out`` overload.
             # Disable the candidate for the process and let the runner redo
             # this token through canonical embedding + copy semantics.
             self.direct_decode_embed = False
-            logger.warning_once(
+            logger.warning(
                 "MiniCPM-o direct Talker decode embedding is unsupported; "
                 "falling back to canonical embedding copies",
                 exc_info=True,

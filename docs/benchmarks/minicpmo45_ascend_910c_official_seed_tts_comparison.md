@@ -7159,6 +7159,35 @@ validate request completion and PCM streaming.
 /tmp/minicpmo-a2-fusedscalar-ipccoalesce-server.log
 ```
 
+### Two-layer FIA event grouping rejection
+
+The earlier single-gate experiment showed that removing all twenty per-layer
+ExternalEvents loses valuable task-update/attention overlap.  A finer
+experiment kept all twenty FIA task updates but shared one gate per adjacent
+layer pair, reducing event waits/signals from twenty to ten while releasing
+compute after every two updates.  Unit tests and a cold smoke passed, but the
+same-signature 160.92-second/144-chunk official run regressed against the
+IPC-only result:
+
+| Metric, lower is better | Per-layer gates | Two-layer gates | Change |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF | **0.206408** | 0.208611 | +1.07% |
+| P99 chunk RTF | **0.327476** | 0.330033 | +0.78% |
+| Mean audio TTFP | **543.215 ms** | 551.661 ms | +1.56% |
+| Mean E2E | **1112.290 ms** | 1125.262 ms | +1.17% |
+| Benchmark duration | **35.609 s** | 36.024 s | +1.16% |
+| Stage-1 ITL | **6.6502 ms** | 6.7619 ms | +1.68% |
+
+Even one extra layer of release delay costs more than ten event operations on
+this graph.  The implementation and profile were removed, and the retained
+path continues to signal one event per FIA layer.
+
+```text
+/tmp/fusedscalar-ipccoalesce-eventgroup2-smoke-20260828/
+/tmp/fusedscalar-ipccoalesce-eventgroup2-official-perf-20260828/
+/tmp/minicpmo-a2-fusedscalar-ipccoalesce-eventgroup2-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

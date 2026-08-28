@@ -22,11 +22,73 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _bounded_top_k_top_p_candidates,
     _graphable_codec_sample,
     _max_audio_tokens,
+    _prepare_talker_dynamic_w8a8,
+    _quantize_talker_dynamic_w8a8_weight,
     _restore_weight_norm_weight,
 )
 from vllm_omni.utils.mm_outputs import to_payload_element
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_talker_dynamic_w8a8_weight_roundtrip_is_per_output_channel() -> None:
+    generator = torch.Generator().manual_seed(23)
+    weight = torch.randn(24, 32, generator=generator)
+
+    quantized, scale = _quantize_talker_dynamic_w8a8_weight(weight)
+    restored = quantized.transpose(0, 1).float() * scale[:, None]
+    channel_error = (restored - weight).abs().amax(dim=1)
+
+    assert quantized.shape == (32, 24)
+    assert quantized.dtype == torch.int8
+    assert quantized.is_contiguous()
+    assert scale.shape == (24,)
+    assert torch.all(channel_error <= scale * 0.501)
+
+
+class _FakeTalkerProjection(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(16, 8, dtype=torch.bfloat16))
+        self.quant_method = object()
+        self.custom_op = SimpleNamespace(update_attrs=lambda: None)
+
+
+def test_talker_dynamic_w8a8_selects_only_norm_produced_projections() -> None:
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    layer = model.layers[0]
+    layer.self_attn = nn.Module()
+    layer.self_attn.qkv_proj = _FakeTalkerProjection()
+    layer.self_attn.o_proj = _FakeTalkerProjection()
+    layer.mlp = nn.Module()
+    layer.mlp.gate_up_proj = _FakeTalkerProjection()
+    layer.mlp.down_proj = _FakeTalkerProjection()
+
+    converted, parameter_bytes = _prepare_talker_dynamic_w8a8(model)
+
+    assert converted == 2
+    assert parameter_bytes == 2 * (16 * 8 + 16 * 4)
+    assert layer.self_attn.qkv_proj.weight.dtype == torch.int8
+    assert layer.mlp.gate_up_proj.weight.dtype == torch.int8
+    assert layer.self_attn.o_proj.weight.dtype == torch.bfloat16
+    assert layer.mlp.down_proj.weight.dtype == torch.bfloat16
+
+
+def test_talker_dynamic_w8a8_can_target_only_gate_up() -> None:
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    layer = model.layers[0]
+    layer.self_attn = nn.Module()
+    layer.self_attn.qkv_proj = _FakeTalkerProjection()
+    layer.mlp = nn.Module()
+    layer.mlp.gate_up_proj = _FakeTalkerProjection()
+
+    converted, _ = _prepare_talker_dynamic_w8a8(model, "gate_up")
+
+    assert converted == 1
+    assert layer.self_attn.qkv_proj.weight.dtype == torch.bfloat16
+    assert layer.mlp.gate_up_proj.weight.dtype == torch.int8
 
 
 class _FakeNativeTalker(nn.Module):

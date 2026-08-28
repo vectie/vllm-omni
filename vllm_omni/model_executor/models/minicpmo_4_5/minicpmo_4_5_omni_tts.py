@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from transformers import LlamaConfig
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
@@ -54,6 +55,110 @@ _NPU_DEFERRED_CHUNK_EOS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"
 _DIRECT_STOP_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER"
 _CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES"
 _INITIAL_CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"
+_NPU_TALKER_DYNAMIC_W8A8_ENV = "VLLM_OMNI_MINICPMO45_NPU_TALKER_DYNAMIC_W8A8"
+_NPU_TALKER_DYNAMIC_W8A8_TARGETS_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_TALKER_DYNAMIC_W8A8_TARGETS"
+)
+
+
+def _quantize_talker_dynamic_w8a8_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an ``[out,in]`` Talker weight for Ascend Cube.
+
+    Dynamic W8A8 keeps one symmetric scale per output channel. The persistent
+    INT8 tensor is stored in the ``[in,out]`` orientation consumed by
+    ``npu_quant_matmul`` so neither eager decode nor the captured graph needs a
+    transpose at runtime.
+    """
+    if weight.ndim != 2:
+        raise ValueError(
+            f"Talker dynamic W8A8 requires a matrix, got shape={tuple(weight.shape)}"
+        )
+    source = weight.detach().to(dtype=torch.float32)
+    scale = source.abs().amax(dim=1).clamp_min(torch.finfo(torch.float32).tiny) / 127.0
+    quantized = torch.round(source / scale[:, None]).clamp_(-127, 127).to(torch.int8)
+    return quantized.transpose(0, 1).contiguous(), scale.contiguous()
+
+
+class _TalkerDynamicW8A8LinearMethod(QuantizeMethodBase):
+    """Graph-visible dynamic-W8A8 method for post-load Talker conversion."""
+
+    def create_weights(self, layer: nn.Module, *args, **kwargs) -> None:
+        del layer, args, kwargs
+        raise RuntimeError("Talker dynamic W8A8 is installed after weight loading")
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        # The converter already emits persistent [in,out] INT8 weights. In
+        # particular, do not run the unquantized method's NZ transform.
+        del layer
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output_shape = (*x.shape[:-1], layer.weight.shape[-1])
+        x_2d = x.reshape(-1, x.shape[-1])
+        quantized_x, pertoken_scale = torch.ops.npu.npu_dynamic_quant(x_2d)
+        output = torch.ops.npu.npu_quant_matmul(
+            quantized_x,
+            layer.weight,
+            layer.weight_scale,
+            pertoken_scale=pertoken_scale,
+            bias=bias,
+            output_dtype=x.dtype,
+        )
+        return output.reshape(output_shape)
+
+
+def _talker_dynamic_w8a8_suffixes(targets: str) -> tuple[str, ...]:
+    target_map = {
+        "qkv": "self_attn.qkv_proj",
+        "gate_up": "mlp.gate_up_proj",
+    }
+    requested = tuple(part.strip() for part in targets.split(",") if part.strip())
+    unknown = sorted(set(requested) - target_map.keys())
+    if not requested or unknown:
+        raise ValueError(
+            f"Invalid {_NPU_TALKER_DYNAMIC_W8A8_TARGETS_ENV}={targets!r}; "
+            "expected qkv, gate_up, or both"
+        )
+    return tuple(target_map[target] for target in requested)
+
+
+def _prepare_talker_dynamic_w8a8(
+    model: nn.Module,
+    targets: str = "qkv,gate_up",
+) -> tuple[int, int]:
+    """Convert only RMSNorm-produced QKV and gate/up Talker projections."""
+    converted = 0
+    parameter_bytes = 0
+    selected_suffixes = _talker_dynamic_w8a8_suffixes(targets)
+    for name, layer in model.named_modules():
+        if not name.endswith(selected_suffixes):
+            continue
+        weight = getattr(layer, "weight", None)
+        if not isinstance(weight, nn.Parameter) or weight.ndim != 2:
+            raise ValueError(f"Talker W8A8 target {name!r} has no matrix weight")
+        quantized, scale = _quantize_talker_dynamic_w8a8_weight(weight)
+        weight.requires_grad_(False)
+        weight.data = quantized
+        layer.register_parameter(
+            "weight_scale",
+            nn.Parameter(scale, requires_grad=False),
+        )
+        layer.quant_method = _TalkerDynamicW8A8LinearMethod()
+        custom_op = getattr(layer, "custom_op", None)
+        if custom_op is not None:
+            custom_op.update_attrs()
+        converted += 1
+        parameter_bytes += weight.numel() * weight.element_size()
+        parameter_bytes += scale.numel() * scale.element_size()
+    if converted == 0:
+        raise ValueError("Talker dynamic W8A8 found no eligible projections")
+    return converted, parameter_bytes
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
@@ -1514,6 +1619,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         for name in self.tts_model.load_weights(backbone_weights):
             loaded.add(f"tts_model.{name}")
+
+        if _env_enabled(_NPU_TALKER_DYNAMIC_W8A8_ENV, default=False):
+            converted, parameter_bytes = _prepare_talker_dynamic_w8a8(
+                self.tts_model,
+                os.environ.get(
+                    _NPU_TALKER_DYNAMIC_W8A8_TARGETS_ENV,
+                    "qkv,gate_up",
+                ),
+            )
+            logger.info(
+                "MiniCPM-o Talker selective dynamic W8A8 active: "
+                "%d projections, %.2f MiB persistent parameters",
+                converted,
+                parameter_bytes / (1024 * 1024),
+            )
 
         if head_g is None or head_v is None:
             raise ValueError("MiniCPM-o checkpoint is missing weight-norm Talker head parameters")

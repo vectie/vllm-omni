@@ -1,0 +1,19 @@
+# Atlas 800I A2 evaluator candidate: dynamically quantize only the Talker
+# QKV and gate/up projections fed directly by RMSNorm. Attention, row
+# projections, codec sampling, Stage 0 and Stage 2 retain their proven dtypes.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_TALKER_DYNAMIC_W8A8: "1"
+          VLLM_OMNI_MINICPMO45_NPU_TALKER_DYNAMIC_W8A8_TARGETS: gate_up
+        compilation_config:
+          pass_config:
+            fuse_norm_quant: true
+        additional_config:
+          ascend_compilation_config:
+            fuse_norm_quant: true

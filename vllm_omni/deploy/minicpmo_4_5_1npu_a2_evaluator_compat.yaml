@@ -35,6 +35,11 @@ platforms:
             fuse_norm_quant: false
             fuse_act_quant: false
       - stage_id: 1
+        env:
+          # Stage env dictionaries replace, rather than inherit, the server
+          # environment.  Repeat the A2 capability gate here so a clean
+          # Stage-1 AOT cache cannot trace the unavailable ACLNN operator.
+          VLLM_ASCEND_ENABLE_ADD_RMS_NORM_BIAS: "0"
         max_num_seqs: 1
         kv_cache_memory_bytes: 268435456  # 256 MiB
         additional_config:

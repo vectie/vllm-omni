@@ -85,7 +85,57 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._fused_codec_sampler_enabled = False
     talker._fused_codec_sampler_prepared = False
     talker._fused_codec_sampler_request_id = None
+    talker.direct_decode_embed = False
     return talker
+
+
+def test_direct_decode_embedding_writes_into_runner_slab() -> None:
+    talker = _make_talker()
+    talker.direct_decode_embed = True
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 4)])
+    info = {
+        "audio_state": {"finished": False},
+        "audio_codes": {"current": torch.tensor([3])},
+    }
+    output = torch.empty(1, 4)
+    output_ptr = output.data_ptr()
+
+    result = talker.preprocess_decode_into(
+        torch.tensor([0]),
+        output,
+        **info,
+    )
+
+    assert result is not None
+    returned_ids, updates = result
+    assert returned_ids.tolist() == [0]
+    assert updates == {}
+    assert output.data_ptr() == output_ptr
+    assert torch.equal(output, talker.emb_code[0](torch.tensor([3])))
+
+
+def test_direct_decode_embedding_preserves_canonical_fallbacks() -> None:
+    talker = _make_talker()
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 4)])
+    output = torch.full((1, 4), 7.0)
+
+    assert talker.preprocess_decode_into(
+        torch.tensor([0]),
+        output,
+        audio_state={"finished": False},
+        audio_codes={"current": torch.tensor([3])},
+    ) is None
+    assert torch.equal(output, torch.full((1, 4), 7.0))
+
+    talker.direct_decode_embed = True
+    result = talker.preprocess_decode_into(
+        torch.tensor([0]),
+        output,
+        audio_state={"finished": True},
+        audio_codes={"current": torch.empty(0, dtype=torch.long)},
+    )
+    assert result is not None
+    assert torch.count_nonzero(output).item() == 0
 
 
 def test_talker_static_w8a8_target_validation() -> None:

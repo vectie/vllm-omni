@@ -1,0 +1,11 @@
+# Single-chip A2 isolation profile for direct Talker decode embedding writes.
+# The codec embedding gather writes into the stable graph-input slice instead
+# of allocating a temporary tensor and copying it afterward. This remains an
+# opt-in A/B candidate until official-shape RTF, TTFP and output gates pass.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_experimental.yaml
+
+stages:
+  - stage_id: 1
+    env:
+      VLLM_OMNI_MINICPMO45_NPU_DIRECT_DECODE_EMBED: "1"

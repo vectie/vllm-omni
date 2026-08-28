@@ -121,10 +121,12 @@ def test_a2_evaluator_metacache_targets_only_talker():
     assert stage1.env["VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"] == "1"
     assert stage1.env["VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT"] == "1"
     assert stage1.env["VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE"] == "1"
+    assert stage1.env["VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING"] == "1"
     for name in (
         "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH",
         "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT",
         "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE",
+        "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING",
     ):
         assert name not in (stage0.env or {})
         assert name not in (stage2.env or {})

@@ -7000,6 +7000,42 @@ loaded the already cached identical WavLM checkpoint and completed the gate.
 /tmp/minicpmo-a2-fia-bucket16-slotfast-dirtybt-metacache-server.log
 ```
 
+### Fused batch-one Talker metadata
+
+The next retained step replaces the remaining batch-one decode scalar chain
+with one graph-visible Triton/Ascend program. After the single dynamic
+`num_computed_tokens` upload, the kernel writes position, sequence length, and
+the first KV group's slot mapping together; every additional non-Mamba KV
+group updates only its own slot slab. The implementation retains the exact
+integer arithmetic and stable graph input addresses. It is gated by
+`VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING=1` under the same batch-one,
+one-token, non-prefill, non-speculative, non-DCP, non-GDN and non-multiaxis-RoPE
+conditions as the resident metadata path.
+
+The first integration attempt exposed that MiniCPM-o uses
+`MultiGroupBlockTable`; the missing wrapper method killed Stage 1 before any
+scored request (0/32). That run was rejected, the wrapper was implemented to
+cover every KV group, and both six focused unit tests and a cold real request
+then passed before the official-shape run.
+
+| Metric, lower is better | Persistent metadata control | Fused metadata | Improvement |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF, 161.04 s / 145 chunks | 0.216280 | **0.208516** | **3.59%** |
+| P99 chunk RTF | 0.334312 | **0.331753** | **0.77%** |
+| Mean audio TTFP | 556.054 ms | **544.965 ms** | **1.99%** |
+| Mean E2E | 1158.536 ms | **1120.094 ms** | **3.32%** |
+| Stage-1 ITL | 7.0034 ms | **6.7004 ms** | **4.33%** |
+
+The quality run completed 32/32 requests with continuous streaming and zero
+request, PCM, ASR or embedding failures. WER remained 0.0170 and WavLM SIM
+remained 0.8259, exactly matching the previous accepted quality gate.
+
+```text
+/tmp/fusedscalar-multigroup-official-perf-20260828/
+/tmp/fusedscalar-multigroup-official-quality-20260828/
+/tmp/minicpmo-a2-fia-bucket16-slotfast-dirtybt-metacache-fusedscalar-multigroup-server.log
+```
+
 ### ENPU update-before-replay rejection
 
 The safe FIA configuration was also launched with vLLM-Ascend's internal

@@ -1223,6 +1223,7 @@ class TestDeployConfigLoading:
         assert deploy.stages[1].env == {
             "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT": "1",
             "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE": "1",
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING": "1",
             "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "1",
             "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "1",
             "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS": "1",
@@ -1251,6 +1252,7 @@ class TestDeployConfigLoading:
         deploy.stages[1].env = {
             "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT": "0",
             "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE": "0",
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING": "0",
             "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "0",
             "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "0",
         }
@@ -1285,6 +1287,9 @@ class TestDeployConfigLoading:
         ] == "0"
         assert deploy.stages[1].env[
             "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE"
+        ] == "0"
+        assert deploy.stages[1].env[
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING"
         ] == "0"
         assert deploy.stages[1].env[
             "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
@@ -1393,6 +1398,10 @@ class TestDeployConfigLoading:
         assert "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT" not in deploy.stages[1].env
         assert (
             "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE"
+            not in deploy.stages[1].env
+        )
+        assert (
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING"
             not in deploy.stages[1].env
         )
 

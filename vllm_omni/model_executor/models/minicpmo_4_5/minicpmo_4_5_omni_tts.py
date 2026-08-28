@@ -165,12 +165,25 @@ def _apply_repetition_penalty_from_frequencies(
     logits: torch.Tensor,
     frequencies: torch.Tensor,
     *,
-    penalty: float,
+    penalty: float | torch.Tensor,
 ) -> torch.Tensor:
     """Apply a precomputed frequency penalty without NPU host fallbacks."""
-    if penalty == 1.0:
-        return logits
-    alpha = torch.pow(torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype), frequencies)
+    if isinstance(penalty, torch.Tensor):
+        penalty_tensor = penalty
+        if penalty_tensor.device != logits.device or penalty_tensor.dtype != logits.dtype:
+            penalty_tensor = penalty_tensor.to(
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+    else:
+        if penalty == 1.0:
+            return logits
+        penalty_tensor = torch.as_tensor(
+            penalty,
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+    alpha = torch.pow(penalty_tensor, frequencies)
     return torch.where(logits < 0, logits * alpha, logits / alpha)
 
 
@@ -881,7 +894,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         logits = _apply_repetition_penalty_from_frequencies(
             logits,
             frequencies,
-            penalty=self._codec_repetition_penalty,
+            # This registered buffer follows the Talker onto the NPU. Reusing
+            # it avoids materializing the same Python scalar through a
+            # synchronous host-to-device ``as_tensor`` on every codec step.
+            penalty=self._fused_codec_penalty,
         )
         if mask_eos:
             logits[..., eos_id] = float("-inf")

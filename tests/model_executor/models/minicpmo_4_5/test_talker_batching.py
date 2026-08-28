@@ -396,6 +396,33 @@ def test_device_native_repetition_penalty_matches_bincount_reference() -> None:
     assert torch.equal(actual, expected)
 
 
+def test_resident_repetition_penalty_skips_scalar_materialization(monkeypatch) -> None:
+    logits = torch.tensor([[-2.0, -1.0, 0.5, 1.0]])
+    frequencies = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
+    penalty = torch.tensor([1.05])
+    expected = torch.where(
+        logits < 0,
+        logits * torch.pow(penalty, frequencies),
+        logits / torch.pow(penalty, frequencies),
+    )
+
+    monkeypatch.setattr(
+        torch,
+        "as_tensor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("resident penalty must not be rematerialized")
+        ),
+    )
+
+    actual = _apply_repetition_penalty_from_frequencies(
+        logits,
+        frequencies,
+        penalty=penalty,
+    )
+
+    assert torch.equal(actual, expected)
+
+
 def test_incremental_repetition_frequencies_match_sliding_window() -> None:
     talker = _make_talker()
     logits = torch.zeros(1, 8)

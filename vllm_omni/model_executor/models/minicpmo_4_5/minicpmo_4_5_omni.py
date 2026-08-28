@@ -307,28 +307,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return self.talker.preprocess(input_ids=input_ids, input_embeds=input_embeds, **kwargs)
         if self.model_stage != "llm":
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
-        return input_ids, embeds, {}
-
-    def preprocess_decode_into(
-        self,
-        input_ids: torch.Tensor,
-        output_embeds: torch.Tensor,
-        **kwargs,
-    ):
-        """Delegate the fixed-slab Talker decode embedding fast path."""
-        if self.model_stage != "tts":
-            return None
-        direct = getattr(self.talker, "preprocess_decode_into", None)
-        if not callable(direct):
-            return None
-        result = direct(
-            input_ids=input_ids,
-            output_embeds=output_embeds,
-            **kwargs,
-        )
-        if not getattr(self.talker, "direct_decode_embed", False):
-            self.supports_preprocess_decode_into = False
-        return result
+            return input_ids, embeds, {}
 
         duplex = kwargs.get("duplex")
         if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
@@ -477,6 +456,27 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         else:
             req_input_ids = torch.full_like(input_ids, helper._required_token_id("unit_token_id"))
         return req_input_ids, req_embeds, {"duplex": update_result}
+
+    def preprocess_decode_into(
+        self,
+        input_ids: torch.Tensor,
+        output_embeds: torch.Tensor,
+        **kwargs,
+    ):
+        """Delegate the fixed-slab Talker decode embedding fast path."""
+        if self.model_stage != "tts":
+            return None
+        direct = getattr(self.talker, "preprocess_decode_into", None)
+        if not callable(direct):
+            return None
+        result = direct(
+            input_ids=input_ids,
+            output_embeds=output_embeds,
+            **kwargs,
+        )
+        if not getattr(self.talker, "direct_decode_embed", False):
+            self.supports_preprocess_decode_into = False
+        return result
 
     def _duplex_data_plane_helper(self):
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)

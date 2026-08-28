@@ -60,6 +60,21 @@ def test_wrapper_always_delegates_talker_to_native_ar_path() -> None:
     assert model.talker.forward_kwargs["model_intermediate_buffer"][0]["request_id"] == "req"
 
 
+def test_wrapper_llm_preprocess_embeds_plain_requests(monkeypatch) -> None:
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.model_stage = "llm"
+    input_ids = torch.tensor([11, 12])
+    expected = torch.ones((2, 4))
+    monkeypatch.setattr(model, "get_input_embeddings", lambda _: expected)
+
+    returned_ids, embeds, updates = model.preprocess(input_ids)
+
+    assert returned_ids is input_ids
+    assert embeds is expected
+    assert updates == {}
+
+
 def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
     nn.Module.__init__(talker)

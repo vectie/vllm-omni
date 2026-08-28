@@ -21,8 +21,12 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _bounded_codec_distribution,
     _bounded_top_k_top_p_candidates,
     _graphable_codec_sample,
+    _load_talker_static_w8a8_scales,
     _max_audio_tokens,
+    _prepare_talker_static_w8a8_calibration,
+    _quantize_talker_static_w8a8_weight,
     _restore_weight_norm_weight,
+    _talker_static_w8a8_suffixes,
 )
 from vllm_omni.utils.mm_outputs import to_payload_element
 
@@ -74,6 +78,8 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._request_audio_states = {}
     talker._request_repetition_frequencies = {}
     talker._deferred_cleanup_ids = set()
+    talker._static_w8a8_calibration_path = None
+    talker._static_w8a8_collectors = {}
     talker._codec_vocab_ids = torch.arange(8)
     talker._codec_min_tokens = 50
     talker._codec_seed = 42
@@ -81,6 +87,56 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._fused_codec_sampler_prepared = False
     talker._fused_codec_sampler_request_id = None
     return talker
+
+
+def test_talker_static_w8a8_target_validation() -> None:
+    assert _talker_static_w8a8_suffixes("gate_up") == ("mlp.gate_up_proj",)
+    assert _talker_static_w8a8_suffixes("qkv,gate_up") == (
+        "self_attn.qkv_proj",
+        "mlp.gate_up_proj",
+    )
+    with pytest.raises(ValueError, match="expected qkv, gate_up"):
+        _talker_static_w8a8_suffixes("down")
+
+
+def test_talker_static_w8a8_weight_is_per_output_channel() -> None:
+    weight = torch.tensor([[1.0, -2.0, 0.5], [0.25, -0.5, 0.125]])
+
+    quantized, scale = _quantize_talker_static_w8a8_weight(weight)
+
+    assert quantized.dtype == torch.int8
+    assert quantized.shape == (3, 2)
+    assert torch.allclose(scale, torch.tensor([2.0 / 127.0, 0.5 / 127.0]))
+    restored = quantized.t().float() * scale[:, None]
+    assert torch.allclose(restored, weight, atol=float(scale.max()))
+
+
+def test_talker_static_w8a8_calibration_collects_projection_inputs(tmp_path) -> None:
+    class _Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.self_attn = nn.Module()
+            self.self_attn.qkv_proj = nn.Linear(3, 4, bias=False)
+            self.mlp = nn.Module()
+            self.mlp.gate_up_proj = nn.Linear(3, 6, bias=False)
+
+    model = nn.Module()
+    model.layers = nn.ModuleList([_Block()])
+    collectors = _prepare_talker_static_w8a8_calibration(model, "gate_up")
+    model.layers[0].mlp.gate_up_proj(torch.tensor([[1.0, -3.5, 2.0]]))
+
+    assert collectors.keys() == {"layers.0.mlp.gate_up_proj"}
+    assert collectors["layers.0.mlp.gate_up_proj"].item() == 3.5
+
+    calibration = tmp_path / "talker-scales.json"
+    talker = _make_talker()
+    talker._static_w8a8_calibration_path = str(calibration)
+    talker._static_w8a8_collectors = collectors
+    talker.on_requests_finished(["calibration-request"])
+
+    assert _load_talker_static_w8a8_scales(str(calibration)) == {
+        "layers.0.mlp.gate_up_proj": 3.5,
+    }
 
 
 def test_fused_codec_sampler_stages_fixed_request_state() -> None:

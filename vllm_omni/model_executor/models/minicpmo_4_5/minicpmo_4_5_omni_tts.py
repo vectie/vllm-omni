@@ -53,7 +53,6 @@ _NPU_FUSED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_SAMPLER"
 _NPU_BATCHED_CODEC_OUTPUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
 _NPU_DEFERRED_CHUNK_EOS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"
 _DIRECT_STOP_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER"
-_NPU_DIRECT_DECODE_EMBED_ENV = "VLLM_OMNI_MINICPMO45_NPU_DIRECT_DECODE_EMBED"
 _CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES"
 _INITIAL_CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"
 _NPU_TALKER_STATIC_W8A8_CALIBRATION_ENV = (
@@ -403,15 +402,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             _DIRECT_STOP_SAMPLER_ENV,
             default=False,
         )
-        # The ordinary runner path allocates one embedding result and then
-        # copies it into the fixed graph-input slab for every codec token.
-        # The single-token NPU path can instead make index_select write into
-        # that slab directly. Keep this opt-in until a whole-service A/B proves
-        # that the saved allocation/copy outweighs the eager gather launch.
-        self.direct_decode_embed = _env_enabled(
-            _NPU_DIRECT_DECODE_EMBED_ENV,
-            default=False,
-        )
         self.omni_pooler_payload_include_hidden = not self.batched_codec_output
         self._request_transport_codes: dict[str, list[torch.Tensor]] = {}
         self._request_transport_chunks: dict[str, int] = {}
@@ -683,50 +673,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         code = current.to(device=self.emb_code[0].weight.device, dtype=torch.long).reshape(1)
         embeds = self.emb_code[0](code)
         return input_ids, embeds, {}
-
-    def preprocess_decode_into(
-        self,
-        input_ids: torch.Tensor,
-        output_embeds: torch.Tensor,
-        **info_dict: Any,
-    ) -> tuple[torch.Tensor, dict[str, Any]] | None:
-        """Write one decode embedding directly into the runner input slab.
-
-        ``output_embeds`` is the stable-address slice consumed by the captured
-        one-token Talker graph.  ``torch.index_select(..., out=...)`` avoids
-        materializing a temporary embedding followed by a separate D2D copy.
-        Returning ``None`` keeps the runner on the canonical preprocess path
-        whenever the experimental switch or shape contract does not apply.
-        """
-        if not self.direct_decode_embed or output_embeds.shape[0] != 1:
-            return None
-
-        state = info_dict.get("audio_state")
-        current = (info_dict.get("audio_codes", {}) or {}).get("current")
-        weight = self.emb_code[0].weight
-        if not isinstance(current, torch.Tensor) or current.numel() != 1:
-            if isinstance(state, dict) and state.get("finished"):
-                output_embeds.zero_()
-                return input_ids, {}
-            raise RuntimeError(
-                "MiniCPM-o Talker decode is missing the previous request-local audio code"
-            )
-
-        code = current.to(device=weight.device, dtype=torch.long).reshape(1)
-        try:
-            torch.index_select(weight.detach(), 0, code, out=output_embeds)
-        except (RuntimeError, TypeError):
-            # Some torch_npu releases do not implement the ``out`` overload.
-            # Disable the candidate for the process and let the runner redo
-            # this token through canonical embedding + copy semantics.
-            self.direct_decode_embed = False
-            logger.warning(
-                "MiniCPM-o direct Talker decode embedding is unsupported; "
-                "falling back to canonical embedding copies",
-                exc_info=True,
-            )
-            return None
-        return input_ids, {}
 
     def _request_generator(self, request_id: str, device: torch.device) -> torch.Generator:
         generator = self._request_generators.get(request_id)

@@ -139,10 +139,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # tts_token_ids/tts_hidden_states handoff into its conditioning
         # embeddings and initializes request-local codec generation state.
         self.has_preprocess = self.model_stage in {"llm", "tts"}
-        self.supports_preprocess_decode_into = bool(
-            self.model_stage == "tts"
-            and getattr(self.talker, "direct_decode_embed", False)
-        )
 
     @cached_property
     def sampler(self):
@@ -456,27 +452,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         else:
             req_input_ids = torch.full_like(input_ids, helper._required_token_id("unit_token_id"))
         return req_input_ids, req_embeds, {"duplex": update_result}
-
-    def preprocess_decode_into(
-        self,
-        input_ids: torch.Tensor,
-        output_embeds: torch.Tensor,
-        **kwargs,
-    ):
-        """Delegate the fixed-slab Talker decode embedding fast path."""
-        if self.model_stage != "tts":
-            return None
-        direct = getattr(self.talker, "preprocess_decode_into", None)
-        if not callable(direct):
-            return None
-        result = direct(
-            input_ids=input_ids,
-            output_embeds=output_embeds,
-            **kwargs,
-        )
-        if not getattr(self.talker, "direct_decode_embed", False):
-            self.supports_preprocess_decode_into = False
-        return result
 
     def _duplex_data_plane_helper(self):
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)

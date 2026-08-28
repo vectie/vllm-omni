@@ -7395,6 +7395,43 @@ offline-quantized checkpoints, but it is inactive in serving.
 /tmp/minicpmo-a2-talker-static-w8a8-normquant-20260828-server.log
 ```
 
+### Talker direct decode-embedding rejection
+
+An opt-in runner path replaced each single-token Talker embedding temporary
+plus graph-input copy with `torch.index_select(..., out=stable_input_slice)`.
+The installed torch-npu 2.10 stack supported the BF16 `out=` operation and the
+candidate completed two hot four-request runs and the 32-request performance
+gate without fallback or streaming failure.
+
+The tiny smoke runs showed an unstable 2.6--6.0 ms TTFP reduction, but the
+official-shape run reversed it and regressed every normalized ranked metric:
+
+| Metric, lower is better | Retained BF16 | Direct embedding | Change |
+| --- | ---: | ---: | ---: |
+| Overall audio RTF | **0.221284** | 0.234876 | +6.14% |
+| Mean chunk RTF | **0.206408** | 0.218432 | +5.83% |
+| P99 chunk RTF | **0.329015** | 0.340267 | +3.42% |
+| Mean audio TTFP | **543.215 ms** | 559.205 ms | +2.94% |
+| Mean TTFT | **75.057 ms** | 80.533 ms | +7.30% |
+
+The candidate generated a different audio-length cluster (140.88 seconds / 125
+chunks versus 160.92 seconds / 144 chunks), so the shorter raw duration and E2E
+are not wins. RTF and per-chunk normalization independently reject the path.
+The runtime code and deploy profile were removed.
+
+The first real warmup also exposed a separate wrapper regression: insertion of
+the experimental method had split the existing Stage-0 `preprocess` body and
+left the ordinary LLM path returning an unbound `embeds`. The original control
+flow was restored and a plain-LLM preprocessing regression test was retained;
+that correctness fix is independent of the rejected optimization.
+
+```text
+/tmp/talker-direct-decode-embed-fixed-smoke-v2-20260828/
+/tmp/talker-direct-decode-embed-fixed-smoke-v3-20260828/
+/tmp/talker-direct-decode-embed-official-perf-20260828/
+/tmp/minicpmo-a2-direct-decode-embed-fixed-20260828-server.log
+```
+
 ```text
 /tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
 /tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/

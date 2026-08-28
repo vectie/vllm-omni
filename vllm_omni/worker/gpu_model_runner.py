@@ -1770,30 +1770,6 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 flush_decode_batch()
 
-                preprocess_decode_into = getattr(
-                    self.model,
-                    "preprocess_decode_into",
-                    None,
-                )
-                if (
-                    getattr(self.model, "supports_preprocess_decode_into", False)
-                    and callable(preprocess_decode_into)
-                    and span_len == 1
-                    and not is_prefill
-                    and inputs_embeds is not None
-                ):
-                    direct_result = preprocess_decode_into(
-                        input_ids=preprocess_input_ids[s:e],
-                        output_embeds=inputs_embeds[s:e],
-                        **req_infos,
-                    )
-                    if direct_result is not None:
-                        req_input_ids, update_dict = direct_result
-                        self._update_intermediate_buffer(req_id, update_dict)
-                        if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == span_len:
-                            preprocess_input_ids[s:e] = req_input_ids
-                        continue
-
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=preprocess_input_ids[s:e],

@@ -7064,6 +7064,37 @@ The isolation profile was removed and the source default remains unchanged.
 /tmp/minicpmo-a2-fia-bucket16-fusedscalar-nz-server.log
 ```
 
+### Graph-wide FIA gate rejection
+
+Bucket16 avoids task-parameter rebinding for fifteen out of every sixteen
+Talker decode tokens, but its captured graph still contains one
+`ExternalEvent` gate per FIA layer.  An opt-in lower-layer candidate replaced
+those twenty gates with one gate before the first FIA layer.  At a bucket
+transition the update stream first queued all twenty task updates and then
+released the graph; inside a bucket it updated the tail mask and recorded only
+the single gate.  This preserved exact attention math and the 161.04-second,
+145-chunk output signature, but lost useful layer-by-layer update/compute
+overlap:
+
+| Metric, lower is better | Per-layer gates | Single graph gate | Change |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF | **0.208516** | 0.212717 | +2.01% |
+| P99 chunk RTF | 0.331753 | **0.331458** | -0.09% |
+| Mean audio TTFP | **544.965 ms** | 554.493 ms | +1.75% |
+| Mean E2E | **1120.094 ms** | 1142.809 ms | +2.03% |
+| Stage-1 ITL | **6.7004 ms** | 6.8430 ms | +2.04% |
+
+The event calls are therefore not pure host overhead: their granularity lets
+the replay stream start earlier while later FIA tasks are being rebound.  The
+implementation and profile were fully removed; bucket16 retains per-layer
+external events.
+
+```text
+/tmp/fusedscalar-singlegate-smoke-20260828/
+/tmp/fusedscalar-singlegate-official-perf-20260828/
+/tmp/minicpmo-a2-fia-bucket16-fusedscalar-singlegate-server.log
+```
+
 ### ENPU update-before-replay rejection
 
 The safe FIA configuration was also launched with vLLM-Ascend's internal

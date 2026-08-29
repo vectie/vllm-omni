@@ -8261,3 +8261,37 @@ real first-packet Stage-2 shape rather than weaken sampler parity gates.
 /tmp/lunanexa-bench/codec-parity-v77-sync.jsonl
 /tmp/lunanexa-bench/codec-parity-v78-gate-off.jsonl
 ```
+
+### Rejected deeper Stage-1 async batch queue
+
+vLLM 0.26 normally permits two in-flight batches for single-chip async
+scheduling. An experimental, MiniCPM-o-only profile raised this limit to four
+before `EngineCore` construction so that the KV reservation and scheduler
+queue used the same depth. The A2 runtime confirmed the exact path was active
+(`Stage-1 async batch queue depth raised from 2 to 4`) and completed all eight
+requests without an OOM or deadlock.
+
+The fixed Chinese Seed-TTS screen nevertheless regressed against the adjacent
+safe run:
+
+| Metric | Safe run | Queue depth 4 | Change |
+| --- | ---: | ---: | ---: |
+| Total audio frames | 828,480 | 816,960 | -1.39% (not comparable) |
+| Benchmark duration | 5.9543 s | 6.1682 s | +3.59% |
+| Audio throughput | 5.7975x | 5.5186x | -4.81% |
+| Mean chunk RTF | 0.15665 | 0.16634 | +6.19% |
+| Mean TTFP | 432.15 ms | 443.82 ms | +2.70% |
+| Mean E2E | 743.76 ms | 770.52 ms | +3.60% |
+
+The shorter output makes the regression stronger, not weaker: the candidate
+performed less audio work while taking longer. MiniCPM-o's next codec state is
+model-worker dependent, so increasing the host batch queue cannot create a
+valid multi-token executable. It also moves stop/EOS observation relative to
+already queued work, explaining the changed output geometry. The code and
+profile were removed. Any future lookahead must advance the codec state and
+terminal mask inside one parity-proven device executable rather than enqueue
+dependent one-token calls speculatively.
+
+```text
+/tmp/lunanexa-bench/queue4-v79-zh8/
+```

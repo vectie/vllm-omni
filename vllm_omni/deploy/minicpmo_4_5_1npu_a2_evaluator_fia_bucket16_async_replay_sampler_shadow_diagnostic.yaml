@@ -1,0 +1,14 @@
+# Fail-fast diagnostic for the rejected inverse-CDF Talker sampler graph. Each
+# graph draw is compared in the same forward pass with both eager inverse-CDF
+# and the resident torch.multinomial path from an identical generator state.
+# Full device fences isolate sampler arithmetic from stream ordering. Never use
+# this profile for a performance claim or submission.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_sampler_graph_sync_diagnostic.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_SHADOW: "1"

@@ -50,6 +50,7 @@ _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 _NPU_BOUNDED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_BOUNDED_CODEC_SAMPLER"
 _NPU_CODEC_SAMPLER_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"
 _NPU_CODEC_SAMPLER_SYNC_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_SYNC"
+_NPU_CODEC_SAMPLER_SHADOW_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_SHADOW"
 _NPU_FUSED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_SAMPLER"
 _NPU_BATCHED_CODEC_OUTPUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
 _NPU_DEFERRED_CHUNK_EOS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"
@@ -867,23 +868,101 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 graph_entry["expired"].copy_(
                     history.reshape(-1)[-_REPETITION_WINDOW].reshape(1, 1)
                 )
+            generator = self._request_generator(request_id, hidden_state.device)
+            sampler_shadow = _env_enabled(
+                _NPU_CODEC_SAMPLER_SHADOW_ENV,
+                default=False,
+            )
+            shadow_generator = None
+            runtime_canary = not graph_entry["runtime_validated"]
+            if sampler_shadow or runtime_canary:
+                # Preserve the exact pre-draw request RNG state. The shadow
+                # generator can then execute the resident multinomial without
+                # advancing the real request generator a second time. The
+                # first real replay always runs this check: capture-time probes
+                # alone cannot detect every nested FULL_DECODE graph failure.
+                shadow_generator = torch.Generator(device=hidden_state.device)
+                shadow_generator.set_state(generator.get_state())
             graph_entry["uniform"].uniform_(
                 0.0,
                 1.0,
-                generator=self._request_generator(request_id, hidden_state.device),
+                generator=generator,
             )
+            shadow_sample = None
+            inverse_sample = None
+            if shadow_generator is not None:
+                shadow_probabilities, shadow_ids = _bounded_codec_distribution(
+                    hidden_state,
+                    frequencies,
+                    self.head_code[0].weight,
+                    self._fused_codec_penalty,
+                    temperature=self._codec_temperature,
+                    top_k=self._codec_top_k,
+                    top_p=self._codec_top_p,
+                    eos_id=eos_id,
+                    mask_eos=mask_eos,
+                )
+                shadow_position = torch.multinomial(
+                    shadow_probabilities,
+                    num_samples=1,
+                    generator=shadow_generator,
+                )
+                shadow_sample = shadow_ids.gather(-1, shadow_position)
+                inverse_position = torch.sum(
+                    shadow_probabilities.cumsum(dim=-1) < graph_entry["uniform"],
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_max_(shadow_probabilities.shape[-1] - 1)
+                inverse_sample = shadow_ids.gather(-1, inverse_position)
+            sampler_sync = _env_enabled(
+                _NPU_CODEC_SAMPLER_SYNC_ENV,
+                default=False,
+            )
+            if sampler_sync:
+                # Diagnostic only: a post-replay fence cannot establish that
+                # the graph observed the input copies above. Fence both sides
+                # to distinguish a graph-input handoff race from an incorrect
+                # sampler implementation. A promotable implementation must
+                # replace these device-wide fences with stream events.
+                torch.npu.synchronize()
             graph_entry["graph"].replay()
+            if sampler_sync:
+                # The graph-owned outputs are consumed on the caller stream.
+                # Fence before copying them: synchronizing after the copies
+                # only waits for both streams and cannot prevent a copy from
+                # observing the previous replay's output.
+                torch.npu.synchronize()
             graph_sampled, next_frequencies = graph_entry["outputs"]
             sampled = graph_entry["sampled"]
             sampled.copy_(graph_sampled)
+            if shadow_sample is not None and inverse_sample is not None:
+                graph_code = int(sampled.item())
+                inverse_code = int(inverse_sample.item())
+                multinomial_code = int(shadow_sample.item())
+                if graph_code != inverse_code or graph_code != multinomial_code:
+                    logger.warning(
+                        "MiniCPM-o codec sampler runtime canary failed; "
+                        "disabling NPUGraph and returning the native sample: "
+                        f"request={request_id}, step={step}, "
+                        f"uniform={float(graph_entry['uniform'].item()):.9f}, "
+                        f"graph={graph_code}, inverse_cdf={inverse_code}, "
+                        f"multinomial={multinomial_code}",
+                    )
+                    self._npu_codec_sampler_graph_disabled = True
+                    self._npu_codec_sampler_graphs = {}
+                    native_sample = shadow_sample.reshape(())
+                    self._advance_repetition_frequencies(
+                        request_id,
+                        history,
+                        native_sample,
+                        frequencies,
+                    )
+                    return native_sample
+            # Commit graph-owned rolling state only after the first-runtime
+            # parity gate passes. On fallback ``frequencies`` must still be
+            # the pre-draw request state so the native sample advances the
+            # repetition window exactly once.
             frequencies.copy_(next_frequencies)
-            if _env_enabled(_NPU_CODEC_SAMPLER_SYNC_ENV, default=False):
-                # Diagnostic only: establish whether the sampler graph's
-                # request-owned sample/frequency state crosses execution
-                # streams without a completion dependency.  A successful
-                # accuracy screen must replace this device-wide fence with a
-                # narrow event handoff before performance promotion.
-                torch.npu.synchronize()
             if not graph_entry["runtime_validated"]:
                 valid_sample = bool(
                     ((sampled >= 0) & (sampled < self._num_audio_tokens)).all().item()
@@ -1054,6 +1133,42 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 for actual, expected in zip(outputs, eager_outputs)
             ):
                 raise RuntimeError("captured codec sample did not match eager execution")
+
+            # Matching capture-time values is not enough. Some combinations
+            # of an outer FULL_DECODE graph and a lazily captured continuation
+            # can replay successfully while retaining a capture-time scalar.
+            # That failure is especially dangerous here: every tensor remains
+            # finite and in range, but the request follows a different codec
+            # trajectory. Change the fixed-address RNG input after capture and
+            # require replay to observe it before enabling the graph.
+            static_uniform.fill_(0.916076303)
+            with torch.inference_mode():
+                probe_expected = tuple(
+                    value.clone()
+                    for value in _graphable_codec_sample(
+                        static_hidden,
+                        static_frequencies,
+                        weight,
+                        penalty,
+                        static_uniform,
+                        static_mask_eos,
+                        static_expired,
+                        vocab_ids,
+                        temperature=self._codec_temperature,
+                        top_k=self._codec_top_k,
+                        top_p=self._codec_top_p,
+                        eos_id=self._num_audio_tokens - 1,
+                    )
+                )
+            graph.replay()
+            torch.npu.synchronize()
+            if not all(
+                torch.equal(actual, expected)
+                for actual, expected in zip(outputs, probe_expected)
+            ):
+                raise RuntimeError(
+                    "captured codec sample ignored a fixed-address runtime input update"
+                )
             entry = {
                 "graph": graph,
                 "hidden": static_hidden,

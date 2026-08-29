@@ -82,6 +82,7 @@ def test_zh_asr_initialization_disables_network_update_checks(monkeypatch) -> No
         SimpleNamespace(AutoModel=fake_auto_model),
     )
     monkeypatch.setenv("SEED_TTS_EVAL_DEVICE", "cpu")
+    monkeypatch.delenv("SEED_TTS_PARAFORMER_MODEL", raising=False)
     monkeypatch.setattr(seed_tts_eval, "_zh_paraformer", None)
     monkeypatch.setattr(seed_tts_eval, "_device", None)
 
@@ -91,6 +92,36 @@ def test_zh_asr_initialization_disables_network_update_checks(monkeypatch) -> No
     assert calls == [
         {
             "model": seed_tts_eval.PARAFORMER_MODEL_ID,
+            "device": "cpu",
+            "disable_update": True,
+        }
+    ]
+
+
+def test_zh_asr_accepts_offline_paraformer_path(monkeypatch, tmp_path) -> None:
+    calls: list[dict[str, object]] = []
+    model = object()
+
+    def fake_auto_model(**kwargs):
+        calls.append(kwargs)
+        return model
+
+    monkeypatch.setitem(
+        sys.modules,
+        "funasr",
+        SimpleNamespace(AutoModel=fake_auto_model),
+    )
+    monkeypatch.setenv("SEED_TTS_EVAL_DEVICE", "cpu")
+    monkeypatch.setenv("SEED_TTS_PARAFORMER_MODEL", str(tmp_path))
+    monkeypatch.setattr(seed_tts_eval, "_zh_paraformer", None)
+    monkeypatch.setattr(seed_tts_eval, "_device", None)
+
+    seed_tts_eval._ensure_zh_asr()
+
+    assert seed_tts_eval._zh_paraformer is model
+    assert calls == [
+        {
+            "model": str(tmp_path),
             "device": "cpu",
             "disable_update": True,
         }

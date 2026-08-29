@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 # Mirrors seed-tts-eval/run_wer.py
 OFFICIAL_WHISPER_HF_ID = "openai/whisper-large-v3"
 PARAFORMER_MODEL_ID = "paraformer-zh"
+PARAFORMER_MODEL_ENV = "SEED_TTS_PARAFORMER_MODEL"
 
 _lock = threading.Lock()
 _device: str | None = None
@@ -454,28 +455,29 @@ def _ensure_zh_asr() -> None:
         from funasr import AutoModel
 
         _device = _get_eval_device()
+        model_id = os.environ.get(PARAFORMER_MODEL_ENV, "").strip() or PARAFORMER_MODEL_ID
         logger.warning(
             "Loading Seed-TTS eval Paraformer %r on %s (one-time, seed-tts-eval protocol)...",
-            PARAFORMER_MODEL_ID,
+            model_id,
             _device,
         )
         try:
             _zh_paraformer = AutoModel(
-                model=PARAFORMER_MODEL_ID,
+                model=model_id,
                 device=_device,
                 disable_update=True,
             )
         except TypeError:
             try:
                 _zh_paraformer = AutoModel(
-                    model=PARAFORMER_MODEL_ID,
+                    model=model_id,
                     disable_update=True,
                 )
             except TypeError:
                 # Compatibility with older FunASR releases that predate both
                 # ``device`` and ``disable_update``. Official evaluation
                 # images ship a newer version and stay fully offline here.
-                _zh_paraformer = AutoModel(model=PARAFORMER_MODEL_ID)
+                _zh_paraformer = AutoModel(model=model_id)
 
 
 def _transcribe_en_f32_16k(wav_f32: np.ndarray) -> str:

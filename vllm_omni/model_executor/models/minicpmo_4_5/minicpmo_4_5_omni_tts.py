@@ -56,6 +56,7 @@ _NPU_FUSED_CODEC_DISTRIBUTION_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_DISTRIBUTION"
 )
 _NPU_FIXED_CODEC_RING_ENV = "VLLM_OMNI_MINICPMO45_NPU_FIXED_CODEC_RING"
+_NPU_GRAPH_CODEC_STATE_ENV = "VLLM_OMNI_MINICPMO45_NPU_GRAPH_CODEC_STATE"
 _NPU_BATCHED_CODEC_OUTPUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
 _NPU_DEFERRED_CHUNK_EOS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"
 _DIRECT_STOP_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER"
@@ -379,6 +380,37 @@ def _graphable_codec_distribution(
     return torch.softmax(candidate_logits, dim=-1), candidate_ids
 
 
+def _graphable_advance_codec_state(
+    frequencies: torch.Tensor,
+    history_slab: torch.Tensor,
+    pending_sample: torch.Tensor,
+    vocab_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the previous native draw inside the next Talker graph replay.
+
+    ``history_slab`` is a left-padded fixed FIFO. A negative pending value is
+    the first-step sentinel and leaves both tensors unchanged. This keeps the
+    native multinomial boundary while moving the full-vocabulary frequency
+    update and growing-history replacement into the outer FULL_DECODE graph.
+    """
+    pending = pending_sample.reshape(1, 1)
+    expired = history_slab[:1].reshape(1, 1)
+    valid_pending = pending >= 0
+    valid_expired = expired >= 0
+    add = (vocab_ids.reshape(1, -1) == pending).to(frequencies.dtype)
+    subtract = (vocab_ids.reshape(1, -1) == expired).to(frequencies.dtype)
+    next_frequencies = frequencies + add * valid_pending.to(frequencies.dtype)
+    next_frequencies = next_frequencies - subtract * valid_expired.to(
+        frequencies.dtype
+    )
+    shifted = torch.cat(
+        [history_slab[1:], pending_sample.reshape(1)],
+        dim=0,
+    )
+    next_history = torch.where(valid_pending.reshape(()), shifted, history_slab)
+    return next_frequencies, next_history
+
+
 def _env_enabled(name: str, *, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -459,6 +491,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             _NPU_FIXED_CODEC_RING_ENV,
             default=False,
         )
+        self._graph_codec_state_enabled = _env_enabled(
+            _NPU_GRAPH_CODEC_STATE_ENV,
+            default=False,
+        )
+        if self._graph_codec_state_enabled and not self._fused_codec_distribution_enabled:
+            raise ValueError(
+                f"{_NPU_GRAPH_CODEC_STATE_ENV} requires "
+                f"{_NPU_FUSED_CODEC_DISTRIBUTION_ENV}"
+            )
+        if self._graph_codec_state_enabled and self._fixed_codec_ring_enabled:
+            raise ValueError(
+                f"{_NPU_GRAPH_CODEC_STATE_ENV} and "
+                f"{_NPU_FIXED_CODEC_RING_ENV} are mutually exclusive"
+            )
+        self._graph_codec_state_request_id: str | None = None
         self._fused_codec_sampler_prepared = False
         self._fused_codec_sampler_request_id: str | None = None
         # Code2Wav consumes codec chunks, not Talker's per-token hidden row.
@@ -562,6 +609,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self.register_buffer(
                 "_fused_codec_candidate_ids",
                 torch.zeros((1, candidate_width), dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_history_slab",
+                torch.full(
+                    (_REPETITION_WINDOW,),
+                    -1,
+                    dtype=torch.long,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_pending_sample",
+                torch.full((1,), -1, dtype=torch.long),
                 persistent=False,
             )
 
@@ -840,6 +901,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return fallback
         return slab[: int(entry.get("length", 0))]
 
+    def _graph_codec_history(self, fallback: torch.Tensor) -> torch.Tensor:
+        if not getattr(self, "_graph_codec_state_enabled", False):
+            return fallback
+        slab = self._fused_codec_history_slab
+        return slab[slab >= 0]
+
     def _codec_ring_expired(
         self,
         request_id: str,
@@ -987,30 +1054,38 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 dtype=torch.long,
             ).reshape(-1)
 
-        frequencies = self._repetition_frequencies(
-            request_id,
-            codes,
-            self._fused_codec_frequencies,
-        )
-        if frequencies.data_ptr() != self._fused_codec_frequencies.data_ptr():
-            self._fused_codec_frequencies.copy_(frequencies)
+        graph_state_enabled = getattr(self, "_graph_codec_state_enabled", False)
+        if graph_state_enabled:
+            if self._graph_codec_state_request_id != request_id:
+                self._fused_codec_frequencies.zero_()
+                self._fused_codec_history_slab.fill_(-1)
+                self._fused_codec_pending_sample.fill_(-1)
+                self._graph_codec_state_request_id = request_id
+            frequencies = self._fused_codec_frequencies
+        else:
+            frequencies = self._repetition_frequencies(
+                request_id,
+                codes,
+                self._fused_codec_frequencies,
+            )
+            if frequencies.data_ptr() != self._fused_codec_frequencies.data_ptr():
+                self._fused_codec_frequencies.copy_(frequencies)
         # Keep request state bound to the stable graph input address.
         self._request_repetition_frequencies[request_id] = self._fused_codec_frequencies
         step = int(state.get("step", 0))
         min_tokens = int(state.get("min_tokens", self._codec_min_tokens))
         self._fused_codec_mask_eos.fill_(step < min_tokens)
         self._fused_codec_expired.fill_(-1)
-        expired = self._codec_ring_expired(
-            request_id,
-            codes,
-            self._fused_codec_expired.device,
-        )
-        if expired is None and codes.numel() >= _REPETITION_WINDOW:
-            expired = codes[-_REPETITION_WINDOW]
-        if expired is not None:
-            self._fused_codec_expired.copy_(
-                expired.reshape(1, 1)
+        if not graph_state_enabled:
+            expired = self._codec_ring_expired(
+                request_id,
+                codes,
+                self._fused_codec_expired.device,
             )
+            if expired is None and codes.numel() >= _REPETITION_WINDOW:
+                expired = codes[-_REPETITION_WINDOW]
+            if expired is not None:
+                self._fused_codec_expired.copy_(expired.reshape(1, 1))
         if getattr(self, "_fused_codec_sampler_enabled", False):
             self._fused_codec_uniform.uniform_(
                 0.0,
@@ -1157,7 +1232,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 )
                 self._advance_repetition_frequencies(
                     request_id,
-                    history,
+                    self._graph_codec_history(history),
                     eager_sample,
                     self._fused_codec_frequencies,
                 )
@@ -1179,12 +1254,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
             sampled = candidate_ids.gather(-1, sampled_position).reshape(())
 
-        self._advance_repetition_frequencies(
-            request_id,
-            history,
-            sampled,
-            self._fused_codec_frequencies,
-        )
+        if getattr(self, "_graph_codec_state_enabled", False):
+            # The next outer replay consumes this fixed-address scalar and
+            # advances both the frequency vector and FIFO inside the graph.
+            self._fused_codec_pending_sample.copy_(sampled.reshape(1))
+            self._request_repetition_frequencies[request_id] = (
+                self._fused_codec_frequencies
+            )
+        else:
+            self._advance_repetition_frequencies(
+                request_id,
+                history,
+                sampled,
+                self._fused_codec_frequencies,
+            )
         return sampled
 
     def _sample_audio_code(
@@ -1853,7 +1936,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # Deferred EOS may feed a few terminal-tail samples speculatively;
             # the transport boundary trims all of them from observable output.
             if (defer_eos or not is_eos) and not reached_limit:
-                if getattr(self, "_fixed_codec_ring_enabled", False):
+                if getattr(self, "_graph_codec_state_enabled", False):
+                    if getattr(self, "_fused_codec_distribution_disabled", False):
+                        graph_history = self._graph_codec_history(codes)
+                        codes = torch.cat(
+                            [
+                                graph_history[-(_REPETITION_WINDOW - 1) :],
+                                sampled.reshape(1),
+                            ]
+                        )
+                    else:
+                        # The graph-owned FIFO carries repetition history. The
+                        # request envelope needs only the last code to build
+                        # the next token embedding.
+                        codes = sampled.reshape(1)
+                elif getattr(self, "_fixed_codec_ring_enabled", False):
                     codes = self._codec_ring_history(request_id, codes)
                 else:
                     codes = torch.cat(
@@ -1998,6 +2095,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             request_audio_states.pop(request_id, None)
             self._request_repetition_frequencies.pop(request_id, None)
             self._request_codec_rings.pop(request_id, None)
+            if self._graph_codec_state_request_id == request_id:
+                self._graph_codec_state_request_id = None
             transport_codes.pop(request_id, None)
             transport_chunks.pop(request_id, None)
         self._deferred_cleanup_ids.clear()
@@ -2071,6 +2170,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             and not getattr(self, "_fused_codec_distribution_disabled", False)
             and hidden_states.shape[0] == 1
         ):
+            if getattr(self, "_graph_codec_state_enabled", False):
+                next_frequencies, next_history = _graphable_advance_codec_state(
+                    self._fused_codec_frequencies,
+                    self._fused_codec_history_slab,
+                    self._fused_codec_pending_sample,
+                    self._codec_vocab_ids,
+                )
+                self._fused_codec_frequencies.copy_(next_frequencies)
+                self._fused_codec_history_slab.copy_(next_history)
             probabilities, candidate_ids = _graphable_codec_distribution(
                 hidden_states[-1:],
                 self._fused_codec_frequencies,

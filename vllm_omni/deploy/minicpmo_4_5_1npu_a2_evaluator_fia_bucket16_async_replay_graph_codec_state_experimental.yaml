@@ -1,0 +1,14 @@
+# A2 score candidate that keeps native torch.multinomial outside the Talker
+# graph but defers its rolling repetition-state update into the next outer
+# FULL_DECODE replay. The graph advances one fixed 16-code FIFO and the
+# 6,562-wide frequency vector before building the next distribution; the hot
+# path crosses the graph boundary with only one sampled-code scalar.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_fused_distribution_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_GRAPH_CODEC_STATE: "1"

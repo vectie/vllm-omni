@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _apply_top_k_top_p,
     _bounded_codec_distribution,
     _bounded_top_k_top_p_candidates,
+    _graphable_advance_codec_state,
     _graphable_codec_distribution,
     _graphable_codec_sample,
     _load_talker_static_w8a8_scales,
@@ -104,6 +105,8 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._fused_codec_distribution_disabled = False
     talker._fused_codec_distribution_validated_steps = set()
     talker._fixed_codec_ring_enabled = False
+    talker._graph_codec_state_enabled = False
+    talker._graph_codec_state_request_id = None
     talker._fused_codec_sampler_prepared = False
     talker._fused_codec_sampler_request_id = None
     return talker
@@ -620,6 +623,43 @@ def test_fixed_codec_ring_initializes_from_legacy_history() -> None:
     expected_history = torch.cat([history[-15:], torch.tensor([3])])
     expected = torch.bincount(expected_history, minlength=8).to(logits.dtype).reshape(1, -1)
     assert torch.equal(talker._request_repetition_frequencies["req-restore"], expected)
+
+
+def test_graphable_codec_state_matches_sliding_window_counts() -> None:
+    frequencies = torch.zeros(1, 8)
+    history = torch.full((16,), -1, dtype=torch.long)
+    pending = torch.full((1,), -1, dtype=torch.long)
+    vocab_ids = torch.arange(8)
+    reference: list[int] = []
+
+    for value in [0, 1, 1, 2, 3, 5, 7, 6, 4, 4, 3, 2, 1, 0, 7, 6, 5, 4, 3, 2] * 3:
+        frequencies, history = _graphable_advance_codec_state(
+            frequencies,
+            history,
+            pending,
+            vocab_ids,
+        )
+        expected = torch.bincount(
+            torch.tensor(reference[-16:], dtype=torch.long),
+            minlength=8,
+        ).to(frequencies.dtype).reshape(1, -1)
+        assert torch.equal(frequencies, expected)
+        assert history[history >= 0].tolist() == reference[-16:]
+        pending.fill_(value)
+        reference.append(value)
+
+    frequencies, history = _graphable_advance_codec_state(
+        frequencies,
+        history,
+        pending,
+        vocab_ids,
+    )
+    expected = torch.bincount(
+        torch.tensor(reference[-16:], dtype=torch.long),
+        minlength=8,
+    ).to(frequencies.dtype).reshape(1, -1)
+    assert torch.equal(frequencies, expected)
+    assert history.tolist() == reference[-16:]
 
 
 def test_bounded_codec_candidates_match_full_warper_distribution() -> None:

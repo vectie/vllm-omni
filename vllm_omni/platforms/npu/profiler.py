@@ -16,6 +16,37 @@ from vllm_omni.profiler.omni_torch_profiler import (
 
 logger = init_logger(__name__)
 
+_AIC_METRICS_ENV = "VLLM_OMNI_NPU_PROFILER_AIC_METRICS"
+_L2_CACHE_ENV = "VLLM_OMNI_NPU_PROFILER_L2_CACHE"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_aic_metrics(torch_npu):
+    """Resolve an AiCMetrics enum without pinning Omni to one torch-npu API.
+
+    torch-npu releases have added metrics over time. Keep the default cheap,
+    but let 910C profiling runs request e.g. ``PipeUtilization`` without a
+    source edit. Invalid names fail early instead of silently collecting an
+    operator trace with no AI Core counters.
+    """
+    metrics = torch_npu.profiler.AiCMetrics
+    requested = os.environ.get(_AIC_METRICS_ENV, "AiCoreNone").strip()
+    candidate = getattr(metrics, requested, None)
+    if candidate is not None:
+        return candidate
+    names = sorted(name for name in dir(metrics) if not name.startswith("_"))
+    folded = {name.casefold(): name for name in names}
+    canonical = folded.get(requested.casefold())
+    if canonical is not None:
+        return getattr(metrics, canonical)
+    raise ValueError(f"Unknown {_AIC_METRICS_ENV}={requested!r}; supported values: {', '.join(names)}")
+
 
 class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
     """NPU-specific profiler using torch_npu.profiler.
@@ -49,12 +80,19 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
                 npu_activities.append(torch_npu.profiler.ProfilerActivity.NPU)
 
         # NPU-specific experimental config for detailed profiling
+        aic_metrics = _resolve_aic_metrics(torch_npu)
+        l2_cache = _env_flag(_L2_CACHE_ENV)
+        logger.info(
+            "NPU profiler AI Core metrics=%s l2_cache=%s",
+            os.environ.get(_AIC_METRICS_ENV, "AiCoreNone"),
+            l2_cache,
+        )
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             msprof_tx=False,
-            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-            l2_cache=False,
+            aic_metrics=aic_metrics,
+            l2_cache=l2_cache,
             op_attr=False,
             data_simplification=True,
             record_op_args=False,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import nullcontext
 from typing import Any
 
@@ -123,7 +124,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = True,
     ) -> str:
+        # NPU has no TRTLLM backend; accepted for signature parity, ignored.
         from importlib.util import find_spec
 
         if selected_backend is not None:
@@ -172,6 +175,34 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def synchronize(cls) -> None:
         torch.npu.synchronize()
+
+    @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        """Record a NPU event on the default stream to mark tensor readiness.
+
+        On NPU/Ascend with HCCL, distributed communication may use internal
+        streams not visible to the default stream. Synchronize the default
+        stream first so that HCCL results are written back before we record
+        the event, ensuring d2h_stream.wait_event() captures the complete
+        output data.
+        """
+        try:
+            # TP/HCCL deployments retain the conservative synchronization by
+            # default. TP1 streaming deployments can opt into event chaining
+            # after validating that no hidden communication stream produced
+            # the tensor, avoiding a host-blocking synchronization per chunk.
+            sync_before_event = os.environ.get(
+                "VLLM_OMNI_NPU_SYNC_BEFORE_DEVICE_EVENT",
+                "1",
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if sync_before_event:
+                torch.npu.current_stream().synchronize()
+            event = torch.npu.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record NPU event for cross-stream sync")
+            return None
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:

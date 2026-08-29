@@ -58,6 +58,9 @@ class Ids(TypedDict, total=False):
 
 
 class OmniPayloadMeta(TypedDict, total=False):
+    lifecycle_event: str
+    lifecycle_generation: int
+    prompt_fingerprint: str
     finished: torch.Tensor
     is_segment_finished: torch.Tensor
     stream_finished: torch.Tensor
@@ -156,6 +159,9 @@ class IdsStruct(_StructBase):
 
 
 class MetaStruct(_StructBase):
+    lifecycle_event: str | None = None
+    lifecycle_generation: int | None = None
+    prompt_fingerprint: str | None = None
     finished: torch.Tensor | None = None
     is_segment_finished: torch.Tensor | None = None
     stream_finished: torch.Tensor | None = None

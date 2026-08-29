@@ -11,6 +11,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import json
+import os
 import queue
 import threading
 import time
@@ -30,7 +31,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
-from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
@@ -69,7 +70,6 @@ from vllm_omni.engine.stage_runtime import (
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
-    is_new_format_deploy_config,
     load_and_resolve_stage_configs,
     parse_stage_overrides,
 )
@@ -152,7 +152,7 @@ class AsyncOmniEngine:
         transfer_emitter: Any = None,
         log_stats: bool = False,
         tokenizer: str | None = None,
-        trust_remote_code: bool = False,
+        trust_remote_code: bool | None = None,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -214,9 +214,15 @@ class AsyncOmniEngine:
         # beforehand. The stage CLI exposes the same deploy YAML through
         # stage_configs_path.
         deploy_config_path = kwargs.get("deploy_config") or kwargs.get("stage_configs_path")
+        # ``trust_remote_code`` is tri-state (bool | None): ``None`` means "not
+        # specified" so stage-config resolution can defer to the deploy yaml's
+        # per-stage value (see ``with_trust_remote_code_override``). The
+        # restriction path below loads the top-level HF config via vLLM's
+        # ``get_config``, which needs a real bool, so collapse ``None`` to the
+        # default ``False`` here (#5495).
         pipeline_config = StageConfigFactory.get_pipeline_config(
             model=model,
-            trust_remote_code=trust_remote_code,
+            trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
         )
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
@@ -230,8 +236,34 @@ class AsyncOmniEngine:
         self.duplex_session_config = DuplexSessionRuntimeConfig()
         if deploy_config_path is not None:
             self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
+        if self.duplex_session_config.background_aging_s is not None:
+            # Stage workers inherit the launch environment. The scheduler is
+            # deliberately model-neutral, so pass the typed pipeline setting
+            # through one private Omni environment variable.
+            os.environ["VLLM_OMNI_DUPLEX_BACKGROUND_AGING_S"] = str(
+                self.duplex_session_config.background_aging_s
+            )
+        else:
+            os.environ.pop("VLLM_OMNI_DUPLEX_BACKGROUND_AGING_S", None)
+        if (
+            self.duplex_session_config.foreground_preemption
+            and self.duplex_session_config.foreground_priority is not None
+        ):
+            os.environ["VLLM_OMNI_DUPLEX_FOREGROUND_PREEMPTION_PRIORITY"] = str(
+                self.duplex_session_config.foreground_priority
+            )
+        else:
+            os.environ.pop("VLLM_OMNI_DUPLEX_FOREGROUND_PREEMPTION_PRIORITY", None)
+        if self.duplex_session_config.cache_control_embeddings:
+            os.environ["VLLM_OMNI_MINICPMO45_CACHE_CONTROL_EMBEDDINGS"] = "1"
+        else:
+            os.environ.pop("VLLM_OMNI_MINICPMO45_CACHE_CONTROL_EMBEDDINGS", None)
 
-        kwargs["trust_remote_code"] = trust_remote_code
+        # Tri-state: None means "not specified" — the deploy yaml's per-stage
+        # trust_remote_code stays in effect. An explicit True/False here is a
+        # global override (precedence: caller > deploy yaml > default False);
+        # the merge rule lives in with_trust_remote_code_override.
+        kwargs = with_trust_remote_code_override(kwargs, trust_remote_code)
         self.config_path, self.stage_configs = self._resolve_stage_configs(
             model,
             kwargs,
@@ -328,6 +360,7 @@ class AsyncOmniEngine:
             omni_heartbeat_timeout=self._omni_heartbeat_timeout,
             omni_lb_policy=self._omni_lb_policy,
             request_queue=self.request_queue,
+            log_stats=self._log_stats,
         )
         self._runtime.initialize()
 
@@ -462,6 +495,13 @@ class AsyncOmniEngine:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                logger.warning(
+                    "[AsyncOmniEngine] Orchestrator startup timed out after %ss. "
+                    "Multi-stage deployments that initialize stages sequentially on one device "
+                    "or load checkpoints from slow storage may need larger --init-timeout and "
+                    "--stage-init-timeout values.",
+                    startup_timeout,
+                )
                 self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
                 raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s")
             try:
@@ -787,6 +827,9 @@ class AsyncOmniEngine:
                 supported_tasks=self.supported_tasks,
             )
             request.external_req_id = cid
+            # Companions are stage-0-final for ordinary downstream payloads,
+            # but diffusion still needs their CFG KV caches.
+            request = apply_omni_final_stage_metadata(request, 0, force_kv_transfer=True)
 
             # Registration of this companion on stage-0's output processor is
             # deferred to Orchestrator._handle_add_companion, which routes
@@ -945,6 +988,7 @@ class AsyncOmniEngine:
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
             vae_parallel_mode = normalized_kwargs.get("vae_parallel_mode") or "tile"
+            text_encoder_tp_size = normalized_kwargs.get("text_encoder_tp_size") or 1
             enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
@@ -965,6 +1009,7 @@ class AsyncOmniEngine:
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 vae_parallel_mode=vae_parallel_mode,
+                text_encoder_tp_size=text_encoder_tp_size,
                 use_hsdp=use_hsdp,
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
@@ -1000,6 +1045,8 @@ class AsyncOmniEngine:
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
+            "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
+            "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"
@@ -1143,7 +1190,7 @@ class AsyncOmniEngine:
         model: str,
         kwargs: dict[str, Any],
         *,
-        trust_remote_code: bool,
+        trust_remote_code: bool | None,
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
@@ -1158,12 +1205,7 @@ class AsyncOmniEngine:
                 "Ignoring it and resolving stages from stage_configs_path/model factory."
             )
 
-        # Legacy ``stage_args`` YAMLs own per-stage EngineArgs completely, so
-        # strip parent CLI fields. New-format deploy YAMLs (also accepted via
-        # ``--stage-configs-path``) merge CLI overrides the same way as
-        # ``--deploy-config`` — do not strip, or flags like
-        # ``interleave_mm_strings`` / ``media_io_kwargs`` are silently dropped.
-        if stage_configs_path is not None and not is_new_format_deploy_config(stage_configs_path):
+        if stage_configs_path is not None:
             base_kwargs = self._strip_single_engine_args(kwargs)
         else:
             base_kwargs = kwargs
@@ -1187,7 +1229,8 @@ class AsyncOmniEngine:
         # rather than as a per-stage config field.
         self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
 
-        # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
+        # Inject pipeline-wide runtime knobs and diffusion-only LoRA knobs from
+        # kwargs when the stage config does not already provide them.
         for cfg in stage_configs:
             try:
                 if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
@@ -1196,15 +1239,13 @@ class AsyncOmniEngine:
                 if global_sleep_mode is not None:
                     if not hasattr(cfg.engine_args, "enable_sleep_mode") or cfg.engine_args.enable_sleep_mode is None:
                         cfg.engine_args.enable_sleep_mode = global_sleep_mode
-                if getattr(cfg, "stage_type", None) != "diffusion":
-                    continue
-                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
-                    cfg.engine_args = OmegaConf.create({})
                 additional_config = kwargs.get("additional_config")
                 if additional_config is not None:
                     current_additional_config = getattr(cfg.engine_args, "additional_config", None)
                     if current_additional_config in (None, {}):
                         cfg.engine_args.additional_config = additional_config
+                if getattr(cfg, "stage_type", None) != "diffusion":
+                    continue
                 if kwargs.get("lora_path") is not None:
                     if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
                         cfg.engine_args.lora_path = kwargs["lora_path"]

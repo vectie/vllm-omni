@@ -22,9 +22,10 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -33,9 +34,7 @@ from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncGPUModelRunnerOutput,
-    IntermediateTensors,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
@@ -46,7 +45,6 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     get_stage_connector_role,
     stage_sends_async_output,
 )
-from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -291,7 +289,7 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
-class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
+class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     """Autoregressive GPU model runner that returns hidden states per request.
 
     Follows the v0.12 two-phase execute/sample flow from GPUModelRunner, and
@@ -323,23 +321,46 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             "Qwen3TTSTalkerForConditionalGeneration",
             "Qwen3TTSCode2Wav",
             "CosyVoice3Model",
+            "NemotronDenseForCausalLM",
+            "NemotronHForCausalLM",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
         }
-        if (
-            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
-            or get_stage_connector_role(self.model_config) is not None
-        ):
+        # The stage-level ``model_arch`` override may be blank so the class
+        # resolves from the checkpoint's own ``architectures`` (e.g. the Audex
+        # TTA/TTS thinker stages, which bind dense on the 2B and NemotronH on
+        # the 30B-A3B). Gate on the RESOLVED architectures, not only the raw
+        # override — otherwise a blank-override producer stage never creates
+        # its worker connector and the sync full-payload flush silently never
+        # runs (downstream stage starves on connector input).
+        stage_archs = set(getattr(self.model_config, "architectures", None) or ())
+        model_arch_override = getattr(self.model_config, "model_arch", None)
+        if model_arch_override:
+            stage_archs.add(model_arch_override)
+        if stage_archs & _OMNI_CONNECTOR_INIT_ARCHS or get_stage_connector_role(self.model_config) is not None:
             self.init_omni_connectors(
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
-        self._init_duplex_sampling_state()
+        self._duplex_sampling_hook = None
+        self._duplex_sampling_hook_resolved = False
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+
+    def _resolve_duplex_sampling_hook(self, *, force: bool = False):
+        if not force and getattr(self, "_duplex_sampling_hook_resolved", False):
+            return self._duplex_sampling_hook
+        candidate = getattr(getattr(self, "model", None), "prepare_duplex_sampling", None)
+        self._duplex_sampling_hook = candidate if callable(candidate) else None
+        self._duplex_sampling_hook_resolved = True
+        if self._duplex_sampling_hook is not None and not hasattr(self, "_duplex_sampling_helper"):
+            from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingHelper
+
+            self._duplex_sampling_helper = DuplexSamplingHelper()
+        return self._duplex_sampling_hook
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -409,7 +430,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
-        self._update_duplex_sampling_states(scheduler_output)
+        if self._resolve_duplex_sampling_hook() is None:
+            return deferred_state_corrections_fn
+        helper = getattr(self, "_duplex_sampling_helper", None)
+        if helper is not None:
+            helper.update_states(self, scheduler_output)
         return deferred_state_corrections_fn
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
@@ -537,7 +562,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._downstream_payload_cache.clear()
         if hasattr(self, "model_intermediate_buffer"):
             self.model_intermediate_buffer.clear()
-        self._clear_duplex_sampling()
+        duplex_helper = getattr(self, "_duplex_sampling_helper", None)
+        if duplex_helper is not None:
+            duplex_helper.clear()
 
         # 5. Release all CUDA graphs unconditionally (upstream only does this
         #    on ROCm; on CUDA the graphs are only freed by Python GC during
@@ -780,12 +807,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     hidden_states=hidden_states,
                     hidden_states_cpu=hidden_states_cpu,
                     num_scheduled_tokens=num_scheduled_tokens,
+                    include_computed_prefix=True,
                 )
             combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
                 query_start_loc=self.query_start_loc.cpu,
                 input_batch=self.input_batch,
                 multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_scheduled_tokens=num_scheduled_tokens,
+                include_computed_prefix=self._model_needs_full_prefix_hidden_states(),
             )
         return combined_hidden_states, combined_multimodal_outputs
 
@@ -1450,7 +1479,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
                 prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
-                self._apply_duplex_sampling(logits, prepared_sampling_metadata)
+                prepare_duplex_sampling = self._resolve_duplex_sampling_hook()
+                if prepare_duplex_sampling is not None:
+                    helper = getattr(self, "_duplex_sampling_helper", None)
+                    rows = helper.rows(self) if helper is not None and helper.active_request_ids else ()
+                    if rows or (helper is not None and helper.hook_active):
+                        prepare_duplex_sampling(logits, prepared_sampling_metadata, rows)
+                    if helper is not None:
+                        helper.hook_active = bool(rows)
                 sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
                     return sampler_output

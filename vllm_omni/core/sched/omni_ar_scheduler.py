@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
-from time import time
+from collections.abc import Iterable
+from time import monotonic, time
 from typing import Any
 
+import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import create_request_queue
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
@@ -33,6 +36,60 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
+
+_MINICPMO45_TALKER_IPC_COALESCE_ENV = "VLLM_OMNI_MINICPMO45_TALKER_IPC_COALESCE"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class SampledLogprobContractError(RuntimeError):
+    """The model runner returned unusable sampled-token logprobs."""
+
+
+def _slice_sampled_logprobs(logprobs: Any, req_index: int, sampled_token_ids: list[int]) -> Any:
+    """Slice and validate the sampled-token logprobs for one AR request."""
+    if logprobs is None:
+        raise SampledLogprobContractError("AR logprobs were requested, but the model runner returned none")
+
+    sliced = logprobs.slice_request(req_index, len(sampled_token_ids))
+    token_rows = np.asarray(sliced.logprob_token_ids)
+    value_rows = np.asarray(sliced.logprobs)
+    expected_rows = len(sampled_token_ids)
+
+    if token_rows.ndim != 2 or value_rows.ndim != 2:
+        raise SampledLogprobContractError(
+            "AR sampled-token logprobs must be rank-2 arrays, "
+            f"got token_ids={token_rows.shape} logprobs={value_rows.shape}"
+        )
+    if token_rows.shape[0] != expected_rows or value_rows.shape[0] != expected_rows:
+        raise SampledLogprobContractError(
+            "AR sampled-token logprob row count does not match generated tokens: "
+            f"tokens={expected_rows} token_id_rows={token_rows.shape[0]} "
+            f"logprob_rows={value_rows.shape[0]}"
+        )
+    if expected_rows == 0:
+        return sliced
+    if token_rows.shape[1] == 0 or value_rows.shape[1] == 0:
+        raise SampledLogprobContractError("AR sampled-token logprob rows are empty")
+
+    sampled = np.asarray(sampled_token_ids)
+    if not np.array_equal(token_rows[:, 0], sampled):
+        mismatch = np.flatnonzero(token_rows[:, 0] != sampled)
+        first = int(mismatch[0])
+        raise SampledLogprobContractError(
+            "AR sampled-token logprobs are misaligned: "
+            f"row={first} generated_token={int(sampled[first])} "
+            f"logprob_token={int(token_rows[first, 0])}"
+        )
+    if not np.isfinite(value_rows[:, 0]).all():
+        bad_rows = np.flatnonzero(~np.isfinite(value_rows[:, 0])).tolist()
+        raise SampledLogprobContractError(f"AR sampled-token logprobs contain non-finite values at rows {bad_rows}")
+    return sliced
 
 
 class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
@@ -80,6 +137,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        self._talker_ipc_coalesce = (
+            _env_flag(_MINICPMO45_TALKER_IPC_COALESCE_ENV)
+            and getattr(model_config, "stage_id", None) == 1
+            and str(getattr(model_config, "engine_output_type", "")).lower()
+            == "audio"
+        )
+        self._talker_ipc_pending_token_ids: dict[str, list[int]] = {}
+
+    def _coalesce_talker_ipc_tokens(
+        self,
+        request_id: str,
+        new_token_ids: list[int],
+        *,
+        publish: bool,
+    ) -> list[int]:
+        """Keep token-only Talker updates inside the scheduler process.
+
+        MiniCPM-o's NPU Talker already emits sparse codec payloads only at the
+        first/steady chunk boundaries.  Sending the otherwise empty engine
+        output after every codec token still pays msgpack, ZMQ and frontend
+        processing costs.  Accumulate those token ids locally and attach them
+        to the next real payload or terminal output.  Sampling and request
+        state advance normally on every step; this only coalesces transport.
+        """
+        pending = self._talker_ipc_pending_token_ids
+        if new_token_ids:
+            pending.setdefault(request_id, []).extend(new_token_ids)
+        if not publish:
+            return []
+        return pending.pop(request_id, [])
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -100,7 +187,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return None
 
     def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
-        """True when orchestrator will not run stage 1+ for this request (e.g. text-only).
+        """True when this stage-zero-final request does not need downstream KV.
 
         The result is cached per request to avoid repeated deserialization of
         additional_information on every scheduler tick.
@@ -115,13 +202,161 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             result = False
         else:
             info = deserialize_additional_information(payload)
-            result = info.get("omni_final_stage_id") == 0
+            result = info.get("omni_final_stage_id") == 0 and not bool(info.get("omni_force_kv_transfer", False))
 
         self._omits_kv_transfer_cache[rid] = result
         return result
 
     def _should_defer_waiting_admission(self) -> bool:
         return False
+
+    @staticmethod
+    def _remove_queued_request(queue: Any, request: Request) -> None:
+        """Remove from either a vLLM RequestQueue or a plain running list."""
+        remove_request = getattr(queue, "remove_request", None)
+        if remove_request is not None:
+            remove_request(request)
+        else:
+            queue.remove(request)
+
+    def _promote_aged_background_requests(self) -> None:
+        """Bound background starvation when duplex foreground priority is on.
+
+        vLLM's priority queue orders smaller values first. Established duplex
+        requests use a negative configured priority; ordinary work remains at
+        zero unless the caller supplied another value. Once non-foreground
+        work exceeds the configured wait bound, promote the oldest aged cohort
+        ahead of the current foreground floor and rebuild the heap.
+        """
+        raw = os.environ.get("VLLM_OMNI_DUPLEX_BACKGROUND_AGING_S")
+        if raw in (None, "") or not self.waiting:
+            return
+        promoted = getattr(self, "_omni_aged_background", None)
+        if promoted is not None and any(waiting is promoted[0] for waiting in self.waiting):
+            return
+        try:
+            aging_s = float(raw)
+        except ValueError:
+            logger.warning("Invalid VLLM_OMNI_DUPLEX_BACKGROUND_AGING_S=%r; disabling aging", raw)
+            return
+        if aging_s <= 0:
+            return
+
+        now = time()
+        waiting = list(self.waiting)
+        aged = [
+            request
+            for request in waiting
+            if request.priority >= 0 and now - float(request.arrival_time) >= aging_s
+        ]
+        if not aged:
+            return
+        # Only one background request receives the temporary boost. It keeps
+        # that boost until admitted, then returns to its caller-supplied
+        # priority. This guarantees progress without turning an old offline
+        # queue into a new foreground class.
+        aged_request = min(aged, key=lambda request: (request.arrival_time, request.request_id))
+        current_floor = min(
+            (request.priority for request in (*waiting, *self.running)),
+            default=0,
+        )
+        aged_priority = current_floor - 1
+        self._omni_aged_background = (aged_request, aged_request.priority)
+        aged_request.priority = aged_priority
+        rebuilt = create_request_queue(self.policy)
+        for request in waiting:
+            rebuilt.add_request(request)
+        self.waiting = rebuilt
+        logger.debug(
+            "Promoted aged background request %s to priority %d after %.3fs",
+            aged_request.request_id,
+            aged_priority,
+            aging_s,
+        )
+
+    def _restore_admitted_background_priority(self) -> None:
+        promoted = getattr(self, "_omni_aged_background", None)
+        if promoted is None:
+            return
+        request, original_priority = promoted
+        if any(waiting is request for waiting in self.waiting):
+            return
+        request.priority = original_priority
+        self._omni_aged_background = None
+
+    def _preempt_background_for_foreground(self) -> Request | None:
+        """Free one occupied slot for latency-critical duplex work.
+
+        Priority queues only affect admission order. If all request slots are
+        already occupied, a newly arrived foreground append otherwise waits
+        for a running background decode to finish. On the synchronous AR
+        scheduler, the start of ``schedule`` is a safe token boundary: the
+        prior runner output has been consumed and no work for this step has
+        been submitted yet. Reuse vLLM's own preemption primitive here so KV,
+        encoder-cache, metrics, and recompute-on-resume bookkeeping stay in
+        one implementation.
+        """
+        raw = os.environ.get("VLLM_OMNI_DUPLEX_FOREGROUND_PREEMPTION_PRIORITY")
+        if raw in (None, "") or not self.waiting or not self.running:
+            return None
+        if self.policy != SchedulingPolicy.PRIORITY:
+            return None
+        try:
+            foreground_priority = int(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid VLLM_OMNI_DUPLEX_FOREGROUND_PREEMPTION_PRIORITY=%r; disabling preemption",
+                raw,
+            )
+            return None
+
+        occupied = len(self.running) + int(getattr(self, "num_waiting_for_streaming_input", 0))
+        if occupied < self.max_num_running_reqs:
+            return None
+
+        aged = getattr(self, "_omni_aged_background", None)
+        aged_request = aged[0] if aged is not None else None
+        if aged_request is not None and any(request is aged_request for request in self.waiting):
+            # The starvation bound deliberately puts this one background
+            # request ahead of foreground admission. Do not evict another
+            # background request merely to fill the reclaimed slot with the
+            # already-aged request.
+            return None
+        foreground = [
+            request
+            for request in self.waiting
+            if request.priority <= foreground_priority and not request.is_finished()
+        ]
+        if not foreground:
+            return None
+        admitted = min(
+            foreground,
+            key=lambda request: (request.priority, request.arrival_time, request.request_id),
+        )
+
+        victims = [
+            request
+            for request in self.running
+            if request.priority > admitted.priority
+            and request.status == RequestStatus.RUNNING
+            and not request.is_finished()
+        ]
+        if not victims:
+            return None
+        victim = max(
+            victims,
+            key=lambda request: (request.priority, request.arrival_time, request.request_id),
+        )
+        self.running.remove(victim)
+        self._preempt_request(victim, monotonic())
+        logger.info(
+            "Preempted background request %s (priority=%d) for duplex foreground %s (priority=%d)",
+            victim.request_id,
+            victim.priority,
+            admitted.request_id,
+            admitted.priority,
+        )
+        return victim
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -204,9 +439,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         for queue in (self.waiting, self.running):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
-                    queue.remove(req)
+                    self._remove_queued_request(queue, req)
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
+        self._promote_aged_background_requests()
+        self._preempt_background_for_foreground()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
@@ -220,6 +457,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            self._restore_admitted_background_priority()
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
                 if deferred_waiting:
@@ -341,10 +579,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
+            request = self.requests.get(req_id)
+            if request is not None:
+                # vLLM 0.26: settle the in-flight tokens counted in schedule().
+                # Must happen before the skips below — failed-KV-load and
+                # already-finished requests were incremented too, and the two
+                # readers (allocate_slots, _connector_finished) clamp with
+                # max(0, computed - in_flight), so a leaked counter silently
+                # freezes sliding-window block freeing.
+                request.num_in_flight_tokens -= num_tokens_scheduled
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # Skip requests that were recovered from KV load failure
                 continue
-            request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
@@ -353,6 +599,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+            status_before_stop = request.status
+            new_logprobs = None
+            logprob_validation_failed = False
+
+            # Validate before mutating request token state. A bad runner output
+            # is request-local: terminate only this request and keep processing
+            # the rest of the batch.
+            if (
+                generated_token_ids
+                and request.sampling_params is not None
+                and request.sampling_params.num_logprobs is not None
+            ):
+                try:
+                    new_logprobs = _slice_sampled_logprobs(logprobs, req_index, generated_token_ids)
+                except SampledLogprobContractError as exc:
+                    logger.error("Invalid AR sampled-token logprobs for request %s: %s", req_id, exc)
+                    request.status = RequestStatus.FINISHED_ERROR
+                    request.stop_reason = str(exc)
+                    request.resumable = False
+                    generated_token_ids = []
+                    logprob_validation_failed = True
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             if scheduled_spec_token_ids and generated_token_ids:
@@ -382,22 +649,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
-            stopped = False
+            stopped = logprob_validation_failed
             is_segment_finished = False
             finished = False
-            new_logprobs = None
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
             kv_transfer_params = None
-            status_before_stop = request.status
             finish_reason = None
             routed_experts = None
 
             # Check for stop and update request status.
             if new_token_ids:
+                num_sampled_tokens = len(new_token_ids)
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
+                    # A mid-step stop (e.g. spec-decode tokens sampled past
+                    # EOS) trims new_token_ids after the validation slice
+                    # above; re-slice so the emitted logprob rows stay 1:1
+                    # with the emitted tokens, as upstream vLLM does by
+                    # slicing after the trim.
+                    new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -451,7 +724,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
-                    kv_transfer_params = self._free_request(request)
+                    kv_transfer_params, _ = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
@@ -462,15 +735,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 else:
                     stopped_preempted_reqs.add(request)
 
-            # Extract sample logprobs if needed.
-            if request.sampling_params is not None and request.sampling_params.num_logprobs is not None and logprobs:
-                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
-
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            if getattr(self, "_talker_ipc_coalesce", False) and new_logprobs is None:
+                new_token_ids = self._coalesce_talker_ipc_tokens(
+                    req_id,
+                    new_token_ids,
+                    publish=(
+                        mm_output is not None
+                        or pooler_output is not None
+                        or kv_transfer_params is not None
+                        or stopped
+                    ),
+                )
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
@@ -642,7 +922,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return engine_core_outputs
 
-    def finish_requests(self, request_ids: Any, finished_status: RequestStatus) -> list[tuple[str, int]]:
+    def finish_requests(self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus) -> list[Request]:
         """Handles the finish signal from outside the scheduler.
 
         For example, the API server can abort a request when the client
@@ -651,8 +931,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         If request_ids is None, all requests will be finished.
 
         Returns:
-            Tuple of (req_id, client_index) for requests that were aborted. Will not
-            include any that were already finished.
+            The Request objects that were aborted. Will not include any that
+            were already finished.
         """
         # TODO(yrr): chunk transfer adapter & input_coordinator unified to one
         if self.chunk_transfer_adapter:
@@ -688,8 +968,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is not None:
-            for request_id, _ in finished:
-                self._free_input_coordinator_request(request_id)
+            for request in finished:
+                self._free_input_coordinator_request(request.request_id)
         return finished
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
@@ -748,12 +1028,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
 
-    def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
+        getattr(self, "_talker_ipc_pending_token_ids", {}).pop(request.request_id, None)
 
         # [Upstream compat] Discard request from in-flight prefills set added
         # upstream for routed-experts in-flight reservation tracking.
@@ -787,10 +1070,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         logger.debug(f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting.")
                         self.waiting_for_transfer_free.add(request_id)
                         kv_xfer_params = None
-                        return kv_xfer_params
+                        return kv_xfer_params, None
                     elif request_id in self.waiting_for_transfer_free:
                         # Blocks held until KV extraction completes in a future step.
-                        return None
+                        return None, None
                     else:
                         logger.debug(
                             f"[Omni] Request {request_id} finished and transfer no longer ACTIVE (extracted/acked). "
@@ -827,16 +1110,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         if isinstance(add_info, dict):
                             add_info.update(kv_xfer_params)
 
-                    return kv_xfer_params
+                    return kv_xfer_params, None
 
             # 3. Standard Freeing
             delay_free_blocks |= connector_delay_free_blocks
             if not delay_free_blocks:
                 self._free_blocks(request)
 
-            return kv_xfer_params
+            return kv_xfer_params, None
         finally:
             self._free_input_coordinator_request(request_id)
+            # Normal completion runs through here, not finish_requests()
+            # (the abort path) -- see vllm-project/vllm-omni#5349.
+            if self.chunk_transfer_adapter is not None:
+                self.chunk_transfer_adapter.cleanup_receiver(request_id)
 
     def _mark_request_for_kv_transfer(self, req_id: str, seq_len: int) -> None:
         """Mark a request as needing KV cache transfer when it finishes."""

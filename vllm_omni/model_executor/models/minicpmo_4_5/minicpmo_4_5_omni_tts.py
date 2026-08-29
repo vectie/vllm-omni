@@ -11,6 +11,9 @@ Pipeline:
   4. Continuously generate request-aligned discrete audio-code deltas
 """
 
+import hashlib
+import json
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -23,6 +26,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
@@ -44,6 +48,92 @@ _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
+_NPU_BOUNDED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_BOUNDED_CODEC_SAMPLER"
+_NPU_CODEC_SAMPLER_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"
+_NPU_CODEC_SAMPLER_SYNC_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_SYNC"
+_NPU_CODEC_SAMPLER_SHADOW_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_SHADOW"
+_NPU_FUSED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_SAMPLER"
+_NPU_FUSED_CODEC_DISTRIBUTION_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_DISTRIBUTION"
+)
+_NPU_FIXED_CODEC_RING_ENV = "VLLM_OMNI_MINICPMO45_NPU_FIXED_CODEC_RING"
+_NPU_GRAPH_CODEC_STATE_ENV = "VLLM_OMNI_MINICPMO45_NPU_GRAPH_CODEC_STATE"
+_NPU_BATCHED_CODEC_OUTPUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
+_NPU_DEFERRED_CHUNK_EOS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"
+_DIRECT_STOP_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER"
+_CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES"
+_INITIAL_CODEC_CHUNK_FRAMES_ENV = "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES"
+_NPU_TALKER_STATIC_W8A8_CALIBRATION_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_TALKER_STATIC_W8A8_CALIBRATION"
+)
+_NPU_TALKER_STATIC_W8A8_TARGETS_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_TALKER_STATIC_W8A8_TARGETS"
+)
+_CODEC_PARITY_TRACE_ENV = "VLLM_OMNI_MINICPMO45_CODEC_PARITY_TRACE"
+_CODEC_PARITY_SYNC_ENV = "VLLM_OMNI_MINICPMO45_CODEC_PARITY_SYNC"
+
+
+def _talker_static_w8a8_suffixes(targets: str) -> tuple[str, ...]:
+    target_map = {
+        "qkv": "self_attn.qkv_proj",
+        "gate_up": "mlp.gate_up_proj",
+    }
+    requested = tuple(part.strip() for part in targets.split(",") if part.strip())
+    unknown = sorted(set(requested) - target_map.keys())
+    if not requested or unknown:
+        raise ValueError(
+            f"Invalid {_NPU_TALKER_STATIC_W8A8_TARGETS_ENV}={targets!r}; "
+            "expected qkv, gate_up, or both"
+        )
+    return tuple(target_map[target] for target in requested)
+
+
+def _prepare_talker_static_w8a8_calibration(
+    model: nn.Module,
+    targets: str,
+) -> dict[str, torch.Tensor]:
+    """Attach graph-captured max collectors to selected projection inputs."""
+    collectors: dict[str, torch.Tensor] = {}
+    selected_suffixes = _talker_static_w8a8_suffixes(targets)
+    for name, layer in model.named_modules():
+        if not name.endswith(selected_suffixes):
+            continue
+        weight = getattr(layer, "weight", None)
+        if not isinstance(weight, nn.Parameter) or weight.ndim != 2:
+            raise ValueError(f"Talker W8A8 calibration target {name!r} has no matrix weight")
+        absmax = torch.zeros((), device=weight.device, dtype=torch.float32)
+        collectors[name] = absmax
+
+        def collect_input_absmax(
+            module: nn.Module,
+            inputs: tuple[Any, ...],
+            *,
+            destination: torch.Tensor = absmax,
+        ) -> None:
+            del module
+            if inputs and isinstance(inputs[0], torch.Tensor):
+                observed = inputs[0].detach().to(dtype=torch.float32).abs().amax()
+                destination.copy_(torch.maximum(destination, observed))
+
+        layer.register_forward_pre_hook(collect_input_absmax)
+    if not collectors:
+        raise ValueError("Talker static W8A8 calibration found no eligible projections")
+    return collectors
+
+
+def _load_talker_static_w8a8_scales(path: str) -> dict[str, float]:
+    with open(path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    targets = payload.get("targets") if isinstance(payload, dict) else None
+    if not isinstance(targets, dict) or not targets:
+        raise ValueError(f"Talker static W8A8 calibration {path!r} has no targets")
+    scales: dict[str, float] = {}
+    for name, value in targets.items():
+        value = float(value)
+        if value <= 0.0:
+            raise ValueError(f"Talker static W8A8 calibration for {name!r} is not positive")
+        scales[str(name)] = value
+    return scales
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
@@ -76,8 +166,34 @@ def _apply_repetition_penalty(
     if penalty == 1.0 or history.numel() == 0:
         return logits
     recent = history.reshape(-1)[-window_size:].to(device=logits.device, dtype=torch.long)
-    frequencies = torch.bincount(recent, minlength=logits.shape[-1]).to(dtype=logits.dtype)
-    alpha = torch.pow(torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype), frequencies)
+    vocab_ids = torch.arange(logits.shape[-1], device=logits.device, dtype=torch.long)
+    frequencies = torch.sum(recent[:, None] == vocab_ids, dim=0).to(dtype=logits.dtype)
+    return _apply_repetition_penalty_from_frequencies(logits, frequencies, penalty=penalty)
+
+
+def _apply_repetition_penalty_from_frequencies(
+    logits: torch.Tensor,
+    frequencies: torch.Tensor,
+    *,
+    penalty: float | torch.Tensor,
+) -> torch.Tensor:
+    """Apply a precomputed frequency penalty without NPU host fallbacks."""
+    if isinstance(penalty, torch.Tensor):
+        penalty_tensor = penalty
+        if penalty_tensor.device != logits.device or penalty_tensor.dtype != logits.dtype:
+            penalty_tensor = penalty_tensor.to(
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+    else:
+        if penalty == 1.0:
+            return logits
+        penalty_tensor = torch.as_tensor(
+            penalty,
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+    alpha = torch.pow(penalty_tensor, frequencies)
     return torch.where(logits < 0, logits * alpha, logits / alpha)
 
 
@@ -107,6 +223,204 @@ def _apply_top_k_top_p(
     return filtered
 
 
+def _bounded_top_k_top_p_candidates(
+    logits: torch.Tensor,
+    *,
+    top_k: int,
+    top_p: float | None,
+    min_tokens_to_keep: int = 3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply full-vocabulary top-p while sorting only final top-k candidates.
+
+    The checkpoint applies top-p before top-k.  Sorting all 6,562 codec logits
+    for that ordering is especially expensive in single-token Ascend decode.
+    Tokens outside the final top-k are discarded anyway: their aggregate
+    probability mass is sufficient to compute the exact top-p cutoff for the
+    retained candidates.  This reduces the sort and multinomial domains to 25
+    values with the checkpoint defaults while preserving the candidate
+    probabilities (apart from top-k boundary ties).
+    """
+    vocab_size = int(logits.shape[-1])
+    keep = min(vocab_size, max(int(top_k), min_tokens_to_keep))
+    candidate_logits, candidate_ids = torch.topk(logits, keep, dim=-1)
+    if top_p is None or not 0.0 < top_p < 1.0:
+        return candidate_logits, candidate_ids
+
+    max_logits = logits.amax(dim=-1, keepdim=True)
+    total_mass = torch.exp(logits - max_logits).sum(dim=-1, keepdim=True)
+    candidate_mass = torch.exp(candidate_logits - max_logits)
+    outside_mass = (total_mass - candidate_mass.sum(dim=-1, keepdim=True)).clamp_min_(0.0)
+
+    # topk returns descending values; top-p's released warper accumulates from
+    # the low-probability end and always retains at least the final three.
+    candidate_logits = candidate_logits.flip(-1)
+    candidate_ids = candidate_ids.flip(-1)
+    candidate_mass = candidate_mass.flip(-1)
+    cumulative = (outside_mass + candidate_mass.cumsum(dim=-1)) / total_mass
+    remove = cumulative <= (1.0 - float(top_p))
+    remove[..., -min_tokens_to_keep:] = False
+    return candidate_logits.masked_fill(remove, float("-inf")), candidate_ids
+
+
+def _bounded_codec_distribution(
+    hidden_state: torch.Tensor,
+    frequencies: torch.Tensor,
+    weight: torch.Tensor,
+    penalty: torch.Tensor,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float | None,
+    eos_id: int,
+    mask_eos: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the exact bounded codec distribution for one Talker token.
+
+    This pure distribution builder is used by correctness tests and by the
+    exact eager sampling path. The optimized Ascend path uses the same values
+    with inverse-CDF sampling in ``_graphable_codec_sample``.
+    """
+    logits = F.linear(hidden_state, weight).float() / temperature
+    alpha = torch.pow(penalty, frequencies)
+    logits = torch.where(logits < 0, logits * alpha, logits / alpha)
+    if mask_eos:
+        logits[..., eos_id] = float("-inf")
+    candidate_logits, candidate_ids = _bounded_top_k_top_p_candidates(
+        logits,
+        top_k=top_k,
+        top_p=top_p,
+        min_tokens_to_keep=3,
+    )
+    return torch.softmax(candidate_logits, dim=-1), candidate_ids
+
+
+def _graphable_codec_sample(
+    hidden_state: torch.Tensor,
+    frequencies: torch.Tensor,
+    weight: torch.Tensor,
+    penalty: torch.Tensor,
+    uniform: torch.Tensor,
+    mask_eos: torch.Tensor,
+    expired: torch.Tensor,
+    vocab_ids: torch.Tensor,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float | None,
+    eos_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample one codec token without the Ascend AICPU multinomial kernel.
+
+    Inverse-CDF sampling is distribution-equivalent to ``multinomial`` for a
+    single draw.  The explicit uniform is a static graph input so request-local
+    RNG remains outside capture, while the head, filters, draw and 16-token
+    frequency-window update become one fixed-shape executable.
+    """
+    logits = F.linear(hidden_state, weight).float() / temperature
+    alpha = torch.pow(penalty, frequencies)
+    logits = torch.where(logits < 0, logits * alpha, logits / alpha)
+    eos_value = torch.where(
+        mask_eos,
+        logits.new_full(logits[..., eos_id].shape, float("-inf")),
+        logits[..., eos_id],
+    )
+    logits[..., eos_id] = eos_value
+    candidate_logits, candidate_ids = _bounded_top_k_top_p_candidates(
+        logits,
+        top_k=top_k,
+        top_p=top_p,
+        min_tokens_to_keep=3,
+    )
+    probabilities = torch.softmax(candidate_logits, dim=-1)
+    sampled_position = torch.sum(
+        probabilities.cumsum(dim=-1) < uniform,
+        dim=-1,
+        keepdim=True,
+    ).clamp_max_(probabilities.shape[-1] - 1)
+    sampled = candidate_ids.gather(-1, sampled_position)
+    next_frequencies = frequencies + (vocab_ids == sampled).to(frequencies.dtype)
+    next_frequencies = next_frequencies - (
+        (expired >= 0) & (vocab_ids == expired)
+    ).to(frequencies.dtype)
+    return sampled, next_frequencies
+
+
+def _graphable_codec_distribution(
+    hidden_state: torch.Tensor,
+    frequencies: torch.Tensor,
+    weight: torch.Tensor,
+    penalty: torch.Tensor,
+    mask_eos: torch.Tensor,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float | None,
+    eos_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build graph-owned candidates while retaining native multinomial.
+
+    Unlike :func:`_graphable_codec_sample`, this helper does not substitute
+    inverse-CDF sampling.  The expensive codec head, repetition penalty and
+    bounded distribution stay inside the outer Talker graph, while the caller
+    consumes the resulting 25-way distribution with the checkpoint's native
+    ``torch.multinomial`` path and request-local generator.
+    """
+    logits = F.linear(hidden_state, weight).float() / temperature
+    alpha = torch.pow(penalty, frequencies)
+    logits = torch.where(logits < 0, logits * alpha, logits / alpha)
+    eos_value = torch.where(
+        mask_eos,
+        logits.new_full(logits[..., eos_id].shape, float("-inf")),
+        logits[..., eos_id],
+    )
+    logits[..., eos_id] = eos_value
+    candidate_logits, candidate_ids = _bounded_top_k_top_p_candidates(
+        logits,
+        top_k=top_k,
+        top_p=top_p,
+        min_tokens_to_keep=3,
+    )
+    return torch.softmax(candidate_logits, dim=-1), candidate_ids
+
+
+def _graphable_advance_codec_state(
+    frequencies: torch.Tensor,
+    history_slab: torch.Tensor,
+    pending_sample: torch.Tensor,
+    vocab_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the previous native draw inside the next Talker graph replay.
+
+    ``history_slab`` is a left-padded fixed FIFO. A negative pending value is
+    the first-step sentinel and leaves both tensors unchanged. This keeps the
+    native multinomial boundary while moving the full-vocabulary frequency
+    update and growing-history replacement into the outer FULL_DECODE graph.
+    """
+    pending = pending_sample.reshape(1, 1)
+    expired = history_slab[:1].reshape(1, 1)
+    valid_pending = pending >= 0
+    valid_expired = expired >= 0
+    add = (vocab_ids.reshape(1, -1) == pending).to(frequencies.dtype)
+    subtract = (vocab_ids.reshape(1, -1) == expired).to(frequencies.dtype)
+    next_frequencies = frequencies + add * valid_pending.to(frequencies.dtype)
+    next_frequencies = next_frequencies - subtract * valid_expired.to(
+        frequencies.dtype
+    )
+    shifted = torch.cat(
+        [history_slab[1:], pending_sample.reshape(1)],
+        dim=0,
+    )
+    next_history = torch.where(valid_pending.reshape(()), shifted, history_slab)
+    return next_frequencies, next_history
+
+
+def _env_enabled(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 class _MiniCPMTTSProjector(nn.Module):
     """Checkpoint-compatible hidden-state projector used by MiniCPMTTS."""
 
@@ -133,9 +447,102 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.config = config
         self.vllm_config = vllm_config
         self._batch_stop_logits: torch.Tensor | None = None
+        self._batch_stop_token_ids: torch.Tensor | None = None
+        self._stop_logits_constants: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._stop_token_constants: tuple[torch.Tensor, torch.Tensor] | None = None
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
+        self._request_repetition_frequencies: dict[str, torch.Tensor] = {}
+        self._request_codec_rings: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
+        self._static_w8a8_calibration_path: str | None = None
+        self._static_w8a8_collectors: dict[str, torch.Tensor] = {}
+        parity_trace_path = os.environ.get(_CODEC_PARITY_TRACE_ENV, "").strip()
+        self._codec_parity_trace_path: str | None = parity_trace_path or None
+        self._request_codec_parity: dict[str, dict[str, Any]] = {}
+        self._request_codec_parity_pending: dict[str, dict[str, Any]] = {}
+        self._npu_codec_sampler_graphs: dict[bool, dict[str, Any]] = {}
+        self._npu_codec_sampler_graph_pool: Any | None = None
+        self._npu_codec_sampler_graph_disabled = False
+        # The single-request competition path can fold codec-head sampling
+        # into the already captured Talker executable. Python stages its
+        # request-local RNG/window state into fixed-address buffers before
+        # replay; make_omni_output consumes the graph-owned result afterward.
+        self._fused_codec_sampler_enabled = _env_enabled(
+            _NPU_FUSED_CODEC_SAMPLER_ENV,
+            default=False,
+        )
+        # Preserve the native multinomial seed-to-code mapping while moving
+        # the much larger head/filter/softmax chain into the existing outer
+        # FULL_DECODE graph. This is deliberately independent from the
+        # inverse-CDF experiment above.
+        self._fused_codec_distribution_enabled = _env_enabled(
+            _NPU_FUSED_CODEC_DISTRIBUTION_ENV,
+            default=False,
+        )
+        if (
+            self._fused_codec_sampler_enabled
+            and self._fused_codec_distribution_enabled
+        ):
+            raise ValueError(
+                f"{_NPU_FUSED_CODEC_SAMPLER_ENV} and "
+                f"{_NPU_FUSED_CODEC_DISTRIBUTION_ENV} are mutually exclusive"
+            )
+        self._fused_codec_distribution_disabled = False
+        self._fused_codec_distribution_validated_steps: set[int] = set()
+        # The legacy path grows a 16-code history with torch.cat after every
+        # codec. On a launch-bound NPU decode loop that is one allocation and
+        # one Cat kernel per step. Keep the exact same multiset in a fixed
+        # circular slab and use its cursor to identify the evicted code.
+        self._fixed_codec_ring_enabled = _env_enabled(
+            _NPU_FIXED_CODEC_RING_ENV,
+            default=False,
+        )
+        self._graph_codec_state_enabled = _env_enabled(
+            _NPU_GRAPH_CODEC_STATE_ENV,
+            default=False,
+        )
+        if self._graph_codec_state_enabled and not self._fused_codec_distribution_enabled:
+            raise ValueError(
+                f"{_NPU_GRAPH_CODEC_STATE_ENV} requires "
+                f"{_NPU_FUSED_CODEC_DISTRIBUTION_ENV}"
+            )
+        if self._graph_codec_state_enabled and self._fixed_codec_ring_enabled:
+            raise ValueError(
+                f"{_NPU_GRAPH_CODEC_STATE_ENV} and "
+                f"{_NPU_FIXED_CODEC_RING_ENV} are mutually exclusive"
+            )
+        self._graph_codec_state_request_id: str | None = None
+        self._fused_codec_sampler_prepared = False
+        self._fused_codec_sampler_request_id: str | None = None
+        # Code2Wav consumes codec chunks, not Talker's per-token hidden row.
+        # Batch codec scalars on-device so the NPU runner performs one D2H per
+        # publishable chunk instead of one D2H for every autoregressive step.
+        self.batched_codec_output = _env_enabled(
+            _NPU_BATCHED_CODEC_OUTPUT_ENV,
+            default=False,
+        )
+        # In the sparse chunk transport path, an EOS decision is not visible
+        # downstream until the next publish boundary anyway.  Defer its scalar
+        # D2H read to that boundary so steady Talker decode does not serialize
+        # the NPU and Python once per codec token.  The boundary copy is also
+        # used to keep EOS and any speculative post-EOS codes out of the
+        # sequence seen by Code2Wav.
+        self.deferred_chunk_eos = self.batched_codec_output and _env_enabled(
+            _NPU_DEFERRED_CHUNK_EOS_ENV,
+            default=False,
+        )
+        # The Talker samples codec IDs internally. Its vLLM-visible two-token
+        # head is only a deterministic continue/stop control channel. Reuse
+        # that decision instead of running the generic logits-processor and
+        # sampler stack a second time on every codec step.
+        self.direct_stop_sampler = _env_enabled(
+            _DIRECT_STOP_SAMPLER_ENV,
+            default=False,
+        )
+        self.omni_pooler_payload_include_hidden = not self.batched_codec_output
+        self._request_transport_codes: dict[str, list[torch.Tensor]] = {}
+        self._request_transport_chunks: dict[str, int] = {}
 
         tts_config = getattr(config, "tts_config", None)
         if tts_config is None and getattr(config, "model_type", None) == "minicpmtts":
@@ -155,6 +562,76 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._codec_min_tokens = int(getattr(tts_config, "min_new_tokens", _CODEC_MIN_TOKENS))
         else:
             self._tts_config = None
+
+        if tts_config is not None:
+            self.register_buffer(
+                "_codec_vocab_ids",
+                torch.arange(self._num_audio_tokens, dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_frequencies",
+                torch.zeros((1, self._num_audio_tokens), dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_uniform",
+                torch.full((1, 1), 0.5, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_mask_eos",
+                torch.ones((1,), dtype=torch.bool),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_expired",
+                torch.full((1, 1), -1, dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_penalty",
+                torch.full((1,), self._codec_repetition_penalty, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_sampled",
+                torch.zeros((1, 1), dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_next_frequencies",
+                torch.zeros((1, self._num_audio_tokens), dtype=torch.float32),
+                persistent=False,
+            )
+            candidate_width = min(
+                self._num_audio_tokens,
+                max(self._codec_top_k, 3),
+            )
+            self.register_buffer(
+                "_fused_codec_probabilities",
+                torch.zeros((1, candidate_width), dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_candidate_ids",
+                torch.zeros((1, candidate_width), dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_history_slab",
+                torch.full(
+                    (_REPETITION_WINDOW,),
+                    -1,
+                    dtype=torch.long,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_pending_sample",
+                torch.full((1,), -1, dtype=torch.long),
+                persistent=False,
+            )
 
         self.has_preprocess = True
         self.has_postprocess = False
@@ -335,6 +812,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 request_states = {}
                 self._request_audio_states = request_states
             request_states[request_id] = state
+            self._request_repetition_frequencies.pop(request_id, None)
             empty_codes = torch.empty(0, dtype=torch.long, device=embeds.device)
             return (
                 input_ids,
@@ -370,6 +848,471 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
+    def _codec_ring_entry(
+        self,
+        request_id: str,
+        history: torch.Tensor,
+        device: torch.device,
+    ) -> dict[str, Any] | None:
+        """Return the request's fixed 16-code history slab.
+
+        The slab is initialized once from the legacy history so enabling the
+        optimization is safe across prefill/decode transitions and restored
+        request metadata. Physical ring order is intentionally opaque; only
+        frequency counts, the eviction cursor, and the latest code are used by
+        the Talker hot path.
+        """
+        if not getattr(self, "_fixed_codec_ring_enabled", False):
+            return None
+        entry = self._request_codec_rings.get(request_id)
+        if entry is not None:
+            slab = entry.get("slab")
+            if (
+                isinstance(slab, torch.Tensor)
+                and slab.device == device
+                and slab.dtype == torch.long
+                and slab.numel() == _REPETITION_WINDOW
+            ):
+                return entry
+
+        recent = history.reshape(-1)[-_REPETITION_WINDOW:].to(
+            device=device,
+            dtype=torch.long,
+        )
+        slab = torch.empty(
+            (_REPETITION_WINDOW,),
+            device=device,
+            dtype=torch.long,
+        )
+        length = int(recent.numel())
+        if length:
+            slab[:length].copy_(recent)
+        entry = {
+            "slab": slab,
+            "length": length,
+            "cursor": length % _REPETITION_WINDOW,
+        }
+        self._request_codec_rings[request_id] = entry
+        return entry
+
+    def _codec_ring_history(
+        self,
+        request_id: str,
+        fallback: torch.Tensor,
+    ) -> torch.Tensor:
+        entry = self._request_codec_rings.get(request_id)
+        if not isinstance(entry, dict):
+            return fallback
+        slab = entry.get("slab")
+        if not isinstance(slab, torch.Tensor):
+            return fallback
+        return slab[: int(entry.get("length", 0))]
+
+    def _graph_codec_history(self, fallback: torch.Tensor) -> torch.Tensor:
+        if not getattr(self, "_graph_codec_state_enabled", False):
+            return fallback
+        slab = self._fused_codec_history_slab
+        return slab[slab >= 0]
+
+    def _codec_ring_expired(
+        self,
+        request_id: str,
+        history: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        entry = self._codec_ring_entry(request_id, history, device)
+        if entry is None or int(entry["length"]) < _REPETITION_WINDOW:
+            return None
+        return entry["slab"][int(entry["cursor"])].reshape(())
+
+    def _record_codec_ring_sample(
+        self,
+        request_id: str,
+        history: torch.Tensor,
+        sampled: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        entry = self._codec_ring_entry(request_id, history, device)
+        if entry is None:
+            return
+        cursor = int(entry["cursor"])
+        entry["slab"][cursor].copy_(sampled.reshape(()))
+        entry["cursor"] = (cursor + 1) % _REPETITION_WINDOW
+        entry["length"] = min(
+            _REPETITION_WINDOW,
+            int(entry["length"]) + 1,
+        )
+
+    def _repetition_frequencies(
+        self,
+        request_id: str,
+        history: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        frequencies = self._request_repetition_frequencies.get(request_id)
+        if (
+            frequencies is not None
+            and frequencies.device == logits.device
+            and frequencies.dtype == logits.dtype
+            and frequencies.shape[-1] == logits.shape[-1]
+        ):
+            return frequencies
+        entry = self._codec_ring_entry(request_id, history, logits.device)
+        if entry is None:
+            recent = history.reshape(-1)[-_REPETITION_WINDOW:].to(
+                device=logits.device,
+                dtype=torch.long,
+            )
+        else:
+            recent = entry["slab"][: int(entry["length"])]
+        if recent.numel() == 0:
+            frequencies = logits.new_zeros(logits.shape)
+        else:
+            vocab_ids = self._codec_vocab_ids.to(device=logits.device)
+            frequencies = torch.sum(recent[:, None] == vocab_ids, dim=0, keepdim=True).to(dtype=logits.dtype)
+        self._request_repetition_frequencies[request_id] = frequencies
+        return frequencies
+
+    def _advance_repetition_frequencies(
+        self,
+        request_id: str,
+        history: torch.Tensor,
+        sampled: torch.Tensor,
+        frequencies: torch.Tensor,
+    ) -> None:
+        """Advance the 16-code frequency window using device-native compares."""
+        vocab_ids = self._codec_vocab_ids.to(device=frequencies.device)
+        next_frequencies = frequencies + (vocab_ids == sampled).to(dtype=frequencies.dtype)
+        expired = self._codec_ring_expired(
+            request_id,
+            history,
+            frequencies.device,
+        )
+        if expired is None and history.numel() >= _REPETITION_WINDOW:
+            expired = history.reshape(-1)[-_REPETITION_WINDOW].to(
+                device=frequencies.device,
+            )
+        if expired is not None:
+            next_frequencies = next_frequencies - (vocab_ids == expired).to(dtype=frequencies.dtype)
+        self._request_repetition_frequencies[request_id] = next_frequencies
+        self._record_codec_ring_sample(
+            request_id,
+            history,
+            sampled,
+            frequencies.device,
+        )
+
+    def prepare_fused_codec_sampler_inputs(
+        self,
+        *,
+        model_intermediate_buffer: list[Any] | None = None,
+        request_token_spans: list[tuple[int, int]] | None = None,
+        request_sample_eligible: list[bool] | None = None,
+        **_: Any,
+    ) -> bool:
+        """Stage one batch-1 request into the Talker graph's sampler slabs.
+
+        This deliberately supports only the stable single-request decode shape.
+        Any prefill, compaction, or batched case falls back to the standalone
+        sampler without changing request RNG or repetition state.
+        """
+        self._fused_codec_sampler_prepared = False
+        self._fused_codec_sampler_request_id = None
+        distribution_enabled = (
+            getattr(self, "_fused_codec_distribution_enabled", False)
+            and not getattr(self, "_fused_codec_distribution_disabled", False)
+        )
+        if not (
+            getattr(self, "_fused_codec_sampler_enabled", False)
+            or distribution_enabled
+        ):
+            return False
+        infos = model_intermediate_buffer or []
+        spans = request_token_spans or []
+        eligible = request_sample_eligible or []
+        if len(infos) != 1 or len(spans) != 1 or eligible != [True]:
+            return False
+        info = infos[0]
+        if not isinstance(info, dict):
+            return False
+        start, end = spans[0]
+        # Full-decode capture owns exactly one Talker row. The final prefill
+        # chunk can also be sample-eligible, but its wider hidden output does
+        # not execute the fused branch in forward; staging it would advance
+        # RNG and later consume a stale output slab.
+        if int(end) - int(start) != 1:
+            return False
+        request_id = str(info.get("request_id", 0))
+        state = self._request_audio_states.get(request_id)
+        if not isinstance(state, dict) or state.get("finished"):
+            return False
+        codes = state.get("codes")
+        if not isinstance(codes, torch.Tensor):
+            codes = (info.get("audio_codes", {}) or {}).get("accumulated")
+        if not isinstance(codes, torch.Tensor):
+            codes = torch.empty(
+                0,
+                dtype=torch.long,
+                device=self._fused_codec_frequencies.device,
+            )
+        else:
+            codes = codes.to(
+                device=self._fused_codec_frequencies.device,
+                dtype=torch.long,
+            ).reshape(-1)
+
+        graph_state_enabled = getattr(self, "_graph_codec_state_enabled", False)
+        if graph_state_enabled:
+            if self._graph_codec_state_request_id != request_id:
+                self._fused_codec_frequencies.zero_()
+                self._fused_codec_history_slab.fill_(-1)
+                self._fused_codec_pending_sample.fill_(-1)
+                self._graph_codec_state_request_id = request_id
+            frequencies = self._fused_codec_frequencies
+        else:
+            frequencies = self._repetition_frequencies(
+                request_id,
+                codes,
+                self._fused_codec_frequencies,
+            )
+            if frequencies.data_ptr() != self._fused_codec_frequencies.data_ptr():
+                self._fused_codec_frequencies.copy_(frequencies)
+        # Keep request state bound to the stable graph input address.
+        self._request_repetition_frequencies[request_id] = self._fused_codec_frequencies
+        step = int(state.get("step", 0))
+        min_tokens = int(state.get("min_tokens", self._codec_min_tokens))
+        self._fused_codec_mask_eos.fill_(step < min_tokens)
+        self._fused_codec_expired.fill_(-1)
+        if not graph_state_enabled:
+            expired = self._codec_ring_expired(
+                request_id,
+                codes,
+                self._fused_codec_expired.device,
+            )
+            if expired is None and codes.numel() >= _REPETITION_WINDOW:
+                expired = codes[-_REPETITION_WINDOW]
+            if expired is not None:
+                self._fused_codec_expired.copy_(expired.reshape(1, 1))
+        if getattr(self, "_fused_codec_sampler_enabled", False):
+            self._fused_codec_uniform.uniform_(
+                0.0,
+                1.0,
+                generator=self._request_generator(
+                    request_id,
+                    self._fused_codec_uniform.device,
+                ),
+            )
+        self._fused_codec_sampler_request_id = request_id
+        self._fused_codec_sampler_prepared = True
+        return True
+
+    def _consume_fused_codec_sample(self, request_id: str) -> torch.Tensor | None:
+        if (
+            not getattr(self, "_fused_codec_sampler_enabled", False)
+            or not getattr(self, "_fused_codec_sampler_prepared", False)
+            or self._fused_codec_sampler_request_id != request_id
+        ):
+            return None
+        self._fused_codec_sampler_prepared = False
+        self._fused_codec_sampler_request_id = None
+        self._fused_codec_frequencies.copy_(self._fused_codec_next_frequencies)
+        self._request_repetition_frequencies[request_id] = self._fused_codec_frequencies
+        sampled = self._fused_codec_sampled.reshape(())
+        state = self._request_audio_states.get(request_id, {})
+        history = state.get("codes")
+        if not isinstance(history, torch.Tensor):
+            history = sampled.new_empty(0, dtype=torch.long)
+        self._record_codec_ring_sample(
+            request_id,
+            history,
+            sampled,
+            sampled.device,
+        )
+        return sampled
+
+    def _consume_fused_codec_distribution(
+        self,
+        hidden_state: torch.Tensor,
+        history: torch.Tensor,
+        request_id: str,
+        step: int,
+    ) -> torch.Tensor | None:
+        """Sample an outer-graph distribution with the native RNG mapping.
+
+        Four lifecycle boundaries are checked against the eager builder on the
+        first request: initial state, incremental state, repetition-window
+        eviction, and EOS unmasking. A stale graph input or changed candidate
+        distribution disables the path before its sample becomes observable.
+        """
+        if (
+            not getattr(self, "_fused_codec_distribution_enabled", False)
+            or getattr(self, "_fused_codec_distribution_disabled", False)
+            or not getattr(self, "_fused_codec_sampler_prepared", False)
+            or self._fused_codec_sampler_request_id != request_id
+        ):
+            return None
+
+        self._fused_codec_sampler_prepared = False
+        self._fused_codec_sampler_request_id = None
+        probabilities = self._fused_codec_probabilities
+        candidate_ids = self._fused_codec_candidate_ids
+        generator = self._request_generator(request_id, probabilities.device)
+        parity_trace_enabled = bool(
+            getattr(self, "_codec_parity_trace_path", None)
+        )
+        if (
+            parity_trace_enabled
+            and probabilities.device.type == "npu"
+            and _env_enabled(_CODEC_PARITY_SYNC_ENV, default=False)
+        ):
+            # Diagnostic only. A device-wide fence makes the replay output
+            # stable before both the snapshot and multinomial consume it. If
+            # this removes cross-run drift, the production fix must be a
+            # stream/event dependency rather than retaining this host fence.
+            torch.npu.synchronize()
+        parity_candidate_ids_before = None
+        parity_probabilities_before = None
+        if parity_trace_enabled:
+            parity_candidate_ids_before = candidate_ids.detach().clone()
+            parity_probabilities_before = probabilities.detach().clone()
+
+        validation_steps = {
+            0,
+            1,
+            _REPETITION_WINDOW,
+            int(
+                self._request_audio_states.get(request_id, {}).get(
+                    "min_tokens", self._codec_min_tokens
+                )
+            ),
+        }
+        validate = (
+            step in validation_steps
+            and step not in self._fused_codec_distribution_validated_steps
+        )
+        if validate:
+            shadow_generator = torch.Generator(device=probabilities.device)
+            shadow_generator.set_state(generator.get_state())
+            eager_probabilities, eager_ids = _bounded_codec_distribution(
+                hidden_state,
+                self._fused_codec_frequencies,
+                self.head_code[0].weight,
+                self._fused_codec_penalty,
+                temperature=self._codec_temperature,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                eos_id=self._num_audio_tokens - 1,
+                mask_eos=step
+                < int(
+                    self._request_audio_states[request_id].get(
+                        "min_tokens", self._codec_min_tokens
+                    )
+                ),
+            )
+            graph_position = torch.multinomial(
+                probabilities,
+                num_samples=1,
+                generator=generator,
+            )
+            eager_position = torch.multinomial(
+                eager_probabilities,
+                num_samples=1,
+                generator=shadow_generator,
+            )
+            graph_sample = candidate_ids.gather(-1, graph_position).reshape(())
+            eager_sample = eager_ids.gather(-1, eager_position).reshape(())
+            ids_match = torch.equal(candidate_ids, eager_ids)
+            probs_match = torch.allclose(
+                probabilities,
+                eager_probabilities,
+                atol=1e-7,
+                rtol=1e-6,
+            )
+            token_match = int(graph_sample.item()) == int(eager_sample.item())
+            if not (ids_match and probs_match and token_match):
+                # The shadow generator executed the canonical draw. Restore
+                # that post-draw state and return its token exactly once.
+                generator.set_state(shadow_generator.get_state())
+                self._fused_codec_distribution_disabled = True
+                max_drift = (
+                    float(
+                        torch.max(
+                            torch.abs(probabilities - eager_probabilities)
+                        ).item()
+                    )
+                    if probabilities.shape == eager_probabilities.shape
+                    else float("inf")
+                )
+                logger.warning(
+                    "MiniCPM-o fused codec distribution runtime gate failed; "
+                    "disabling the path and returning the native eager sample: "
+                    "request=%s, step=%d, ids_match=%s, max_drift=%g, "
+                    "graph_token=%d, eager_token=%d",
+                    request_id,
+                    step,
+                    ids_match,
+                    max_drift,
+                    int(graph_sample.item()),
+                    int(eager_sample.item()),
+                )
+                self._advance_repetition_frequencies(
+                    request_id,
+                    self._graph_codec_history(history),
+                    eager_sample,
+                    self._fused_codec_frequencies,
+                )
+                self._stage_codec_parity_distribution(
+                    request_id,
+                    step=step,
+                    sampled=eager_sample,
+                    candidate_ids_before=parity_candidate_ids_before,
+                    probabilities_before=parity_probabilities_before,
+                    candidate_ids_after=candidate_ids,
+                    probabilities_after=probabilities,
+                )
+                return eager_sample
+            self._fused_codec_distribution_validated_steps.add(step)
+            logger.info(
+                "MiniCPM-o fused codec distribution runtime gate passed: "
+                "request=%s, step=%d, validated_steps=%s",
+                request_id,
+                step,
+                sorted(self._fused_codec_distribution_validated_steps),
+            )
+            sampled = graph_sample
+        else:
+            sampled_position = torch.multinomial(
+                probabilities,
+                num_samples=1,
+                generator=generator,
+            )
+            sampled = candidate_ids.gather(-1, sampled_position).reshape(())
+
+        if getattr(self, "_graph_codec_state_enabled", False):
+            # The next outer replay consumes this fixed-address scalar and
+            # advances both the frequency vector and FIFO inside the graph.
+            self._fused_codec_pending_sample.copy_(sampled.reshape(1))
+            self._request_repetition_frequencies[request_id] = (
+                self._fused_codec_frequencies
+            )
+        else:
+            self._advance_repetition_frequencies(
+                request_id,
+                history,
+                sampled,
+                self._fused_codec_frequencies,
+            )
+        self._stage_codec_parity_distribution(
+            request_id,
+            step=step,
+            sampled=sampled,
+            candidate_ids_before=parity_candidate_ids_before,
+            probabilities_before=parity_probabilities_before,
+            candidate_ids_after=candidate_ids,
+            probabilities_after=probabilities,
+        )
+        return sampled
+
     def _sample_audio_code(
         self,
         hidden_state: torch.Tensor,
@@ -377,33 +1320,500 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id: str,
         step: int,
     ) -> torch.Tensor:
-        logits = self.head_code[0](hidden_state).float() / self._codec_temperature
         eos_id = self._num_audio_tokens - 1
-        logits = _apply_repetition_penalty(
-            logits,
-            history,
-            penalty=self._codec_repetition_penalty,
-            window_size=_REPETITION_WINDOW,
-        )
         request_states = getattr(self, "_request_audio_states", {})
         state = request_states.get(request_id)
         min_tokens = (
             int(state.get("min_tokens", self._codec_min_tokens)) if isinstance(state, dict) else self._codec_min_tokens
         )
-        if step < min_tokens:
-            logits[..., eos_id] = float("-inf")
-        logits = _apply_top_k_top_p(
+        mask_eos = step < min_tokens
+        if (
+            hidden_state.device.type == "npu"
+            and not getattr(self, "_npu_codec_sampler_graphs", {})
+            and not getattr(self, "_npu_codec_sampler_graph_disabled", False)
+            and _env_enabled(_NPU_CODEC_SAMPLER_GRAPH_ENV, default=False)
+        ):
+            # vLLM-Ascend captures the Talker backbone after load_weights().
+            # Capture this continuation lazily on the first real execution
+            # stream so the backbone output and the inverse-CDF continuation
+            # share one ordered stream.
+            self._prepare_npu_codec_sampler_graphs(hidden_state)
+        graph_entry = getattr(self, "_npu_codec_sampler_graphs", {}).get(mask_eos)
+        if graph_entry is not None and hidden_state.device.type == "npu":
+            frequencies = self._repetition_frequencies(
+                request_id,
+                history,
+                graph_entry["frequencies"],
+            )
+            graph_entry["hidden"].copy_(hidden_state)
+            graph_entry["frequencies"].copy_(frequencies)
+            graph_entry["mask_eos"].fill_(mask_eos)
+            graph_entry["expired"].fill_(-1)
+            expired = self._codec_ring_expired(
+                request_id,
+                history,
+                graph_entry["expired"].device,
+            )
+            if expired is None and history.numel() >= _REPETITION_WINDOW:
+                expired = history.reshape(-1)[-_REPETITION_WINDOW]
+            if expired is not None:
+                graph_entry["expired"].copy_(
+                    expired.reshape(1, 1)
+                )
+            generator = self._request_generator(request_id, hidden_state.device)
+            sampler_shadow = _env_enabled(
+                _NPU_CODEC_SAMPLER_SHADOW_ENV,
+                default=False,
+            )
+            shadow_generator = None
+            runtime_canary = not graph_entry["runtime_validated"]
+            if sampler_shadow or runtime_canary:
+                # Preserve the exact pre-draw request RNG state. The shadow
+                # generator can then execute the resident multinomial without
+                # advancing the real request generator a second time. The
+                # first real replay always runs this check: capture-time probes
+                # alone cannot detect every nested FULL_DECODE graph failure.
+                shadow_generator = torch.Generator(device=hidden_state.device)
+                shadow_generator.set_state(generator.get_state())
+            graph_entry["uniform"].uniform_(
+                0.0,
+                1.0,
+                generator=generator,
+            )
+            shadow_sample = None
+            inverse_sample = None
+            if shadow_generator is not None:
+                shadow_probabilities, shadow_ids = _bounded_codec_distribution(
+                    hidden_state,
+                    frequencies,
+                    self.head_code[0].weight,
+                    self._fused_codec_penalty,
+                    temperature=self._codec_temperature,
+                    top_k=self._codec_top_k,
+                    top_p=self._codec_top_p,
+                    eos_id=eos_id,
+                    mask_eos=mask_eos,
+                )
+                shadow_position = torch.multinomial(
+                    shadow_probabilities,
+                    num_samples=1,
+                    generator=shadow_generator,
+                )
+                shadow_sample = shadow_ids.gather(-1, shadow_position)
+                inverse_position = torch.sum(
+                    shadow_probabilities.cumsum(dim=-1) < graph_entry["uniform"],
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_max_(shadow_probabilities.shape[-1] - 1)
+                inverse_sample = shadow_ids.gather(-1, inverse_position)
+            sampler_sync = _env_enabled(
+                _NPU_CODEC_SAMPLER_SYNC_ENV,
+                default=False,
+            )
+            if sampler_sync:
+                # Diagnostic only: a post-replay fence cannot establish that
+                # the graph observed the input copies above. Fence both sides
+                # to distinguish a graph-input handoff race from an incorrect
+                # sampler implementation. A promotable implementation must
+                # replace these device-wide fences with stream events.
+                torch.npu.synchronize()
+            graph_entry["graph"].replay()
+            if sampler_sync:
+                # The graph-owned outputs are consumed on the caller stream.
+                # Fence before copying them: synchronizing after the copies
+                # only waits for both streams and cannot prevent a copy from
+                # observing the previous replay's output.
+                torch.npu.synchronize()
+            graph_sampled, next_frequencies = graph_entry["outputs"]
+            sampled = graph_entry["sampled"]
+            sampled.copy_(graph_sampled)
+            if shadow_sample is not None and inverse_sample is not None:
+                graph_code = int(sampled.item())
+                inverse_code = int(inverse_sample.item())
+                multinomial_code = int(shadow_sample.item())
+                if graph_code != inverse_code or graph_code != multinomial_code:
+                    logger.warning(
+                        "MiniCPM-o codec sampler runtime canary failed; "
+                        "disabling NPUGraph and returning the native sample: "
+                        f"request={request_id}, step={step}, "
+                        f"uniform={float(graph_entry['uniform'].item()):.9f}, "
+                        f"graph={graph_code}, inverse_cdf={inverse_code}, "
+                        f"multinomial={multinomial_code}",
+                    )
+                    self._npu_codec_sampler_graph_disabled = True
+                    self._npu_codec_sampler_graphs = {}
+                    native_sample = shadow_sample.reshape(())
+                    self._advance_repetition_frequencies(
+                        request_id,
+                        history,
+                        native_sample,
+                        frequencies,
+                    )
+                    return native_sample
+            # Commit graph-owned rolling state only after the first-runtime
+            # parity gate passes. On fallback ``frequencies`` must still be
+            # the pre-draw request state so the native sample advances the
+            # repetition window exactly once.
+            frequencies.copy_(next_frequencies)
+            self._record_codec_ring_sample(
+                request_id,
+                history,
+                sampled,
+                frequencies.device,
+            )
+            if not graph_entry["runtime_validated"]:
+                valid_sample = bool(
+                    ((sampled >= 0) & (sampled < self._num_audio_tokens)).all().item()
+                ) and bool(
+                    torch.isfinite(frequencies).all().item()
+                )
+                if not valid_sample:
+                    raise RuntimeError(
+                        "captured codec sampler produced invalid runtime state"
+                    )
+                graph_entry["runtime_validated"] = True
+            return sampled.reshape(())
+
+        logits = self.head_code[0](hidden_state).float() / self._codec_temperature
+        frequencies = self._repetition_frequencies(request_id, history, logits)
+        logits = _apply_repetition_penalty_from_frequencies(
             logits,
-            top_k=self._codec_top_k,
-            top_p=self._codec_top_p,
-            min_tokens_to_keep=3,
+            frequencies,
+            # This registered buffer follows the Talker onto the NPU. Reusing
+            # it avoids materializing the same Python scalar through a
+            # synchronous host-to-device ``as_tensor`` on every codec step.
+            penalty=self._fused_codec_penalty,
         )
-        probabilities = torch.softmax(logits, dim=-1)
-        return torch.multinomial(
-            probabilities,
-            num_samples=1,
-            generator=self._request_generator(request_id, probabilities.device),
-        ).reshape(())
+        if mask_eos:
+            logits[..., eos_id] = float("-inf")
+        bounded_sampler = (
+            logits.device.type == "npu"
+            and self._codec_top_k > 0
+            and self._codec_top_k < logits.shape[-1]
+            and _env_enabled(_NPU_BOUNDED_CODEC_SAMPLER_ENV, default=True)
+        )
+        if bounded_sampler:
+            candidate_logits, candidate_ids = _bounded_top_k_top_p_candidates(
+                logits,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                min_tokens_to_keep=3,
+            )
+            probabilities = torch.softmax(candidate_logits, dim=-1)
+            sampled_position = torch.multinomial(
+                probabilities,
+                num_samples=1,
+                generator=self._request_generator(request_id, probabilities.device),
+            )
+            sampled = candidate_ids.gather(-1, sampled_position).reshape(())
+        else:
+            logits = _apply_top_k_top_p(
+                logits,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                min_tokens_to_keep=3,
+            )
+            probabilities = torch.softmax(logits, dim=-1)
+            sampled = torch.multinomial(
+                probabilities,
+                num_samples=1,
+                generator=self._request_generator(request_id, probabilities.device),
+            ).reshape(())
+        self._advance_repetition_frequencies(request_id, history, sampled, frequencies)
+        return sampled
+
+    def _prepare_npu_codec_sampler_graphs(
+        self,
+        runtime_hidden: torch.Tensor | None = None,
+    ) -> None:
+        """Capture the distribution-equivalent fixed-shape Talker sampler."""
+        if not _env_enabled(_NPU_CODEC_SAMPLER_GRAPH_ENV, default=False):
+            return
+        weight = self.head_code[0].weight
+        if weight.device.type != "npu" or self._npu_codec_sampler_graph_disabled:
+            return
+        if self._codec_top_k <= 0 or self._codec_top_k >= self._num_audio_tokens:
+            logger.warning(
+                "MiniCPM-o NPU codec sampler graph requires bounded top-k; retaining eager sampling"
+            )
+            return
+
+        graphs: dict[bool, dict[str, Any]] = {}
+        pool = torch.npu.graph_pool_handle()
+        penalty = torch.full(
+            (1,),
+            self._codec_repetition_penalty,
+            device=weight.device,
+            dtype=torch.float32,
+        )
+        if runtime_hidden is not None:
+            if runtime_hidden.shape != (1, weight.shape[1]):
+                logger.warning(
+                    "MiniCPM-o NPU codec sampler graph requires hidden shape (1, %d), got %s",
+                    int(weight.shape[1]),
+                    tuple(runtime_hidden.shape),
+                )
+                return
+            hidden_template = runtime_hidden.detach().to(dtype=weight.dtype).clone()
+        else:
+            generator = torch.Generator(device="cpu").manual_seed(20260826)
+            hidden_cpu = torch.randn(
+                (1, weight.shape[1]),
+                generator=generator,
+                dtype=torch.float32,
+            )
+            hidden_template = hidden_cpu.to(device=weight.device, dtype=weight.dtype)
+        frequency_template = torch.zeros(
+            (1, self._num_audio_tokens),
+            device=weight.device,
+            dtype=torch.float32,
+        )
+        try:
+            static_hidden = hidden_template.clone()
+            static_frequencies = frequency_template.clone()
+            static_uniform = torch.full(
+                (1, 1),
+                0.5,
+                device=weight.device,
+                dtype=torch.float32,
+            )
+            static_mask_eos = torch.ones(
+                (1,),
+                device=weight.device,
+                dtype=torch.bool,
+            )
+            static_expired = torch.full(
+                (1, 1),
+                -1,
+                device=weight.device,
+                dtype=torch.long,
+            )
+            vocab_ids = self._codec_vocab_ids.to(device=weight.device).reshape(1, -1)
+            with torch.inference_mode():
+                eager_outputs = tuple(
+                    value.clone()
+                    for value in _graphable_codec_sample(
+                        static_hidden,
+                        static_frequencies,
+                        weight,
+                        penalty,
+                        static_uniform,
+                        static_mask_eos,
+                        static_expired,
+                        vocab_ids,
+                        temperature=self._codec_temperature,
+                        top_k=self._codec_top_k,
+                        top_p=self._codec_top_p,
+                        eos_id=self._num_audio_tokens - 1,
+                    )
+                )
+            torch.npu.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.inference_mode(), torch.npu.graph(graph, pool=pool):
+                outputs = _graphable_codec_sample(
+                    static_hidden,
+                    static_frequencies,
+                    weight,
+                    penalty,
+                    static_uniform,
+                    static_mask_eos,
+                    static_expired,
+                    vocab_ids,
+                    temperature=self._codec_temperature,
+                    top_k=self._codec_top_k,
+                    top_p=self._codec_top_p,
+                    eos_id=self._num_audio_tokens - 1,
+                )
+            graph.replay()
+            torch.npu.synchronize()
+            if not all(
+                torch.equal(actual, expected)
+                for actual, expected in zip(outputs, eager_outputs)
+            ):
+                raise RuntimeError("captured codec sample did not match eager execution")
+
+            # Matching capture-time values is not enough. Some combinations
+            # of an outer FULL_DECODE graph and a lazily captured continuation
+            # can replay successfully while retaining a capture-time scalar.
+            # That failure is especially dangerous here: every tensor remains
+            # finite and in range, but the request follows a different codec
+            # trajectory. Change the fixed-address RNG input after capture and
+            # require replay to observe it before enabling the graph.
+            static_uniform.fill_(0.916076303)
+            with torch.inference_mode():
+                probe_expected = tuple(
+                    value.clone()
+                    for value in _graphable_codec_sample(
+                        static_hidden,
+                        static_frequencies,
+                        weight,
+                        penalty,
+                        static_uniform,
+                        static_mask_eos,
+                        static_expired,
+                        vocab_ids,
+                        temperature=self._codec_temperature,
+                        top_k=self._codec_top_k,
+                        top_p=self._codec_top_p,
+                        eos_id=self._num_audio_tokens - 1,
+                    )
+                )
+            graph.replay()
+            torch.npu.synchronize()
+            if not all(
+                torch.equal(actual, expected)
+                for actual, expected in zip(outputs, probe_expected)
+            ):
+                raise RuntimeError(
+                    "captured codec sample ignored a fixed-address runtime input update"
+                )
+            entry = {
+                "graph": graph,
+                "hidden": static_hidden,
+                "frequencies": static_frequencies,
+                "uniform": static_uniform,
+                "mask_eos": static_mask_eos,
+                "expired": static_expired,
+                "outputs": outputs,
+                "sampled": torch.empty_like(outputs[0]),
+                "runtime_validated": False,
+            }
+            graphs = {True: entry, False: entry}
+        except Exception:
+            self._npu_codec_sampler_graph_disabled = True
+            self._npu_codec_sampler_graphs = {}
+            logger.warning(
+                "MiniCPM-o NPU codec sampler graph capture failed; retaining exact eager sampling",
+                exc_info=True,
+            )
+            return
+
+        self._npu_codec_sampler_graph_pool = pool
+        self._npu_codec_sampler_graphs = graphs
+        logger.info(
+            "MiniCPM-o inverse-CDF Talker codec sampler NPUGraph active: hidden=%d, vocab=%d, top_k=%d",
+            int(weight.shape[1]),
+            self._num_audio_tokens,
+            self._codec_top_k,
+        )
+
+    def _sampled_code_is_eos(
+        self,
+        sampled: torch.Tensor,
+        *,
+        step: int,
+        min_tokens: int,
+        reached_limit: bool,
+    ) -> bool:
+        """Synchronize the sampled code only when EOS can affect control flow.
+
+        ``_sample_audio_code`` masks EOS while ``step < min_tokens``.  Reading
+        the scalar back to Python in that interval therefore cannot change the
+        result, but on NPU it creates a full device/host synchronization after
+        every Talker token.  The max-token boundary is terminal regardless of
+        the sampled value and can skip the readback as well.
+        """
+        if reached_limit or step < min_tokens:
+            return False
+        return int(sampled.item()) == self._num_audio_tokens - 1
+
+    def _transport_codec_delta(
+        self,
+        request_id: str,
+        delta: torch.Tensor,
+        *,
+        finished: bool,
+        native_duplex: bool,
+    ) -> torch.Tensor:
+        """Coalesce one-code NPU outputs into the chunks Code2Wav consumes."""
+        if not getattr(self, "batched_codec_output", False) or native_duplex:
+            return delta
+
+        pending_by_request = getattr(self, "_request_transport_codes", None)
+        if pending_by_request is None:
+            pending_by_request = {}
+            self._request_transport_codes = pending_by_request
+        chunks_by_request = getattr(self, "_request_transport_chunks", None)
+        if chunks_by_request is None:
+            chunks_by_request = {}
+            self._request_transport_chunks = chunks_by_request
+
+        pending = pending_by_request.setdefault(request_id, [])
+        if delta.numel():
+            # The codec sampler graph reuses its output address. Own each code
+            # until the current output slab is published.
+            pending.append(delta.reshape(-1).clone())
+
+        chunk_index = chunks_by_request.get(request_id, 0)
+        default_chunk = max(1, int(os.environ.get(_CODEC_CHUNK_FRAMES_ENV, "25")))
+        initial_chunk = max(
+            1,
+            int(os.environ.get(_INITIAL_CODEC_CHUNK_FRAMES_ENV, str(default_chunk))),
+        )
+        threshold = initial_chunk if chunk_index == 0 else default_chunk
+        pending_count = sum(int(item.numel()) for item in pending)
+        if not finished and pending_count < threshold:
+            return delta.new_empty((0, 1))
+        if not pending:
+            return delta.new_empty((0, 1))
+
+        output = torch.cat(pending).reshape(1, -1)
+        pending.clear()
+        chunks_by_request[request_id] = chunk_index + 1
+        return output
+
+    def _transport_codec_delta_with_deferred_eos(
+        self,
+        request_id: str,
+        sampled: torch.Tensor,
+        *,
+        step: int,
+        min_tokens: int,
+        reached_limit: bool,
+    ) -> tuple[torch.Tensor, bool]:
+        """Publish one codec slab and reconcile EOS once per chunk.
+
+        Samples are retained on-device until the normal Code2Wav boundary.
+        At that boundary a single vector read replaces one scalar read after
+        every eligible Talker token.  If EOS occurred inside the slab, only
+        the prefix before it is published; later speculative samples are
+        discarded together with the terminal request state.
+        """
+        pending = self._request_transport_codes.setdefault(request_id, [])
+        if not reached_limit:
+            # The fused sampler graph reuses this output address on replay.
+            pending.append(sampled.reshape(-1).clone())
+
+        chunk_index = self._request_transport_chunks.get(request_id, 0)
+        default_chunk = max(1, int(os.environ.get(_CODEC_CHUNK_FRAMES_ENV, "25")))
+        initial_chunk = max(
+            1,
+            int(os.environ.get(_INITIAL_CODEC_CHUNK_FRAMES_ENV, str(default_chunk))),
+        )
+        threshold = initial_chunk if chunk_index == 0 else default_chunk
+        if not reached_limit and len(pending) < threshold:
+            return sampled.new_empty((0, 1)), False
+        if not pending:
+            return sampled.new_empty((0, 1)), False
+
+        output = torch.cat(pending).reshape(1, -1)
+        is_eos = False
+        # EOS is masked for all samples whose zero-based step is below
+        # min_tokens.  Avoid even the chunk readback at those early boundaries.
+        if reached_limit or step >= min_tokens:
+            eos_id = self._num_audio_tokens - 1
+            host_codes = output.reshape(-1).tolist()
+            try:
+                eos_offset = host_codes.index(eos_id)
+            except ValueError:
+                eos_offset = -1
+            if eos_offset >= 0:
+                output = output[:, :eos_offset]
+                is_eos = True
+
+        pending.clear()
+        self._request_transport_chunks[request_id] = chunk_index + 1
+        return output, is_eos
 
     def make_omni_output(
         self,
@@ -429,14 +1839,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         stop_rows: list[torch.Tensor] = []
         codec_deltas: list[torch.Tensor] = []
         terminal_flags: list[torch.Tensor] = []
+        finished_rows: list[bool] = []
+        output_request_ids: list[str] = []
         native_duplex_flags: list[torch.Tensor] = []
         duplex_epochs: list[torch.Tensor] = []
         duplex_turn_ids: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
+
+        def append_stop_control(stop: bool) -> None:
+            finished_rows.append(stop)
+            if not self.direct_stop_sampler:
+                stop_rows.append(
+                    hidden.new_tensor([float("-inf"), 0.0] if stop else [0.0, float("-inf")])
+                )
+
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
+            request_id = str(info_dict.get("request_id", index))
+            output_request_ids.append(request_id)
             native_duplex = info_dict.get("native_duplex") is True
             if emit_duplex_metadata:
                 duplex_info = info_dict.get("duplex")
@@ -480,18 +1902,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
 
             if not isinstance(info, dict):
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                append_stop_control(False)
                 continue
             start, end = spans[index]
             end = min(int(end), int(hidden.shape[0]))
             if int(start) >= end:
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                append_stop_control(False)
                 continue
-            request_id = str(info.get("request_id", index))
             request_states = getattr(self, "_request_audio_states", None)
             if request_states is None:
                 request_states = {}
@@ -501,17 +1922,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state = dict(info.get("audio_state", {}) or {})
                 request_states[request_id] = state
             if state.get("finished"):
-                stop_rows.append(hidden.new_tensor([float("-inf"), 0.0]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                append_stop_control(True)
                 continue
             if not sample_eligible[index]:
                 # vLLM computes a logit row for incomplete chunked prefills but
                 # discards its sampled token. Advancing codec/RNG state here
                 # would make output depend on prefill chunking and compaction.
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                append_stop_control(False)
                 continue
             codes = state.get("codes")
             if not isinstance(codes, torch.Tensor):
@@ -521,31 +1942,142 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             else:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             step = int(state.get("step", 0))
-            sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
-            sampled_id = int(sampled.item())
-            is_eos = sampled_id == self._num_audio_tokens - 1
-            state["step"] = int(state.get("step", 0)) + 1
+            sampled = self._consume_fused_codec_distribution(
+                hidden[end - 1 : end],
+                codes,
+                request_id,
+                step,
+            )
+            if sampled is None:
+                sampled = self._consume_fused_codec_sample(request_id)
+            if sampled is None:
+                sampled = self._sample_audio_code(
+                    hidden[end - 1 : end],
+                    codes,
+                    request_id,
+                    step,
+                )
+            min_tokens = int(state.get("min_tokens", self._codec_min_tokens))
+            state["step"] = step + 1
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
-            finished = is_eos or reached_limit
-            state["finished"] = finished
-            # MiniCPMTTS.generate_chunk consumes the boundary sample but
-            # returns only codes that were fed into the retained KV state.
-            if not is_eos and not reached_limit:
-                codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)])
+            defer_eos = (
+                getattr(self, "deferred_chunk_eos", False)
+                and getattr(self, "batched_codec_output", False)
+                and not native_duplex
+            )
+            if defer_eos:
+                is_eos = False
+            else:
+                is_eos = self._sampled_code_is_eos(
+                    sampled,
+                    step=step,
+                    min_tokens=min_tokens,
+                    reached_limit=reached_limit,
+                )
+            # MiniCPMTTS.generate_chunk consumes the max-token boundary sample
+            # but returns only codes that were fed into retained KV state.
+            # Deferred EOS may feed a few terminal-tail samples speculatively;
+            # the transport boundary trims all of them from observable output.
+            if (defer_eos or not is_eos) and not reached_limit:
+                if getattr(self, "_graph_codec_state_enabled", False):
+                    if getattr(self, "_fused_codec_distribution_disabled", False):
+                        graph_history = self._graph_codec_history(codes)
+                        codes = torch.cat(
+                            [
+                                graph_history[-(_REPETITION_WINDOW - 1) :],
+                                sampled.reshape(1),
+                            ]
+                        )
+                    else:
+                        # The graph-owned FIFO carries repetition history. The
+                        # request envelope needs only the last code to build
+                        # the next token embedding.
+                        codes = sampled.reshape(1)
+                elif getattr(self, "_fixed_codec_ring_enabled", False):
+                    codes = self._codec_ring_history(request_id, codes)
+                else:
+                    codes = torch.cat(
+                        [codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)]
+                    )
                 delta = sampled.reshape(1, 1)
             else:
                 delta = empty_delta
+            if defer_eos:
+                delta, is_eos = self._transport_codec_delta_with_deferred_eos(
+                    request_id,
+                    sampled,
+                    step=step,
+                    min_tokens=min_tokens,
+                    reached_limit=reached_limit,
+                )
+                finished = is_eos or reached_limit
+            else:
+                finished = is_eos or reached_limit
+                delta = self._transport_codec_delta(
+                    request_id,
+                    delta,
+                    finished=finished,
+                    native_duplex=native_duplex,
+                )
+            state["finished"] = finished
             state["codes"] = codes
             info["audio_state"] = state
             info["audio_codes"] = {
                 "current": sampled.reshape(1),
                 "accumulated": codes,
             }
+            self._record_codec_parity_step(
+                request_id,
+                sampled,
+                delta,
+                step=step,
+                min_tokens=min_tokens,
+                reached_limit=reached_limit,
+                finished=finished,
+            )
             codec_deltas.append(delta)
             terminal_flags.append(torch.tensor(finished, dtype=torch.bool))
-            stop_rows.append(hidden.new_tensor([float("-inf"), 0.0] if finished else [0.0, float("-inf")]))
+            append_stop_control(finished)
 
-        self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
+        self._batch_stop_token_ids = None
+        if self.direct_stop_sampler and finished_rows:
+            logits_constants = self._stop_logits_constants
+            token_constants = self._stop_token_constants
+            if (
+                logits_constants is None
+                or logits_constants[0].device != hidden.device
+                or logits_constants[0].dtype != hidden.dtype
+                or token_constants is None
+                or token_constants[0].device != hidden.device
+            ):
+                logits_rows = hidden.new_tensor(
+                    [[0.0, float("-inf")], [float("-inf"), 0.0]],
+                )
+                token_rows = hidden.new_tensor([[0], [1]], dtype=torch.int32)
+                logits_constants = (logits_rows[0:1], logits_rows[1:2])
+                token_constants = (token_rows[0:1], token_rows[1:2])
+                self._stop_logits_constants = logits_constants
+                self._stop_token_constants = token_constants
+            if len(finished_rows) == 1:
+                # The competition profile is max_num_seqs=1. Returning an
+                # immutable pair of resident views makes compute_logits and
+                # sample allocation- and kernel-free after their first use.
+                stop_index = int(finished_rows[0])
+                self._batch_stop_logits = logits_constants[stop_index]
+                self._batch_stop_token_ids = token_constants[stop_index]
+            else:
+                self._batch_stop_logits = hidden.new_tensor(
+                    [
+                        [float("-inf"), 0.0] if stop else [0.0, float("-inf")]
+                        for stop in finished_rows
+                    ]
+                )
+                self._batch_stop_token_ids = hidden.new_tensor(
+                    finished_rows,
+                    dtype=torch.int32,
+                ).reshape(-1, 1)
+        else:
+            self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
         meta_outputs = {"finished": terminal_flags}
@@ -563,19 +2095,263 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "codes": {"audio": codec_deltas},
             "meta": meta_outputs,
         }
+        if getattr(self, "batched_codec_output", False):
+            emit_indices = [
+                index
+                for index, delta in enumerate(codec_deltas)
+                if delta.numel() or finished_rows[index]
+            ]
+            multimodal_outputs["codes"]["audio"] = [
+                codec_deltas[index] for index in emit_indices
+            ]
+            sparse_meta = {
+                key: [values[index] for index in emit_indices]
+                for key, values in meta_outputs.items()
+            }
+            sparse_meta["req_id"] = [output_request_ids[index] for index in emit_indices]
+            sparse_meta["sparse_audio"] = ["1"]
+            multimodal_outputs["meta"] = sparse_meta
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=multimodal_outputs,
         )
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for request_id in finished_req_ids:
+            try:
+                self._export_codec_parity_trace(str(request_id))
+            except Exception:
+                logger.exception(
+                    "MiniCPM-o codec parity trace export failed for request %s",
+                    request_id,
+                )
         self._deferred_cleanup_ids.update(str(req_id) for req_id in finished_req_ids)
+        self._export_static_w8a8_calibration()
+
+    def _record_codec_parity_step(
+        self,
+        request_id: str,
+        sampled: torch.Tensor,
+        published: torch.Tensor,
+        *,
+        step: int,
+        min_tokens: int,
+        reached_limit: bool,
+        finished: bool,
+    ) -> None:
+        """Retain a complete device-side codec audit when explicitly enabled.
+
+        The production path pays no tensor clone or scalar synchronization.
+        Diagnostic runs keep samples on the device and perform one host copy
+        only after request completion.  No prompt or reference audio is
+        recorded.
+        """
+        if not getattr(self, "_codec_parity_trace_path", None):
+            return
+        traces = getattr(self, "_request_codec_parity", None)
+        if traces is None:
+            traces = {}
+            self._request_codec_parity = traces
+        trace = traces.setdefault(
+            request_id,
+            {
+                "samples": [],
+                "published": [],
+                "candidate_ids": [],
+                "probabilities": [],
+                "candidate_ids_after": [],
+                "probabilities_after": [],
+                "distribution_samples": [],
+                "distribution_steps": [],
+                "steps": [],
+            },
+        )
+        trace["samples"].append(sampled.detach().reshape(1).clone())
+        if published.numel():
+            trace["published"].append(published.detach().reshape(-1).clone())
+        pending_traces = getattr(self, "_request_codec_parity_pending", None)
+        pending = (
+            pending_traces.pop(request_id, None)
+            if isinstance(pending_traces, dict)
+            else None
+        )
+        if isinstance(pending, dict) and int(pending.get("step", -1)) == int(step):
+            trace["candidate_ids"].append(pending["candidate_ids_before"])
+            trace["probabilities"].append(pending["probabilities_before"])
+            trace["candidate_ids_after"].append(pending["candidate_ids_after"])
+            trace["probabilities_after"].append(pending["probabilities_after"])
+            trace["distribution_samples"].append(pending["sampled"])
+            trace["distribution_steps"].append(int(pending["step"]))
+        trace["steps"].append(
+            {
+                "step": int(step),
+                "min_tokens": int(min_tokens),
+                "reached_limit": bool(reached_limit),
+                "finished": bool(finished),
+            }
+        )
+
+    def _stage_codec_parity_distribution(
+        self,
+        request_id: str,
+        *,
+        step: int,
+        sampled: torch.Tensor,
+        candidate_ids_before: torch.Tensor | None,
+        probabilities_before: torch.Tensor | None,
+        candidate_ids_after: torch.Tensor,
+        probabilities_after: torch.Tensor,
+    ) -> None:
+        """Bind distribution snapshots to the sample that consumed them.
+
+        This hook executes immediately around multinomial. Keeping both sides
+        exposes an asynchronously overwritten graph-output buffer: a later
+        make_omni_output hook cannot reliably reconstruct that association.
+        """
+        if (
+            not getattr(self, "_codec_parity_trace_path", None)
+            or candidate_ids_before is None
+            or probabilities_before is None
+        ):
+            return
+        pending = getattr(self, "_request_codec_parity_pending", None)
+        if pending is None:
+            pending = {}
+            self._request_codec_parity_pending = pending
+        pending[request_id] = {
+            "step": int(step),
+            "sampled": sampled.detach().reshape(1).clone(),
+            "candidate_ids_before": candidate_ids_before.detach().reshape(-1),
+            "probabilities_before": probabilities_before.detach().reshape(-1),
+            "candidate_ids_after": candidate_ids_after.detach().reshape(-1).clone(),
+            "probabilities_after": probabilities_after.detach().reshape(-1).clone(),
+        }
+        if (
+            sampled.device.type == "npu"
+            and _env_enabled(_CODEC_PARITY_SYNC_ENV, default=False)
+        ):
+            # Complete the diagnostic copies before another scheduler stream
+            # can reuse graph/sample storage. Together with the pre-sampling
+            # fence this brackets the exact distribution-to-token operation.
+            torch.npu.synchronize()
+
+    def _export_codec_parity_trace(self, request_id: str) -> None:
+        path = getattr(self, "_codec_parity_trace_path", None)
+        traces = getattr(self, "_request_codec_parity", None)
+        if not path or not isinstance(traces, dict):
+            return
+        trace = traces.pop(request_id, None)
+        if not isinstance(trace, dict):
+            return
+
+        samples_tensors = trace.get("samples") or []
+        published_tensors = trace.get("published") or []
+        samples = (
+            torch.cat(samples_tensors).to(device="cpu", dtype=torch.long).tolist()
+            if samples_tensors
+            else []
+        )
+        published = (
+            torch.cat(published_tensors).to(device="cpu", dtype=torch.long).tolist()
+            if published_tensors
+            else []
+        )
+        candidate_tensors = trace.get("candidate_ids") or []
+        probability_tensors = trace.get("probabilities") or []
+        candidate_after_tensors = trace.get("candidate_ids_after") or []
+        probability_after_tensors = trace.get("probabilities_after") or []
+        distribution_sample_tensors = trace.get("distribution_samples") or []
+        distribution_steps = trace.get("distribution_steps") or []
+        candidate_ids = (
+            torch.stack(candidate_tensors).to(device="cpu", dtype=torch.long).tolist()
+            if candidate_tensors
+            else []
+        )
+        probabilities = (
+            torch.stack(probability_tensors).to(device="cpu", dtype=torch.float32).tolist()
+            if probability_tensors
+            else []
+        )
+        candidate_ids_after = (
+            torch.stack(candidate_after_tensors)
+            .to(device="cpu", dtype=torch.long)
+            .tolist()
+            if candidate_after_tensors
+            else []
+        )
+        probabilities_after = (
+            torch.stack(probability_after_tensors)
+            .to(device="cpu", dtype=torch.float32)
+            .tolist()
+            if probability_after_tensors
+            else []
+        )
+        distribution_samples = (
+            torch.cat(distribution_sample_tensors)
+            .to(device="cpu", dtype=torch.long)
+            .tolist()
+            if distribution_sample_tensors
+            else []
+        )
+        generator = self._request_generators.get(request_id)
+        rng_digest = None
+        if generator is not None:
+            rng_state = generator.get_state().to(device="cpu").contiguous()
+            rng_digest = hashlib.sha256(rng_state.numpy().tobytes()).hexdigest()
+        steps = trace.get("steps") or []
+        payload = {
+            "format": "minicpmo45-codec-parity-v2",
+            "request_sha256": hashlib.sha256(request_id.encode("utf-8")).hexdigest(),
+            "seed": int(self._codec_seed),
+            "eos_id": int(self._num_audio_tokens - 1),
+            "sample_count": len(samples),
+            "published_count": len(published),
+            "samples": samples,
+            "published": published,
+            "candidate_ids": candidate_ids,
+            "probabilities": probabilities,
+            "candidate_ids_after": candidate_ids_after,
+            "probabilities_after": probabilities_after,
+            "distribution_samples": distribution_samples,
+            "distribution_steps": distribution_steps,
+            "steps": steps,
+            "final_rng_sha256": rng_digest,
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+
+    def _export_static_w8a8_calibration(self) -> None:
+        path = self._static_w8a8_calibration_path
+        collectors = self._static_w8a8_collectors
+        if not path or not collectors:
+            return
+        payload = {
+            "format": "minicpmo45-talker-static-w8a8-v1",
+            "targets": {
+                name: float(absmax.item())
+                for name, absmax in sorted(collectors.items())
+            },
+        }
+        temporary_path = f"{path}.tmp.{os.getpid()}"
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary_path, path)
 
     def _flush_deferred_cleanup(self) -> None:
         request_audio_states = getattr(self, "_request_audio_states", {})
+        transport_codes = getattr(self, "_request_transport_codes", {})
+        transport_chunks = getattr(self, "_request_transport_chunks", {})
         for request_id in self._deferred_cleanup_ids:
             self._request_generators.pop(request_id, None)
             request_audio_states.pop(request_id, None)
+            self._request_repetition_frequencies.pop(request_id, None)
+            self._request_codec_rings.pop(request_id, None)
+            if self._graph_codec_state_request_id == request_id:
+                self._graph_codec_state_request_id = None
+            transport_codes.pop(request_id, None)
+            transport_chunks.pop(request_id, None)
         self._deferred_cleanup_ids.clear()
 
     def _dummy_hidden_states(
@@ -613,12 +2389,63 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._flush_deferred_cleanup()
         if input_ids is None and inputs_embeds is None:
             return self._dummy_hidden_states(input_ids, positions, inputs_embeds)
-        return self.tts_model(
+        hidden_states = self.tts_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+        if (
+            getattr(self, "_fused_codec_sampler_enabled", False)
+            and hidden_states.shape[0] == 1
+        ):
+            sampled, next_frequencies = _graphable_codec_sample(
+                hidden_states[-1:],
+                self._fused_codec_frequencies,
+                self.head_code[0].weight,
+                self._fused_codec_penalty,
+                self._fused_codec_uniform,
+                self._fused_codec_mask_eos,
+                self._fused_codec_expired,
+                self._codec_vocab_ids,
+                temperature=self._codec_temperature,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                eos_id=self._num_audio_tokens - 1,
+            )
+            # These fixed-address stores are observable outputs of the outer
+            # graph. They let post-forward Python consume the draw without a
+            # second ACL graph launch or per-token output clone.
+            self._fused_codec_sampled.copy_(sampled)
+            self._fused_codec_next_frequencies.copy_(next_frequencies)
+        elif (
+            getattr(self, "_fused_codec_distribution_enabled", False)
+            and not getattr(self, "_fused_codec_distribution_disabled", False)
+            and hidden_states.shape[0] == 1
+        ):
+            if getattr(self, "_graph_codec_state_enabled", False):
+                next_frequencies, next_history = _graphable_advance_codec_state(
+                    self._fused_codec_frequencies,
+                    self._fused_codec_history_slab,
+                    self._fused_codec_pending_sample,
+                    self._codec_vocab_ids,
+                )
+                self._fused_codec_frequencies.copy_(next_frequencies)
+                self._fused_codec_history_slab.copy_(next_history)
+            probabilities, candidate_ids = _graphable_codec_distribution(
+                hidden_states[-1:],
+                self._fused_codec_frequencies,
+                self.head_code[0].weight,
+                self._fused_codec_penalty,
+                self._fused_codec_mask_eos,
+                temperature=self._codec_temperature,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                eos_id=self._num_audio_tokens - 1,
+            )
+            self._fused_codec_probabilities.copy_(probabilities)
+            self._fused_codec_candidate_ids.copy_(candidate_ids)
+        return hidden_states
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         if not isinstance(hidden_states, torch.Tensor):
@@ -635,6 +2462,19 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return logits
 
     def sample(self, logits, sampling_metadata):
+        stop_token_ids = self._batch_stop_token_ids
+        self._batch_stop_token_ids = None
+        if (
+            self.direct_stop_sampler
+            and stop_token_ids is not None
+            and stop_token_ids.shape[0] == logits.shape[0]
+            and getattr(sampling_metadata, "max_num_logprobs", None) is None
+            and not getattr(sampling_metadata, "logprob_token_ids", None)
+        ):
+            return SamplerOutput(
+                sampled_token_ids=stop_token_ids,
+                logprobs_tensors=None,
+            )
         return Sampler()(logits, sampling_metadata)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -669,6 +2509,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         for name in self.tts_model.load_weights(backbone_weights):
             loaded.add(f"tts_model.{name}")
 
+        calibration_path = os.environ.get(
+            _NPU_TALKER_STATIC_W8A8_CALIBRATION_ENV,
+            "",
+        ).strip()
+        static_targets = os.environ.get(
+            _NPU_TALKER_STATIC_W8A8_TARGETS_ENV,
+            "gate_up",
+        )
+        if calibration_path:
+            self._static_w8a8_calibration_path = calibration_path
+            self._static_w8a8_collectors = _prepare_talker_static_w8a8_calibration(
+                self.tts_model,
+                static_targets,
+            )
+            logger.info(
+                "MiniCPM-o Talker static W8A8 calibration active: "
+                "%d projections -> %s",
+                len(self._static_w8a8_collectors),
+                calibration_path,
+            )
         if head_g is None or head_v is None:
             raise ValueError("MiniCPM-o checkpoint is missing weight-norm Talker head parameters")
         restored = _restore_weight_norm_weight(head_g, head_v)

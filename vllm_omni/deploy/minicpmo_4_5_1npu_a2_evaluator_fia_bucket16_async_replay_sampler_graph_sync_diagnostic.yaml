@@ -1,0 +1,13 @@
+# Diagnostic for the rejected inverse-CDF Talker sampler graph.  It adds a
+# device-wide completion fence after every sampler replay to determine whether
+# request sample/frequency state was consumed on another stream before replay
+# completed.  Never use this profile for a performance claim or submission.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_sampler_graph_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_SYNC: "1"

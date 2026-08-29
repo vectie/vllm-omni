@@ -14,7 +14,7 @@ import torch_npu  # noqa: F401
 
 HIDDEN = 768
 VOCAB = 6562
-TOP_K = 100
+TOP_K = 25
 TOP_P = 0.85
 TEMPERATURE = 0.8
 PENALTY = 1.05
@@ -30,6 +30,8 @@ def sample_step(
     penalty: torch.Tensor,
     vocab_ids: torch.Tensor,
     frequency_output: torch.Tensor,
+    *,
+    exponential_race: bool = False,
 ) -> torch.Tensor:
     logits = F.linear(hidden, weight).float() / TEMPERATURE
     alpha = torch.pow(penalty, frequencies)
@@ -55,8 +57,11 @@ def sample_step(
     remove[..., -3:] = False
     candidates = candidates.masked_fill(remove, float("-inf"))
     probabilities = torch.softmax(candidates, dim=-1)
-    sampled_position = torch.sum(probabilities.cumsum(dim=-1) < uniform, dim=-1, keepdim=True)
-    sampled_position = sampled_position.clamp_max_(TOP_K - 1)
+    if exponential_race:
+        sampled_position = (probabilities / uniform).argmax(dim=-1, keepdim=True)
+    else:
+        sampled_position = torch.sum(probabilities.cumsum(dim=-1) < uniform, dim=-1, keepdim=True)
+        sampled_position = sampled_position.clamp_max_(TOP_K - 1)
     sampled = candidate_ids.gather(-1, sampled_position)
 
     next_frequencies = frequencies + (vocab_ids == sampled).to(frequencies.dtype)
@@ -127,10 +132,12 @@ def main() -> None:
     exact_only = os.environ.get("BENCH_EXACT_ONLY", "0") == "1"
     nd_boundary = os.environ.get("BENCH_ND_BOUNDARY", "0") == "1"
     two_graphs = os.environ.get("BENCH_TWO_GRAPHS", "0") == "1"
+    exponential_race = os.environ.get("BENCH_EXPONENTIAL_RACE", "0") == "1"
     torch.npu.config.allow_internal_format = allow_internal_format
     print(
         f"allow_internal_format={allow_internal_format} "
-        f"exact_only={exact_only} nd_boundary={nd_boundary} two_graphs={two_graphs}"
+        f"exact_only={exact_only} nd_boundary={nd_boundary} two_graphs={two_graphs} "
+        f"exponential_race={exponential_race}"
     )
     torch.manual_seed(7)
     device = torch.device(os.environ.get("BENCH_DEVICE", "npu"))
@@ -138,7 +145,12 @@ def main() -> None:
     weight = torch.randn((VOCAB, HIDDEN), device=device, dtype=torch.bfloat16) * 0.02
     freq0 = torch.zeros((1, VOCAB), device=device, dtype=torch.float32)
     freq1 = torch.zeros_like(freq0)
-    uniform = torch.full((1, 1), 0.37, device=device, dtype=torch.float32)
+    uniform = torch.full(
+        (1, TOP_K if exponential_race else 1),
+        0.37,
+        device=device,
+        dtype=torch.float32,
+    )
     expired = torch.full((1, 1), -1, device=device, dtype=torch.long)
     allow_eos = torch.zeros((1,), device=device, dtype=torch.bool)
     penalty = torch.full((1,), PENALTY, device=device, dtype=torch.float32)
@@ -147,7 +159,8 @@ def main() -> None:
     if not exact_only:
         probabilities = torch.softmax(torch.randn((1, TOP_K), device=device), dim=-1)
         parity = 0
-        for seed in range(100):
+        state_parity = 0
+        for seed in range(1000):
             multinomial_generator = torch.Generator(device=device).manual_seed(seed)
             exponential_generator = torch.Generator(device=device).manual_seed(seed)
             expected = torch.multinomial(
@@ -161,7 +174,14 @@ def main() -> None:
             )
             actual = torch.argmax(probabilities / noise, dim=-1, keepdim=True)
             parity += int(torch.equal(expected, actual))
-        print(f"multinomial_exponential_seed_parity={parity}/100")
+            state_parity += int(
+                torch.equal(
+                    multinomial_generator.get_state(),
+                    exponential_generator.get_state(),
+                )
+            )
+        print(f"multinomial_exponential_seed_parity={parity}/1000")
+        print(f"multinomial_exponential_rng_state_parity={state_parity}/1000")
 
         for _ in range(5):
             sample_step(
@@ -174,6 +194,7 @@ def main() -> None:
                 penalty,
                 vocab_ids,
                 freq1,
+                exponential_race=exponential_race,
             )
         torch.npu.synchronize()
         eager = event_us(
@@ -187,6 +208,7 @@ def main() -> None:
                 penalty,
                 vocab_ids,
                 freq1,
+                exponential_race=exponential_race,
             )
         )
         graph = torch.npu.NPUGraph()
@@ -202,6 +224,7 @@ def main() -> None:
                 penalty,
                 vocab_ids,
                 freq1,
+                exponential_race=exponential_race,
             )
         graph.replay()
         torch.npu.synchronize()
@@ -210,7 +233,10 @@ def main() -> None:
         graph_rng = torch.Generator(device=device).manual_seed(42)
 
         def stochastic_graph_step() -> None:
-            uniform.uniform_(0.0, 1.0, generator=graph_rng)
+            if exponential_race:
+                uniform.exponential_(1.0, generator=graph_rng)
+            else:
+                uniform.uniform_(0.0, 1.0, generator=graph_rng)
             graph.replay()
 
         stochastic_replay = event_us(stochastic_graph_step)
@@ -233,7 +259,7 @@ def main() -> None:
         )
         print(f"speedup={statistics.mean(eager) / statistics.mean(replay):.4f}x")
         print(
-            "graph_with_uniform_rng_us "
+            f"graph_with_{'exponential_race' if exponential_race else 'uniform'}_rng_us "
             f"mean={statistics.mean(stochastic_replay):.3f} "
             f"median={statistics.median(stochastic_replay):.3f}"
         )

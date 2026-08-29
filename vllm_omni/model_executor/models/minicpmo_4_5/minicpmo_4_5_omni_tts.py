@@ -49,6 +49,7 @@ _CODEC_MIN_TOKENS = 50
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 _NPU_BOUNDED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_BOUNDED_CODEC_SAMPLER"
 _NPU_CODEC_SAMPLER_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"
+_NPU_CODEC_SAMPLER_SYNC_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_SYNC"
 _NPU_FUSED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_SAMPLER"
 _NPU_BATCHED_CODEC_OUTPUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
 _NPU_DEFERRED_CHUNK_EOS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"
@@ -876,6 +877,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             sampled = graph_entry["sampled"]
             sampled.copy_(graph_sampled)
             frequencies.copy_(next_frequencies)
+            if _env_enabled(_NPU_CODEC_SAMPLER_SYNC_ENV, default=False):
+                # Diagnostic only: establish whether the sampler graph's
+                # request-owned sample/frequency state crosses execution
+                # streams without a completion dependency.  A successful
+                # accuracy screen must replace this device-wide fence with a
+                # narrow event handoff before performance promotion.
+                torch.npu.synchronize()
             if not graph_entry["runtime_validated"]:
                 valid_sample = bool(
                     ((sampled >= 0) & (sampled < self._num_audio_tokens)).all().item()

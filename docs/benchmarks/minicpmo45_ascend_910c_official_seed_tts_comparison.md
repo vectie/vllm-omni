@@ -7713,3 +7713,62 @@ a13e96ee73dd2d0680c083d000f4203d759a455ba108003396d58b83ec43ad54  inverse-cdf-zh
 /tmp/lunanexa-bench/resident-control-v24-quality-zh32-local/
 /tmp/lunanexa-bench/inverse-cdf-v26-quality-zh32-local/
 ```
+
+## 2026-08-29 leaderboard refresh and next primary target
+
+The public vLLM-Omni leaderboard reported an update time of
+`2026-08-29 00:16:25`.  The retained submission was ninth:
+
+| Rank | Team | RTF | TTFP | TTFT |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | 李炎彬 / UCAS | 0.1066 | 568.96 ms | 49.20 ms |
+| 2 | grounds / USTC | 0.1258 | 266.07 ms | 108.44 ms |
+| 3 | 田峻钢 | 0.1274 | 678.33 ms | 46.66 ms |
+| 4 | LinguistWantsTech | 0.1398 | 207.62 ms | 47.30 ms |
+| 5 | 榴莲大王 | 0.1546 | 237.11 ms | 43.11 ms |
+| 6 | KuaaMU | 0.1572 | 240.69 ms | 122.85 ms |
+| 7 | 味蕾 | 0.1856 | 156.03 ms | 6.37 ms |
+| 8 | 奶龙必胜 | 0.2191 | 371.90 ms | 160.20 ms |
+| 9 | 向量贴贴 | 0.2423 | 514.22 ms | 45.72 ms |
+| 10 | deltax | 0.2502 | 582.05 ms | 60.66 ms |
+
+RTF remains the ranking axis.  Matching rank one requires a 56.00% reduction
+from 0.2423; matching rank five requires 36.19%; matching rank seven requires
+23.40%.  TTFT is already competitive, so more Stage-0 work is not the primary
+score target.  The latest safe local resident-scalar result has not yet been
+reflected in the public score and measured mean chunk RTF 0.179135, but local
+and evaluator protocols are not interchangeable.
+
+The last valid Stage-1 trace showed that the Talker is launch-bound and that
+the remaining exact eager head/filter/multinomial tail is repeated for every
+codec token.  The safe path already reduces the multinomial domain from 6,562
+to the checkpoint's top-k of 25.  Therefore repeating the earlier full-vocab
+exponential-race rejection would be the wrong experiment.
+
+The first new screen combined that 25-value bounded distribution with an
+exponential-race random input.  On desktop PyTorch 2.12.1 CPU, both sampled
+token and generator state matched `torch.multinomial` for all 3,000 tested
+shape/seed pairs.  That assumption did not hold on the actual A2 stack:
+
+| A2 parity screen (`[1, 25]`, FP32) | Result | Gate |
+| --- | ---: | --- |
+| torch / torch_npu | 2.10.0 / 2.10.0 | recorded |
+| Sampled-code parity | 106 / 1,000 | fail |
+| Generator-state parity | 1,000 / 1,000 | pass |
+
+Ascend's `MultinomialWithReplacement` therefore advances the generator by the
+same amount but does not implement the PyTorch exponential-race token mapping.
+The candidate failed before performance measurement, exactly as required by
+the fail-fast gate.  Its runtime path and deploy YAML were removed; the safe
+default is unchanged.  The NPU benchmark now uses the live top-k of 25 and
+reports both token and generator-state parity so this result is reproducible.
+
+This removes sampler-algorithm substitution from the near-term plan.  The
+primary target is now a graph-visible multi-code/device-loop Talker executable:
+the trace's roughly 83.5% device-idle fraction cannot be removed by another
+isolated microkernel.  A useful prototype must keep the native multinomial
+boundary or prove the complete accuracy gate, advance fixed-address KV and
+metadata state on device, and amortize one host replay across multiple codec
+steps.  Stage-1/Stage-2 overlap remains the second target, but it must first be
+quantified with a two-process NPU timeline because both stages contend for the
+same single-chip Cube/Vector resources.

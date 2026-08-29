@@ -148,6 +148,21 @@ def test_a2_evaluator_graph_codec_state_candidate_is_talker_only():
     assert "VLLM_OMNI_MINICPMO45_NPU_GRAPH_CODEC_STATE" not in (stage2.env or {})
 
 
+def test_a2_graph_codec_state_hf32_candidate_is_single_variable():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_graph_codec_state_hf32_experimental.yaml"
+    )
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_DISTRIBUTION"] == "1"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_GRAPH_CODEC_STATE"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_MATMUL_HF32"] == "1"
+    assert "VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH" not in stage2.env
+    assert "VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_BF16_FFN" not in stage2.env
+    assert "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS" not in stage2.env
+
+
 def test_a2_evaluator_sampler_sync_diagnostic_is_explicitly_talker_only():
     deploy = _load_profile(
         "minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_sampler_graph_sync_diagnostic.yaml"

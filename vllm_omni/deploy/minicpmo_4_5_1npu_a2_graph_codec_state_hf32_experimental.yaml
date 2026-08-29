@@ -1,0 +1,13 @@
+# Single-variable A2 score candidate: keep the qualified one-step CFM policy
+# and graph-owned Talker repetition state, then allow Stage-2 FP32 MatMul to
+# use the Ascend Cube HF32 execution mode.  No CFM graph or BF16 experimental
+# path is enabled here; those paths cannot capture the current ACLop Conv2D.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_graph_codec_state_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_MATMUL_HF32: "1"

@@ -8076,3 +8076,55 @@ effective inherited policy and whole-request contention.
 /tmp/lunanexa-bench/cfm3-graph-state-priority-v65-repeat-zh8/
 /tmp/lunanexa-bench/cfm3-graph-state-clean-v68-repeat-zh8/
 ```
+
+### CFM1 graph composition and isolated HF32 screen
+
+A follow-up candidate preserved source-default CFM1 and combined the accepted
+graph-owned Talker state with the legacy Stage-2 CFM graph, graph cache, BF16
+FFN, HF32 MatMul and prompt-state switches. Runtime evidence showed that this
+was not a valid graph composition: BF16 FFN disabled itself because the model
+did not satisfy its BF16/channel-major preconditions, and CFM capture failed
+during warmup because the current causal convolution still reached the ACLop
+`Conv2D` implementation, which cannot execute during NPU graph capture. The
+first warmup consequently took about 68 seconds. The fully warm 8-request run
+did improve the immediately adjacent control on the identical 940,800-frame /
+39.20-second output signature, but the only newly active numeric variable was
+HF32 MatMul:
+
+| Metric | Safe graph-state control | Mixed candidate | Change |
+| --- | ---: | ---: | ---: |
+| Duration | 6.8860 s | 6.7600 s | -1.83% |
+| Audio throughput | 5.6927x | 5.7988x | +1.86% |
+| Mean TTFT | 87.01 ms | 82.23 ms | -5.49% |
+| Mean TTFP | 451.71 ms | 447.47 ms | -0.94% |
+| Mean chunk RTF | 0.162626 | 0.159423 | -1.97% |
+| Median chunk RTF | 0.125377 | 0.117793 | -6.05% |
+| P99 chunk RTF | 0.273865 | 0.271914 | -0.71% |
+| Mean E2E | 860.25 ms | 844.46 ms | -1.84% |
+
+The mixed profile was removed rather than retaining two disabled or failed
+features. HF32 was then isolated in
+`minicpmo_4_5_1npu_a2_graph_codec_state_hf32_experimental.yaml`. Logs proved
+that this profile enabled only Stage-2 HF32 MatMul and did not attempt a CFM
+graph. Its two hot 8-request repeats averaged mean chunk RTF `0.157576`,
+median chunk RTF `0.119796`, P99 chunk RTF `0.270899`, TTFT `86.32 ms`, TTFP
+`452.54 ms`, and E2E `841.30 ms`. Relative to the adjacent control this is a
+3.10% mean-RTF improvement, but TTFP is neutral/slightly worse (+0.18%). The
+two repeats also generated 938,880 and 935,040 frames rather than the
+control's 940,800, so their shorter wall time is not a strict output-matched
+speed proof. HF32 therefore remains an explicit quality-gated experiment and
+does not replace the accepted graph-state profile. The failed CFM graph and
+BF16 flags are not carried by that profile.
+
+This screen narrows the next major change further: the current CFM1 path is
+already too small for another collection of Stage-2 flags to close the public
+TTFP gap. The remaining high-leverage work is the scheduler-managed Talker
+multi-code command described above, using preallocated KV/slot slabs and a
+device-side sampled-token advance between dependent full-model replays.
+
+```text
+/tmp/lunanexa-bench/cfm1-graph-codec-state-v70-zh8/
+/tmp/lunanexa-bench/graph-codec-state-v71-control-zh8/
+/tmp/lunanexa-bench/graph-codec-state-hf32-v72-zh8/
+/tmp/lunanexa-bench/graph-codec-state-hf32-v72-repeat2-zh8/
+```

@@ -7772,3 +7772,47 @@ metadata state on device, and amortize one host replay across multiple codec
 steps.  Stage-1/Stage-2 overlap remains the second target, but it must first be
 quantified with a two-process NPU timeline because both stages contend for the
 same single-chip Cube/Vector resources.
+
+### Follow-up: sampler math is exact; service state ordering is the suspect
+
+The initial exponential-race failure still revealed that native multinomial
+and a same-shaped random operation advance the NPU generator identically.
+Additional A2 screens then recovered the actual one-sample mapping:
+
+- CDF with the first value of a `[1, 25]` uniform slab matched native
+  multinomial for 300/300 independently seeded draws.
+- Both `[1, 25]`-slab and `[1, 1]`-scalar uniform CDF matched token and RNG
+  state for 1,000/1,000 independently seeded draws.
+- More importantly, both paths matched 1,000/1,000 draws while continuously
+  advancing one request generator from seed 42, with no state mismatch.
+
+The bounded helper was then captured alone in NPUGraph and compared with its
+eager form for 300 synthetic BF16-derived logit rows. Candidate IDs were
+300/300 identical, probabilities were bitwise identical with maximum error
+zero, sampled codes were 300/300 identical, and generator state matched.
+Plain eager and graph `topk` also returned identical IDs for 300/300 rows.
+
+These results overturn the narrower RNG hypothesis: inverse-CDF and bounded
+sampler math are exact relative to the current eager bounded path.  The
+remaining service-only difference is the asynchronous lifetime of sampled-code
+and rolling-frequency outputs across autoregressive steps.  A diagnostic
+profile now places a device-wide fence after replay and state copies:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_sampler_graph_sync_diagnostic.yaml
+```
+
+It is not a performance candidate.  If it restores paired codec/audio hashes,
+the fence will be replaced with a narrow recorded-event/current-stream wait.
+If hashes still differ, stream ordering is rejected and the investigation
+moves to full service state capture.  The profile cannot run concurrently with
+the resident safe service: that service currently consumes 27,735 MiB of the
+32-GiB A2, so the diagnostic requires an explicitly approved short restart.
+
+A separate synthetic comparison found only 174/300 finite-mask parity and
+43/300 sampled-code parity between the original full-vocabulary warper and the
+bounded helper.  This is primarily a BF16 top-k boundary-tie concern and does
+not explain bounded-eager versus bounded-graph divergence.  It does mean the
+bounded optimization must retain its own official quality evidence; it must
+not be described as unconditionally bitwise-equivalent to the original full
+sort.

@@ -1,0 +1,15 @@
+# A2 score candidate that folds the codec head, repetition penalty,
+# top-k/top-p and softmax into the existing Talker FULL_DECODE graph while
+# retaining native torch.multinomial outside the graph. This preserves the
+# checkpoint's request-local generator and seed-to-code mapping. Runtime gates
+# compare graph-owned and eager distributions at the initial, rolling-window
+# and EOS-mask transitions and fail closed on any mismatch.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_DISTRIBUTION: "1"

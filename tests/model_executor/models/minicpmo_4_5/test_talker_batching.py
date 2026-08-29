@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _apply_top_k_top_p,
     _bounded_codec_distribution,
     _bounded_top_k_top_p_candidates,
+    _graphable_codec_distribution,
     _graphable_codec_sample,
     _load_talker_static_w8a8_scales,
     _max_audio_tokens,
@@ -98,6 +99,9 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._codec_min_tokens = 50
     talker._codec_seed = 42
     talker._fused_codec_sampler_enabled = False
+    talker._fused_codec_distribution_enabled = False
+    talker._fused_codec_distribution_disabled = False
+    talker._fused_codec_distribution_validated_steps = set()
     talker._fused_codec_sampler_prepared = False
     talker._fused_codec_sampler_request_id = None
     return talker
@@ -195,6 +199,134 @@ def test_fused_codec_sampler_does_not_stage_final_prefill_chunk() -> None:
     assert prepared is False
     assert talker._fused_codec_sampler_prepared is False
     assert talker._request_generators == {}
+
+
+def test_fused_codec_distribution_staging_does_not_advance_rng() -> None:
+    talker = _make_talker()
+    talker._fused_codec_distribution_enabled = True
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_uniform = torch.full((1, 1), 0.5)
+    talker._fused_codec_mask_eos = torch.ones(1, dtype=torch.bool)
+    talker._fused_codec_expired = torch.full((1, 1), -1, dtype=torch.long)
+    talker._request_audio_states["req-distribution"] = {
+        "codes": torch.tensor([1, 2]),
+        "step": 2,
+        "min_tokens": 5,
+    }
+
+    assert talker.prepare_fused_codec_sampler_inputs(
+        model_intermediate_buffer=[{"request_id": "req-distribution"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+    )
+
+    assert talker._request_generators == {}
+    assert talker._fused_codec_mask_eos.item() is True
+
+
+def test_fused_codec_distribution_keeps_native_multinomial_mapping() -> None:
+    talker = _make_talker()
+    talker._codec_temperature = 0.8
+    talker._codec_top_k = 5
+    talker._codec_top_p = 0.85
+    talker._codec_repetition_penalty = 1.05
+    talker._fused_codec_distribution_enabled = True
+    talker._fused_codec_sampler_prepared = True
+    talker._fused_codec_sampler_request_id = "req-distribution"
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_penalty = torch.tensor([1.05])
+    talker.head_code = nn.ModuleList([nn.Linear(4, 8, bias=False)])
+    hidden = torch.tensor([[0.5, -0.25, 0.75, 1.0]])
+    history = torch.empty(0, dtype=torch.long)
+    state = {"step": 0, "min_tokens": 2, "max_tokens": 64}
+    talker._request_audio_states["req-distribution"] = state
+    probabilities, candidate_ids = _bounded_codec_distribution(
+        hidden,
+        talker._fused_codec_frequencies,
+        talker.head_code[0].weight,
+        talker._fused_codec_penalty,
+        temperature=0.8,
+        top_k=5,
+        top_p=0.85,
+        eos_id=7,
+        mask_eos=True,
+    )
+    talker._fused_codec_probabilities = probabilities.clone()
+    talker._fused_codec_candidate_ids = candidate_ids.clone()
+
+    reference_generator = torch.Generator().manual_seed(42)
+    expected_position = torch.multinomial(
+        probabilities,
+        num_samples=1,
+        generator=reference_generator,
+    )
+    expected = candidate_ids.gather(-1, expected_position).reshape(())
+
+    sampled = talker._consume_fused_codec_distribution(
+        hidden,
+        history,
+        "req-distribution",
+        0,
+    )
+
+    assert torch.equal(sampled, expected)
+    assert talker._fused_codec_distribution_validated_steps == {0}
+    assert torch.equal(
+        talker._request_generators["req-distribution"].get_state(),
+        reference_generator.get_state(),
+    )
+    assert talker._request_repetition_frequencies["req-distribution"][0, int(expected)] == 1
+
+
+def test_fused_codec_distribution_fails_closed_on_stale_graph_output() -> None:
+    talker = _make_talker()
+    talker._codec_temperature = 0.8
+    talker._codec_top_k = 5
+    talker._codec_top_p = 0.85
+    talker._codec_repetition_penalty = 1.05
+    talker._fused_codec_distribution_enabled = True
+    talker._fused_codec_sampler_prepared = True
+    talker._fused_codec_sampler_request_id = "req-stale"
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_penalty = torch.tensor([1.05])
+    talker.head_code = nn.ModuleList([nn.Linear(4, 8, bias=False)])
+    hidden = torch.tensor([[0.5, -0.25, 0.75, 1.0]])
+    state = {"step": 0, "min_tokens": 2, "max_tokens": 64}
+    talker._request_audio_states["req-stale"] = state
+    eager_probabilities, eager_ids = _bounded_codec_distribution(
+        hidden,
+        talker._fused_codec_frequencies,
+        talker.head_code[0].weight,
+        talker._fused_codec_penalty,
+        temperature=0.8,
+        top_k=5,
+        top_p=0.85,
+        eos_id=7,
+        mask_eos=True,
+    )
+    talker._fused_codec_probabilities = torch.roll(eager_probabilities, 1, dims=-1)
+    talker._fused_codec_candidate_ids = eager_ids.clone()
+    reference_generator = torch.Generator().manual_seed(42)
+    expected_position = torch.multinomial(
+        eager_probabilities,
+        num_samples=1,
+        generator=reference_generator,
+    )
+    expected = eager_ids.gather(-1, expected_position).reshape(())
+
+    sampled = talker._consume_fused_codec_distribution(
+        hidden,
+        torch.empty(0, dtype=torch.long),
+        "req-stale",
+        0,
+    )
+
+    assert torch.equal(sampled, expected)
+    assert talker._fused_codec_distribution_disabled is True
+    assert torch.equal(
+        talker._request_generators["req-stale"].get_state(),
+        reference_generator.get_state(),
+    )
 
 
 def test_make_output_consumes_fused_codec_result_without_second_sampler(monkeypatch) -> None:
@@ -501,6 +633,20 @@ def test_graphable_codec_distribution_matches_eager_filter(mask_eos: bool) -> No
 
     assert torch.equal(candidate_ids, expected_ids)
     assert torch.equal(probabilities, expected_probabilities)
+
+    graphable_probabilities, graphable_ids = _graphable_codec_distribution(
+        hidden,
+        frequencies,
+        weight,
+        penalty,
+        torch.tensor([mask_eos]),
+        temperature=0.8,
+        top_k=25,
+        top_p=0.85,
+        eos_id=127,
+    )
+    assert torch.equal(graphable_ids, expected_ids)
+    assert torch.equal(graphable_probabilities, expected_probabilities)
 
 
 @pytest.mark.parametrize("mask_eos", [False, True])

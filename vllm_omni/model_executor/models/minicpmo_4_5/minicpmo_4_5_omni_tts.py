@@ -52,6 +52,9 @@ _NPU_CODEC_SAMPLER_GRAPH_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH"
 _NPU_CODEC_SAMPLER_SYNC_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_SYNC"
 _NPU_CODEC_SAMPLER_SHADOW_ENV = "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_SHADOW"
 _NPU_FUSED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_SAMPLER"
+_NPU_FUSED_CODEC_DISTRIBUTION_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_DISTRIBUTION"
+)
 _NPU_BATCHED_CODEC_OUTPUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
 _NPU_DEFERRED_CHUNK_EOS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"
 _DIRECT_STOP_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER"
@@ -337,6 +340,44 @@ def _graphable_codec_sample(
     return sampled, next_frequencies
 
 
+def _graphable_codec_distribution(
+    hidden_state: torch.Tensor,
+    frequencies: torch.Tensor,
+    weight: torch.Tensor,
+    penalty: torch.Tensor,
+    mask_eos: torch.Tensor,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float | None,
+    eos_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build graph-owned candidates while retaining native multinomial.
+
+    Unlike :func:`_graphable_codec_sample`, this helper does not substitute
+    inverse-CDF sampling.  The expensive codec head, repetition penalty and
+    bounded distribution stay inside the outer Talker graph, while the caller
+    consumes the resulting 25-way distribution with the checkpoint's native
+    ``torch.multinomial`` path and request-local generator.
+    """
+    logits = F.linear(hidden_state, weight).float() / temperature
+    alpha = torch.pow(penalty, frequencies)
+    logits = torch.where(logits < 0, logits * alpha, logits / alpha)
+    eos_value = torch.where(
+        mask_eos,
+        logits.new_full(logits[..., eos_id].shape, float("-inf")),
+        logits[..., eos_id],
+    )
+    logits[..., eos_id] = eos_value
+    candidate_logits, candidate_ids = _bounded_top_k_top_p_candidates(
+        logits,
+        top_k=top_k,
+        top_p=top_p,
+        min_tokens_to_keep=3,
+    )
+    return torch.softmax(candidate_logits, dim=-1), candidate_ids
+
+
 def _env_enabled(name: str, *, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -390,6 +431,24 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             _NPU_FUSED_CODEC_SAMPLER_ENV,
             default=False,
         )
+        # Preserve the native multinomial seed-to-code mapping while moving
+        # the much larger head/filter/softmax chain into the existing outer
+        # FULL_DECODE graph. This is deliberately independent from the
+        # inverse-CDF experiment above.
+        self._fused_codec_distribution_enabled = _env_enabled(
+            _NPU_FUSED_CODEC_DISTRIBUTION_ENV,
+            default=False,
+        )
+        if (
+            self._fused_codec_sampler_enabled
+            and self._fused_codec_distribution_enabled
+        ):
+            raise ValueError(
+                f"{_NPU_FUSED_CODEC_SAMPLER_ENV} and "
+                f"{_NPU_FUSED_CODEC_DISTRIBUTION_ENV} are mutually exclusive"
+            )
+        self._fused_codec_distribution_disabled = False
+        self._fused_codec_distribution_validated_steps: set[int] = set()
         self._fused_codec_sampler_prepared = False
         self._fused_codec_sampler_request_id: str | None = None
         # Code2Wav consumes codec chunks, not Talker's per-token hidden row.
@@ -479,6 +538,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self.register_buffer(
                 "_fused_codec_next_frequencies",
                 torch.zeros((1, self._num_audio_tokens), dtype=torch.float32),
+                persistent=False,
+            )
+            candidate_width = min(
+                self._num_audio_tokens,
+                max(self._codec_top_k, 3),
+            )
+            self.register_buffer(
+                "_fused_codec_probabilities",
+                torch.zeros((1, candidate_width), dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_fused_codec_candidate_ids",
+                torch.zeros((1, candidate_width), dtype=torch.long),
                 persistent=False,
             )
 
@@ -751,7 +824,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         """
         self._fused_codec_sampler_prepared = False
         self._fused_codec_sampler_request_id = None
-        if not getattr(self, "_fused_codec_sampler_enabled", False):
+        distribution_enabled = (
+            getattr(self, "_fused_codec_distribution_enabled", False)
+            and not getattr(self, "_fused_codec_distribution_disabled", False)
+        )
+        if not (
+            getattr(self, "_fused_codec_sampler_enabled", False)
+            or distribution_enabled
+        ):
             return False
         infos = model_intermediate_buffer or []
         spans = request_token_spans or []
@@ -804,21 +884,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._fused_codec_expired.copy_(
                 codes[-_REPETITION_WINDOW].reshape(1, 1)
             )
-        self._fused_codec_uniform.uniform_(
-            0.0,
-            1.0,
-            generator=self._request_generator(
-                request_id,
-                self._fused_codec_uniform.device,
-            ),
-        )
+        if getattr(self, "_fused_codec_sampler_enabled", False):
+            self._fused_codec_uniform.uniform_(
+                0.0,
+                1.0,
+                generator=self._request_generator(
+                    request_id,
+                    self._fused_codec_uniform.device,
+                ),
+            )
         self._fused_codec_sampler_request_id = request_id
         self._fused_codec_sampler_prepared = True
         return True
 
     def _consume_fused_codec_sample(self, request_id: str) -> torch.Tensor | None:
         if (
-            not getattr(self, "_fused_codec_sampler_prepared", False)
+            not getattr(self, "_fused_codec_sampler_enabled", False)
+            or not getattr(self, "_fused_codec_sampler_prepared", False)
             or self._fused_codec_sampler_request_id != request_id
         ):
             return None
@@ -827,6 +909,145 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._fused_codec_frequencies.copy_(self._fused_codec_next_frequencies)
         self._request_repetition_frequencies[request_id] = self._fused_codec_frequencies
         return self._fused_codec_sampled.reshape(())
+
+    def _consume_fused_codec_distribution(
+        self,
+        hidden_state: torch.Tensor,
+        history: torch.Tensor,
+        request_id: str,
+        step: int,
+    ) -> torch.Tensor | None:
+        """Sample an outer-graph distribution with the native RNG mapping.
+
+        Four lifecycle boundaries are checked against the eager builder on the
+        first request: initial state, incremental state, repetition-window
+        eviction, and EOS unmasking. A stale graph input or changed candidate
+        distribution disables the path before its sample becomes observable.
+        """
+        if (
+            not getattr(self, "_fused_codec_distribution_enabled", False)
+            or getattr(self, "_fused_codec_distribution_disabled", False)
+            or not getattr(self, "_fused_codec_sampler_prepared", False)
+            or self._fused_codec_sampler_request_id != request_id
+        ):
+            return None
+
+        self._fused_codec_sampler_prepared = False
+        self._fused_codec_sampler_request_id = None
+        probabilities = self._fused_codec_probabilities
+        candidate_ids = self._fused_codec_candidate_ids
+        generator = self._request_generator(request_id, probabilities.device)
+
+        validation_steps = {
+            0,
+            1,
+            _REPETITION_WINDOW,
+            int(
+                self._request_audio_states.get(request_id, {}).get(
+                    "min_tokens", self._codec_min_tokens
+                )
+            ),
+        }
+        validate = (
+            step in validation_steps
+            and step not in self._fused_codec_distribution_validated_steps
+        )
+        if validate:
+            shadow_generator = torch.Generator(device=probabilities.device)
+            shadow_generator.set_state(generator.get_state())
+            eager_probabilities, eager_ids = _bounded_codec_distribution(
+                hidden_state,
+                self._fused_codec_frequencies,
+                self.head_code[0].weight,
+                self._fused_codec_penalty,
+                temperature=self._codec_temperature,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                eos_id=self._num_audio_tokens - 1,
+                mask_eos=step
+                < int(
+                    self._request_audio_states[request_id].get(
+                        "min_tokens", self._codec_min_tokens
+                    )
+                ),
+            )
+            graph_position = torch.multinomial(
+                probabilities,
+                num_samples=1,
+                generator=generator,
+            )
+            eager_position = torch.multinomial(
+                eager_probabilities,
+                num_samples=1,
+                generator=shadow_generator,
+            )
+            graph_sample = candidate_ids.gather(-1, graph_position).reshape(())
+            eager_sample = eager_ids.gather(-1, eager_position).reshape(())
+            ids_match = torch.equal(candidate_ids, eager_ids)
+            probs_match = torch.allclose(
+                probabilities,
+                eager_probabilities,
+                atol=1e-7,
+                rtol=1e-6,
+            )
+            token_match = int(graph_sample.item()) == int(eager_sample.item())
+            if not (ids_match and probs_match and token_match):
+                # The shadow generator executed the canonical draw. Restore
+                # that post-draw state and return its token exactly once.
+                generator.set_state(shadow_generator.get_state())
+                self._fused_codec_distribution_disabled = True
+                max_drift = (
+                    float(
+                        torch.max(
+                            torch.abs(probabilities - eager_probabilities)
+                        ).item()
+                    )
+                    if probabilities.shape == eager_probabilities.shape
+                    else float("inf")
+                )
+                logger.warning(
+                    "MiniCPM-o fused codec distribution runtime gate failed; "
+                    "disabling the path and returning the native eager sample: "
+                    "request=%s, step=%d, ids_match=%s, max_drift=%g, "
+                    "graph_token=%d, eager_token=%d",
+                    request_id,
+                    step,
+                    ids_match,
+                    max_drift,
+                    int(graph_sample.item()),
+                    int(eager_sample.item()),
+                )
+                self._advance_repetition_frequencies(
+                    request_id,
+                    history,
+                    eager_sample,
+                    self._fused_codec_frequencies,
+                )
+                return eager_sample
+            self._fused_codec_distribution_validated_steps.add(step)
+            logger.info(
+                "MiniCPM-o fused codec distribution runtime gate passed: "
+                "request=%s, step=%d, validated_steps=%s",
+                request_id,
+                step,
+                sorted(self._fused_codec_distribution_validated_steps),
+            )
+            sampled = graph_sample
+        else:
+            sampled_position = torch.multinomial(
+                probabilities,
+                num_samples=1,
+                generator=generator,
+            )
+            sampled = candidate_ids.gather(-1, sampled_position).reshape(())
+
+        self._advance_repetition_frequencies(
+            request_id,
+            history,
+            sampled,
+            self._fused_codec_frequencies,
+        )
+        return sampled
 
     def _sample_audio_code(
         self,
@@ -1444,7 +1665,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             else:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             step = int(state.get("step", 0))
-            sampled = self._consume_fused_codec_sample(request_id)
+            sampled = self._consume_fused_codec_distribution(
+                hidden[end - 1 : end],
+                codes,
+                request_id,
+                step,
+            )
+            if sampled is None:
+                sampled = self._consume_fused_codec_sample(request_id)
             if sampled is None:
                 sampled = self._sample_audio_code(
                     hidden[end - 1 : end],
@@ -1681,6 +1909,24 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # second ACL graph launch or per-token output clone.
             self._fused_codec_sampled.copy_(sampled)
             self._fused_codec_next_frequencies.copy_(next_frequencies)
+        elif (
+            getattr(self, "_fused_codec_distribution_enabled", False)
+            and not getattr(self, "_fused_codec_distribution_disabled", False)
+            and hidden_states.shape[0] == 1
+        ):
+            probabilities, candidate_ids = _graphable_codec_distribution(
+                hidden_states[-1:],
+                self._fused_codec_frequencies,
+                self.head_code[0].weight,
+                self._fused_codec_penalty,
+                self._fused_codec_mask_eos,
+                temperature=self._codec_temperature,
+                top_k=self._codec_top_k,
+                top_p=self._codec_top_p,
+                eos_id=self._num_audio_tokens - 1,
+            )
+            self._fused_codec_probabilities.copy_(probabilities)
+            self._fused_codec_candidate_ids.copy_(candidate_ids)
         return hidden_states
 
     def compute_logits(self, hidden_states, *args, **kwargs):

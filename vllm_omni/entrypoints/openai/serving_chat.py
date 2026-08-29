@@ -240,129 +240,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 return True
         return False
 
-    @staticmethod
-    def _request_extra_value(request: Any, key: str) -> Any:
-        """Read one extension field across the supported OpenAI body forms."""
-        direct = getattr(request, key, None)
-        if direct is not None:
-            return direct
-
-        model_extra = getattr(request, "model_extra", None) or {}
-        if key in model_extra:
-            return model_extra[key]
-
-        extra_body = getattr(request, "extra_body", None)
-        if not isinstance(extra_body, dict):
-            nested = model_extra.get("extra_body")
-            extra_body = nested if isinstance(nested, dict) else {}
-        return extra_body.get(key)
-
-    @classmethod
-    def _minicpmo45_teacher_forcing_enabled(cls, request: Any) -> bool:
-        value = cls._request_extra_value(request, "minicpmo45_tts_teacher_forcing")
-        if value is None:
-            template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
-            task_type = cls._request_extra_value(request, "task_type")
-            ref_audio = cls._request_extra_value(request, "ref_audio")
-            ref_text = cls._request_extra_value(request, "ref_text")
-            # ``Base`` + reference speech is the standard exact-text voice
-            # cloning contract, not an open-ended audio-assistant turn.  The
-            # caller has already supplied the transcript to synthesize, so the
-            # released teacher-forcing semantics are safe to select here.
-            return bool(
-                task_type == "Base"
-                and ref_audio
-                and ref_text
-                and template_kwargs.get("use_tts_template") is True
-                and template_kwargs.get("enable_thinking") is False
-            )
-        if isinstance(value, str):
-            return value.lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    @staticmethod
-    def _last_plain_user_text(messages: list[ChatCompletionMessageParam]) -> str | None:
-        for message in reversed(messages):
-            if not isinstance(message, dict) or message.get("role") != "user":
-                continue
-            content = message.get("content")
-            if isinstance(content, str):
-                text = content.strip()
-                return text or None
-            if not isinstance(content, list):
-                return None
-            text_parts: list[str] = []
-            for part in content:
-                if not isinstance(part, dict) or part.get("type") not in {"text", "input_text"}:
-                    continue
-                text = part.get("text")
-                if isinstance(text, str) and text:
-                    text_parts.append(text)
-            joined = "".join(text_parts).strip()
-            return joined or None
-        return None
-
-    def _prepare_minicpmo45_teacher_forcing(
-        self,
-        request: ChatCompletionRequest,
-        messages: list[ChatCompletionMessageParam],
-    ) -> tuple[list[ChatCompletionMessageParam], str | None]:
-        """Turn exact-text TTS into one parallel prefill plus one decode.
-
-        MiniCPM-o's released ``teacher_forcing`` path does not autoregressively
-        rediscover text that the TTS caller already supplied. It feeds the
-        known assistant span through the LLM once and uses those hidden states
-        to condition the Talker. Keep this behavior opt-in because ordinary
-        audio-assistant chat must still generate an answer.
-        """
-        if not self._has_minicpmo45_stage() or not self._minicpmo45_teacher_forcing_enabled(request):
-            return messages, None
-
-        modalities = getattr(request, "modalities", None) or []
-        if "audio" not in modalities:
-            raise ValueError("minicpmo45_tts_teacher_forcing requires audio output")
-
-        requested_text = self._request_extra_value(request, "minicpmo45_tts_teacher_forcing_text")
-        if requested_text is None:
-            requested_text = self._last_plain_user_text(messages)
-        if not isinstance(requested_text, str) or not requested_text.strip():
-            raise ValueError("minicpmo45_tts_teacher_forcing requires non-empty synthesis text")
-        requested_text = requested_text.strip()
-        if "<|" in requested_text or "|>" in requested_text:
-            raise ValueError("teacher-forced synthesis text must not contain model control tokens")
-
-        forced_reply = cast(
-            ChatCompletionMessageParam,
-            {
-                "role": "assistant",
-                "content": f"<|tts_bos|>{requested_text}<|tts_eos|>",
-            },
-        )
-        return [*messages, forced_reply], requested_text
-
-    def _apply_minicpmo45_teacher_forcing_sampling(
-        self,
-        sampling_params_list: list[Any],
-        teacher_forcing_text: str | None,
-    ) -> list[Any]:
-        """End Stage 0 after the single token needed to publish its prefill."""
-        if teacher_forcing_text is None:
-            return sampling_params_list
-        for idx, stage in enumerate(getattr(self.engine_client, "stage_configs", []) or []):
-            if idx >= len(sampling_params_list):
-                break
-            engine_args = self._stage_get(stage, "engine_args")
-            if self._stage_get(engine_args, "model_arch") != "MiniCPMO45OmniForConditionalGeneration":
-                continue
-            if self._stage_get(engine_args, "model_stage") != "llm":
-                continue
-            params = sampling_params_list[idx]
-            if hasattr(params, "max_tokens"):
-                params.max_tokens = 1
-            if hasattr(params, "min_tokens"):
-                params.min_tokens = 0
-        return sampling_params_list
-
     def _fix_minicpmo45_audio_stream_output_kinds(
         self,
         sampling_params_list: list[Any],
@@ -673,13 +550,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Effective kwargs fold request.chat_template_kwargs, reasoning_effort,
                 # and server defaults — mirrors OpenAIServingChat._effective_chat_template_kwargs.
                 merged_template_kwargs = self._effective_chat_template_kwargs(request)
-                preprocess_messages, teacher_forcing_text = self._prepare_minicpmo45_teacher_forcing(
-                    request,
-                    request.messages,
-                )
                 conversation, engine_prompts = await self._preprocess_chat(
                     request,
-                    preprocess_messages,
+                    request.messages,
                     default_template=request.chat_template or self.chat_template,
                     default_template_content_format=self.chat_template_content_format,
                     default_template_kwargs=merged_template_kwargs,
@@ -687,8 +560,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     tool_parser=tool_parser,
                     # OMNI: Additional parameters
                     renderer=renderer,
-                    add_generation_prompt=(request.add_generation_prompt if teacher_forcing_text is None else False),
-                    continue_final_message=(request.continue_final_message if teacher_forcing_text is None else False),
+                    add_generation_prompt=request.add_generation_prompt,
+                    continue_final_message=request.continue_final_message,
                     documents=getattr(request, "documents", None),
                     add_special_tokens=request.add_special_tokens,
                 )
@@ -697,7 +570,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 conversation, engine_prompts = self.online_renderer._make_request_with_harmony(
                     request, should_include_tools
                 )
-                teacher_forcing_text = None
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -857,11 +729,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
-
-                sampling_params_list = self._apply_minicpmo45_teacher_forcing_sampling(
-                    sampling_params_list,
-                    teacher_forcing_text,
-                )
 
                 # If this is a streaming (output) request, coerce cumulative outputs
                 # to delta to ensure emitted outputs are correctly drained. Otherwise

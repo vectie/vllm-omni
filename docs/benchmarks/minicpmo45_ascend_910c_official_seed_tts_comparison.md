@@ -8211,3 +8211,53 @@ replay boundaries, before its performance result is considered eligible.
 /tmp/lunanexa-bench/graph-native-codec-v74-adjacent-control-repeat-zh8/
 /tmp/lunanexa-bench/graph-native-codec-v74-quality-exact-control-zh32/
 ```
+
+### Complete codec-sequence audit and cold Stage-2 isolation
+
+An explicit `async_scheduling: true` Stage-1 overlay was first screened and
+removed. The retained A2 profile already logs `OmniARAsyncScheduler` and
+`Asynchronous scheduling is enabled`, so the overlay changed neither the
+scheduler nor the executable. Apparent changes between repeated eight-prompt
+runs were accompanied by different generated frame counts and could not be
+claimed as speedups.
+
+A diagnostic-only codec audit was then added behind
+`VLLM_OMNI_MINICPMO45_CODEC_PARITY_TRACE`. The ordinary production path pays
+no clone, host read or file-I/O cost when the variable is absent. An enabled
+run records every sampled and published code, the exact distribution step,
+the candidate IDs/probabilities immediately around native multinomial, and a
+SHA-256 digest of the final request generator state. Request IDs are stored
+only as SHA-256 digests; prompts and reference audio are never written.
+
+The first same-prompt comparison produced 122 samples / 4.96 seconds of audio
+on the first request after service start and 147 samples / 5.32 seconds on the
+next request. The first six samples were equal and the first divergence was
+zero-based step six. An initial analysis incorrectly aligned distribution row
+zero with codec step zero even though the eligible full-decode distribution
+begins at step one; trace format v2 now carries `distribution_steps` and binds
+the pre/post snapshots to the sample at the multinomial call site.
+
+Two controls ruled out a mutable graph-output race:
+
+- device-wide fences before sampling and after the diagnostic copies produced
+  exactly the same two sequences and generator digests as the no-fence run;
+- two later requests with different request IDs were bit-for-bit identical:
+  both produced 147 samples, 123 published codes and 5.32 seconds of audio,
+  with identical candidate distributions and final generator digest.
+
+Disabling the one-time fused-distribution runtime gate also left the first and
+second sequences unchanged, so that unsafe bypass was removed. The boundary
+instead matches the five-code first packet: after codec step five, Stage 2
+starts its first real CFM/HiFT invocation on the colocated NPU. The cold run
+took 67.90 seconds while the next run took 1.00 second because the former
+absorbed Stage-2 compile/warmup. All subsequent unique-ID requests were
+sequence-exact. This is therefore a cold colocated-runtime effect, not a
+steady codec nondeterminism or a speed optimization. Competition measurements
+already use warmup requests; production cold-start work should precompile the
+real first-packet Stage-2 shape rather than weaken sampler parity gates.
+
+```text
+/tmp/lunanexa-bench/codec-parity-v76-nosync.jsonl
+/tmp/lunanexa-bench/codec-parity-v77-sync.jsonl
+/tmp/lunanexa-bench/codec-parity-v78-gate-off.jsonl
+```

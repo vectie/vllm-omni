@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -464,6 +465,114 @@ def test_talker_deferred_eos_trims_terminal_tail_at_chunk_boundary(monkeypatch) 
     assert outputs[2].multimodal_outputs["codes"]["audio"][0].tolist() == [[1]]
     assert outputs[2].multimodal_outputs["meta"]["finished"][0].item() is True
     assert talker._request_transport_codes["req-deferred-eos"] == []
+
+
+def test_talker_codec_parity_trace_records_complete_sample_and_publish_sequences(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "3")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "3")
+    talker = _make_talker()
+    trace_path = tmp_path / "codec-parity.jsonl"
+    talker._codec_parity_trace_path = str(trace_path)
+    talker._request_codec_parity = {}
+    talker.batched_codec_output = True
+    talker.deferred_chunk_eos = True
+    samples = iter((torch.tensor(1), torch.tensor(7), torch.tensor(3)))
+    monkeypatch.setattr(talker, "_sample_audio_code", lambda *_args: next(samples))
+    info = {
+        "request_id": "req-parity-secret",
+        "audio_state": {"step": 0, "min_tokens": 0, "max_tokens": 10},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    for _ in range(3):
+        talker.make_omni_output(
+            torch.ones(1, 2),
+            model_intermediate_buffer=[info],
+            request_token_spans=[(0, 1)],
+        )
+    talker.on_requests_finished(["req-parity-secret"])
+
+    payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert payload["format"] == "minicpmo45-codec-parity-v2"
+    assert payload["sample_count"] == 3
+    assert payload["published_count"] == 1
+    assert payload["samples"] == [1, 7, 3]
+    assert payload["published"] == [1]
+    assert payload["steps"][-1]["finished"] is True
+    assert payload["final_rng_sha256"] is None
+    assert "req-parity-secret" not in trace_path.read_text(encoding="utf-8")
+
+
+def test_codec_parity_trace_binds_distribution_to_native_sample(tmp_path) -> None:
+    talker = _make_talker()
+    trace_path = tmp_path / "codec-distribution-parity.jsonl"
+    talker._codec_parity_trace_path = str(trace_path)
+    talker._request_codec_parity = {}
+    talker._request_codec_parity_pending = {}
+    talker._codec_temperature = 0.8
+    talker._codec_top_k = 5
+    talker._codec_top_p = 0.85
+    talker._codec_repetition_penalty = 1.05
+    talker._fused_codec_distribution_enabled = True
+    talker._fused_codec_sampler_prepared = True
+    talker._fused_codec_sampler_request_id = "req-distribution-parity"
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_penalty = torch.tensor([1.05])
+    talker.head_code = nn.ModuleList([nn.Linear(4, 8, bias=False)])
+    hidden = torch.tensor([[0.5, -0.25, 0.75, 1.0]])
+    history = torch.empty(0, dtype=torch.long)
+    talker._request_audio_states["req-distribution-parity"] = {
+        "step": 0,
+        "min_tokens": 2,
+        "max_tokens": 64,
+    }
+    probabilities, candidate_ids = _bounded_codec_distribution(
+        hidden,
+        talker._fused_codec_frequencies,
+        talker.head_code[0].weight,
+        talker._fused_codec_penalty,
+        temperature=0.8,
+        top_k=5,
+        top_p=0.85,
+        eos_id=7,
+        mask_eos=True,
+    )
+    talker._fused_codec_probabilities = probabilities.clone()
+    talker._fused_codec_candidate_ids = candidate_ids.clone()
+
+    sampled = talker._consume_fused_codec_distribution(
+        hidden,
+        history,
+        "req-distribution-parity",
+        0,
+    )
+    talker._record_codec_parity_step(
+        "req-distribution-parity",
+        sampled,
+        sampled.reshape(1, 1),
+        step=0,
+        min_tokens=2,
+        reached_limit=False,
+        finished=False,
+    )
+    talker.on_requests_finished(["req-distribution-parity"])
+
+    payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert payload["distribution_samples"] == [int(sampled)]
+    assert payload["distribution_steps"] == [0]
+    assert payload["candidate_ids"] == [candidate_ids.reshape(-1).tolist()]
+    assert torch.allclose(
+        torch.tensor(payload["probabilities"]),
+        probabilities,
+    )
+    assert payload["candidate_ids_after"] == payload["candidate_ids"]
+    assert torch.allclose(
+        torch.tensor(payload["probabilities_after"]),
+        torch.tensor(payload["probabilities"]),
+    )
 
 
 def test_talker_deferred_eos_flushes_limit_without_boundary_sample(monkeypatch) -> None:

@@ -11,6 +11,7 @@ Pipeline:
   4. Continuously generate request-aligned discrete audio-code deltas
 """
 
+import hashlib
 import json
 import os
 from collections.abc import Iterable
@@ -68,6 +69,8 @@ _NPU_TALKER_STATIC_W8A8_CALIBRATION_ENV = (
 _NPU_TALKER_STATIC_W8A8_TARGETS_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_TALKER_STATIC_W8A8_TARGETS"
 )
+_CODEC_PARITY_TRACE_ENV = "VLLM_OMNI_MINICPMO45_CODEC_PARITY_TRACE"
+_CODEC_PARITY_SYNC_ENV = "VLLM_OMNI_MINICPMO45_CODEC_PARITY_SYNC"
 
 
 def _talker_static_w8a8_suffixes(targets: str) -> tuple[str, ...]:
@@ -454,6 +457,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._deferred_cleanup_ids: set[str] = set()
         self._static_w8a8_calibration_path: str | None = None
         self._static_w8a8_collectors: dict[str, torch.Tensor] = {}
+        parity_trace_path = os.environ.get(_CODEC_PARITY_TRACE_ENV, "").strip()
+        self._codec_parity_trace_path: str | None = parity_trace_path or None
+        self._request_codec_parity: dict[str, dict[str, Any]] = {}
+        self._request_codec_parity_pending: dict[str, dict[str, Any]] = {}
         self._npu_codec_sampler_graphs: dict[bool, dict[str, Any]] = {}
         self._npu_codec_sampler_graph_pool: Any | None = None
         self._npu_codec_sampler_graph_disabled = False
@@ -1150,6 +1157,24 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         probabilities = self._fused_codec_probabilities
         candidate_ids = self._fused_codec_candidate_ids
         generator = self._request_generator(request_id, probabilities.device)
+        parity_trace_enabled = bool(
+            getattr(self, "_codec_parity_trace_path", None)
+        )
+        if (
+            parity_trace_enabled
+            and probabilities.device.type == "npu"
+            and _env_enabled(_CODEC_PARITY_SYNC_ENV, default=False)
+        ):
+            # Diagnostic only. A device-wide fence makes the replay output
+            # stable before both the snapshot and multinomial consume it. If
+            # this removes cross-run drift, the production fix must be a
+            # stream/event dependency rather than retaining this host fence.
+            torch.npu.synchronize()
+        parity_candidate_ids_before = None
+        parity_probabilities_before = None
+        if parity_trace_enabled:
+            parity_candidate_ids_before = candidate_ids.detach().clone()
+            parity_probabilities_before = probabilities.detach().clone()
 
         validation_steps = {
             0,
@@ -1236,6 +1261,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     eager_sample,
                     self._fused_codec_frequencies,
                 )
+                self._stage_codec_parity_distribution(
+                    request_id,
+                    step=step,
+                    sampled=eager_sample,
+                    candidate_ids_before=parity_candidate_ids_before,
+                    probabilities_before=parity_probabilities_before,
+                    candidate_ids_after=candidate_ids,
+                    probabilities_after=probabilities,
+                )
                 return eager_sample
             self._fused_codec_distribution_validated_steps.add(step)
             logger.info(
@@ -1268,6 +1302,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 sampled,
                 self._fused_codec_frequencies,
             )
+        self._stage_codec_parity_distribution(
+            request_id,
+            step=step,
+            sampled=sampled,
+            candidate_ids_before=parity_candidate_ids_before,
+            probabilities_before=parity_probabilities_before,
+            candidate_ids_after=candidate_ids,
+            probabilities_after=probabilities,
+        )
         return sampled
 
     def _sample_audio_code(
@@ -1983,6 +2026,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "current": sampled.reshape(1),
                 "accumulated": codes,
             }
+            self._record_codec_parity_step(
+                request_id,
+                sampled,
+                delta,
+                step=step,
+                min_tokens=min_tokens,
+                reached_limit=reached_limit,
+                finished=finished,
+            )
             codec_deltas.append(delta)
             terminal_flags.append(torch.tensor(finished, dtype=torch.bool))
             append_stop_control(finished)
@@ -2065,8 +2117,209 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for request_id in finished_req_ids:
+            try:
+                self._export_codec_parity_trace(str(request_id))
+            except Exception:
+                logger.exception(
+                    "MiniCPM-o codec parity trace export failed for request %s",
+                    request_id,
+                )
         self._deferred_cleanup_ids.update(str(req_id) for req_id in finished_req_ids)
         self._export_static_w8a8_calibration()
+
+    def _record_codec_parity_step(
+        self,
+        request_id: str,
+        sampled: torch.Tensor,
+        published: torch.Tensor,
+        *,
+        step: int,
+        min_tokens: int,
+        reached_limit: bool,
+        finished: bool,
+    ) -> None:
+        """Retain a complete device-side codec audit when explicitly enabled.
+
+        The production path pays no tensor clone or scalar synchronization.
+        Diagnostic runs keep samples on the device and perform one host copy
+        only after request completion.  No prompt or reference audio is
+        recorded.
+        """
+        if not getattr(self, "_codec_parity_trace_path", None):
+            return
+        traces = getattr(self, "_request_codec_parity", None)
+        if traces is None:
+            traces = {}
+            self._request_codec_parity = traces
+        trace = traces.setdefault(
+            request_id,
+            {
+                "samples": [],
+                "published": [],
+                "candidate_ids": [],
+                "probabilities": [],
+                "candidate_ids_after": [],
+                "probabilities_after": [],
+                "distribution_samples": [],
+                "distribution_steps": [],
+                "steps": [],
+            },
+        )
+        trace["samples"].append(sampled.detach().reshape(1).clone())
+        if published.numel():
+            trace["published"].append(published.detach().reshape(-1).clone())
+        pending_traces = getattr(self, "_request_codec_parity_pending", None)
+        pending = (
+            pending_traces.pop(request_id, None)
+            if isinstance(pending_traces, dict)
+            else None
+        )
+        if isinstance(pending, dict) and int(pending.get("step", -1)) == int(step):
+            trace["candidate_ids"].append(pending["candidate_ids_before"])
+            trace["probabilities"].append(pending["probabilities_before"])
+            trace["candidate_ids_after"].append(pending["candidate_ids_after"])
+            trace["probabilities_after"].append(pending["probabilities_after"])
+            trace["distribution_samples"].append(pending["sampled"])
+            trace["distribution_steps"].append(int(pending["step"]))
+        trace["steps"].append(
+            {
+                "step": int(step),
+                "min_tokens": int(min_tokens),
+                "reached_limit": bool(reached_limit),
+                "finished": bool(finished),
+            }
+        )
+
+    def _stage_codec_parity_distribution(
+        self,
+        request_id: str,
+        *,
+        step: int,
+        sampled: torch.Tensor,
+        candidate_ids_before: torch.Tensor | None,
+        probabilities_before: torch.Tensor | None,
+        candidate_ids_after: torch.Tensor,
+        probabilities_after: torch.Tensor,
+    ) -> None:
+        """Bind distribution snapshots to the sample that consumed them.
+
+        This hook executes immediately around multinomial. Keeping both sides
+        exposes an asynchronously overwritten graph-output buffer: a later
+        make_omni_output hook cannot reliably reconstruct that association.
+        """
+        if (
+            not getattr(self, "_codec_parity_trace_path", None)
+            or candidate_ids_before is None
+            or probabilities_before is None
+        ):
+            return
+        pending = getattr(self, "_request_codec_parity_pending", None)
+        if pending is None:
+            pending = {}
+            self._request_codec_parity_pending = pending
+        pending[request_id] = {
+            "step": int(step),
+            "sampled": sampled.detach().reshape(1).clone(),
+            "candidate_ids_before": candidate_ids_before.detach().reshape(-1),
+            "probabilities_before": probabilities_before.detach().reshape(-1),
+            "candidate_ids_after": candidate_ids_after.detach().reshape(-1).clone(),
+            "probabilities_after": probabilities_after.detach().reshape(-1).clone(),
+        }
+        if (
+            sampled.device.type == "npu"
+            and _env_enabled(_CODEC_PARITY_SYNC_ENV, default=False)
+        ):
+            # Complete the diagnostic copies before another scheduler stream
+            # can reuse graph/sample storage. Together with the pre-sampling
+            # fence this brackets the exact distribution-to-token operation.
+            torch.npu.synchronize()
+
+    def _export_codec_parity_trace(self, request_id: str) -> None:
+        path = getattr(self, "_codec_parity_trace_path", None)
+        traces = getattr(self, "_request_codec_parity", None)
+        if not path or not isinstance(traces, dict):
+            return
+        trace = traces.pop(request_id, None)
+        if not isinstance(trace, dict):
+            return
+
+        samples_tensors = trace.get("samples") or []
+        published_tensors = trace.get("published") or []
+        samples = (
+            torch.cat(samples_tensors).to(device="cpu", dtype=torch.long).tolist()
+            if samples_tensors
+            else []
+        )
+        published = (
+            torch.cat(published_tensors).to(device="cpu", dtype=torch.long).tolist()
+            if published_tensors
+            else []
+        )
+        candidate_tensors = trace.get("candidate_ids") or []
+        probability_tensors = trace.get("probabilities") or []
+        candidate_after_tensors = trace.get("candidate_ids_after") or []
+        probability_after_tensors = trace.get("probabilities_after") or []
+        distribution_sample_tensors = trace.get("distribution_samples") or []
+        distribution_steps = trace.get("distribution_steps") or []
+        candidate_ids = (
+            torch.stack(candidate_tensors).to(device="cpu", dtype=torch.long).tolist()
+            if candidate_tensors
+            else []
+        )
+        probabilities = (
+            torch.stack(probability_tensors).to(device="cpu", dtype=torch.float32).tolist()
+            if probability_tensors
+            else []
+        )
+        candidate_ids_after = (
+            torch.stack(candidate_after_tensors)
+            .to(device="cpu", dtype=torch.long)
+            .tolist()
+            if candidate_after_tensors
+            else []
+        )
+        probabilities_after = (
+            torch.stack(probability_after_tensors)
+            .to(device="cpu", dtype=torch.float32)
+            .tolist()
+            if probability_after_tensors
+            else []
+        )
+        distribution_samples = (
+            torch.cat(distribution_sample_tensors)
+            .to(device="cpu", dtype=torch.long)
+            .tolist()
+            if distribution_sample_tensors
+            else []
+        )
+        generator = self._request_generators.get(request_id)
+        rng_digest = None
+        if generator is not None:
+            rng_state = generator.get_state().to(device="cpu").contiguous()
+            rng_digest = hashlib.sha256(rng_state.numpy().tobytes()).hexdigest()
+        steps = trace.get("steps") or []
+        payload = {
+            "format": "minicpmo45-codec-parity-v2",
+            "request_sha256": hashlib.sha256(request_id.encode("utf-8")).hexdigest(),
+            "seed": int(self._codec_seed),
+            "eos_id": int(self._num_audio_tokens - 1),
+            "sample_count": len(samples),
+            "published_count": len(published),
+            "samples": samples,
+            "published": published,
+            "candidate_ids": candidate_ids,
+            "probabilities": probabilities,
+            "candidate_ids_after": candidate_ids_after,
+            "probabilities_after": probabilities_after,
+            "distribution_samples": distribution_samples,
+            "distribution_steps": distribution_steps,
+            "steps": steps,
+            "final_rng_sha256": rng_digest,
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
 
     def _export_static_w8a8_calibration(self) -> None:
         path = self._static_w8a8_calibration_path

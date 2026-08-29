@@ -100,6 +100,15 @@ def test_a2_evaluator_async_sampler_candidate_is_explicitly_talker_only():
     assert "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH" not in (stage2.env or {})
 
 
+def test_a2_evaluator_async_safe_profile_does_not_enable_rejected_sampler():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_experimental.yaml"
+    )
+
+    for stage in deploy.stages:
+        assert "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH" not in (stage.env or {})
+
+
 def test_a2_evaluator_fia_bucket32_candidate_targets_only_talker():
     deploy = _load_profile("minicpmo_4_5_1npu_a2_evaluator_fia_bucket32_experimental.yaml")
     stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)

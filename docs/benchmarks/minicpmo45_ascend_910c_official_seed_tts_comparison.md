@@ -7673,3 +7673,43 @@ vllm_omni/deploy/minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_sample
 /tmp/minicpmo-a2-evaluator-cfm5.log
 /tmp/minicpmo-a2-evaluator-cfm6-rollback.log
 ```
+
+## A2 inverse-CDF accuracy rejection
+
+The resident-scalar eager sampler and the inverse-CDF sampler graph were run
+against the same first 32 Chinese Seed-TTS rows on the same A2 service image.
+Both runs used seed zero, disabled shuffle and oversampling, temperature zero,
+concurrency four, the local Paraformer checkpoint, and the same WavLM-base-plus
+proxy scorer.  All 32 serving requests completed and streaming continuity was
+100% in both runs.
+
+| Metric | Resident eager control | Inverse-CDF graph | Gate decision |
+| --- | ---: | ---: | --- |
+| Serving duration | 21.91 s | 19.70 s | inverse-CDF is 10.1% faster |
+| Audio throughput | 6.32 audio-s/s | 7.25 audio-s/s | inverse-CDF is 14.7% higher |
+| WER evaluated | 32 / 32 | 29 / 32 | inverse-CDF has 3 empty-ASR rows |
+| Mean WER | 4.8315% | 65.1398% | fail; organizer limit is 1.56% |
+| Median WER | 0.0000% | 68.7500% | fail |
+| Mean proxy SIM | 0.831314 | 0.781522 | both exceed 0.689, but this cannot rescue WER |
+
+The control's 32-row WER is only a screen and is not substituted for its prior
+full qualification.  The paired result is nevertheless decisive for this
+candidate: inverse-CDF increases mean WER by 60.31 percentage points and turns
+the median sample from exact recognition into 68.75% error.  Per-item ASR shows
+truncated, unrelated, and empty transcriptions, confirming that this is not
+normal sample variance.  Distribution equivalence is insufficient because the
+changed seed-to-code mapping materially changes the generated utterance.
+
+The release gate is fail-fast.  Daily-Omni and Video-MME were not rerun after
+the mandatory Seed-TTS WER failure; neither text-only benchmark can make a
+WER-failing audio candidate releasable.  The previously qualified full results
+(Daily-Omni 78.279% and Video-MME 70.259%) remain evidence for the accepted
+lineage, not a waiver for this rejected sampler.  The inverse-CDF profile stays
+explicitly experimental and the resident eager sampler remains the A2 default.
+
+```text
+b64aa0073cee42b804a9742ebc0b9cb24e563a410dec034909510a120d78156e  resident-control-zh32.json
+a13e96ee73dd2d0680c083d000f4203d759a455ba108003396d58b83ec43ad54  inverse-cdf-zh32.json
+/tmp/lunanexa-bench/resident-control-v24-quality-zh32-local/
+/tmp/lunanexa-bench/inverse-cdf-v26-quality-zh32-local/
+```

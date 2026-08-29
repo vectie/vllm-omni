@@ -3,6 +3,9 @@
 # head/filter/AICPU-multinomial chain with an inverse-CDF graph.  It preserves
 # the sampling distribution but not the generator seed-to-code mapping, so it
 # must pass the official accuracy gate before becoming a submission default.
+# A matched 32-row Chinese Seed-TTS gate on 2026-08-29 rejected this profile:
+# mean WER was 65.14% with three empty-ASR rows (organizer limit: 1.56%).
+# Keep this profile experimental; do not inherit it from a submission config.
 
 base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_experimental.yaml
 

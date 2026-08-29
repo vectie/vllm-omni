@@ -8029,3 +8029,50 @@ Talker target is therefore a parity-gated two-code merged command with two
 fixed KV/slot-mapping slabs, followed by four/eight-code unrolling only if the
 native sampler state and EOS commit decisions remain exact. That change can
 remove scheduler crossings; another isolated elementwise fusion cannot.
+
+### Rejected graph-embedding and cross-stage composition screens
+
+Moving the previous-code `emb_code` lookup behind a resident placeholder into
+the outer Talker graph was not semantics-safe. The three distribution gates
+passed, but the same fixed eight prompts produced `64.52 s` instead of the
+matched graph-state run's `34.52 s` of audio. Duration regressed from
+`5.9242 s` to `14.4525 s`, mean TTFP from `423.79 ms` to `1090.77 ms`, and
+mean E2E from `740.07 ms` to `1805.32 ms`. The graph was reading a stale or
+incorrectly ordered cross-replay producer even though its local distribution
+was valid. The implementation, tests and profile were removed. A future
+multi-code graph must carry the sampled-code commit and dependent embedding in
+one scheduler-owned executable with distinct KV slots; a resident input
+placeholder is not sufficient.
+
+The first attempt to compose graph-owned Talker state with the older complete
+CFM3 profile also failed. The mixed inheritance chain silently retained old
+Stage-1 sampler/chunk/PA settings, and the two independently fast graph paths
+contended on one NPU. Its fully warm 8-request repeat generated `43.92 s` of
+audio with mean RTF `0.30626`, TTFP `914.93 ms`, TTFT `732.26 ms` and E2E
+`1610.43 ms`; it was substantially slower than either isolated path.
+
+Per-process torch-npu stream priorities were then tested as a preemption
+mechanism: Thinker `-2`, Talker `-1`, Code2Wav `0` (lower is higher priority).
+All workers confirmed installation, but the matched `43.92 s` repeat worsened
+RTF by `0.74%`, TTFP by `2.47%`, TTFT by `2.53%` and E2E by `0.46%`.
+Priority streams do not preempt an already-submitted opaque CFM graph at the
+granularity needed here, so the worker change was removed.
+
+A final single-variable screen kept the qualified graph-owned Talker profile
+unchanged and overlaid only the CFM3 Stage-2 environment. This exposed a
+configuration mistake in the proposed composition: the current source policy
+already defaults to the quality-qualified one-step CFM solver, so forcing
+three steps increased Stage-2 work rather than reducing it. The fully warm
+eight-request repeat generated `55.92 s` of audio with mean chunk RTF about
+`0.28`, mean TTFP `1104.25 ms`, mean TTFT `733.68 ms` and mean E2E
+`1966.93 ms`. The overlay and its test were removed. The accepted submission
+path remains source-default CFM1 plus the graph-owned Talker distribution and
+codec state; stage-local wins must not be composed without checking the
+effective inherited policy and whole-request contention.
+
+```text
+/tmp/lunanexa-bench/graph-codec-embed-v57-zh8/
+/tmp/lunanexa-bench/cfm3-graph-state-v62-repeat-zh8/
+/tmp/lunanexa-bench/cfm3-graph-state-priority-v65-repeat-zh8/
+/tmp/lunanexa-bench/cfm3-graph-state-clean-v68-repeat-zh8/
+```

@@ -8163,3 +8163,51 @@ code and position on device, and return two parity-checked codec tokens per
 scheduler crossing. That architecture targets the launch/IPC/device-idle
 budget that remains visible in the trace, rather than making the already-small
 batch-one matrix arithmetic more expensive.
+
+### Rejected graph-native codec sampler
+
+The next experiment registered a model-owned `torch.Generator` with the
+Stage-1 FULL ACL graph and moved native `torch.multinomial`, sampled-code
+commit, repetition-frequency advance and the fixed 16-code FIFO advance into
+the captured executable. This was technically successful: the A2 runtime
+captured one explicit generator, replayed without the earlier generator-offset
+error, and passed distribution/sample gates at codec steps 1, 16 and 50. The
+generic vLLM-Ascend generator-registration hook and the MiniCPM-o integration
+also passed their focused tests.
+
+Two concurrency-1 repeats showed a real steady-state benefit relative to two
+adjacent safe controls:
+
+| Metric | Safe control mean | Graph-native sampler mean | Change |
+| --- | ---: | ---: | ---: |
+| Audio throughput | 5.6184x | 5.8711x | +4.50% |
+| Mean chunk RTF | 0.16351 | 0.15515 | -5.11% |
+| Median chunk RTF | 0.12685 | 0.11795 | -7.02% |
+| P99 chunk RTF | 0.25850 | 0.25757 | -0.36% |
+| Mean TTFP | 434.21 ms | 432.19 ms | -0.47% |
+| Mean E2E | 762.23 ms | 765.18 ms | +0.39% |
+
+The experiment nevertheless failed the mandatory accuracy gate. On the exact
+same first 32 Chinese Seed-TTS rows used by the qualified graph-state control,
+with `--disable-shuffle --no-oversample`, the candidate produced WER
+`0.0787393` versus `0.0500515` (+2.869 percentage points) and SIM `0.789568`
+versus `0.832275` (-0.042706). The WER loss exceeds the two-point limit. At
+concurrency four, normalized audio throughput improved only from `7.46996x`
+to `7.57522x` (+1.41%), while TTFP worsened from `1869.83 ms` to `1929.03 ms`
+and E2E from `2191.32 ms` to `2274.12 ms` because of the longer sampled audio
+and queueing.
+
+The implementation, profile and capture hook were therefore removed rather
+than promoted. This result also strengthens the next multi-code requirement:
+distribution parity at sparse checkpoints is insufficient. A future device-
+side sampler must prove request-seed and draw-offset parity for the complete
+codec sequence, including capture warmup, request reset, EOS and scheduler
+replay boundaries, before its performance result is considered eligible.
+
+```text
+/tmp/lunanexa-bench/graph-native-codec-v74-zh8/
+/tmp/lunanexa-bench/graph-native-codec-v74-repeat2-zh8/
+/tmp/lunanexa-bench/graph-native-codec-v74-adjacent-control-zh8/
+/tmp/lunanexa-bench/graph-native-codec-v74-adjacent-control-repeat-zh8/
+/tmp/lunanexa-bench/graph-native-codec-v74-quality-exact-control-zh32/
+```

@@ -7958,3 +7958,74 @@ replicas are not the first move on this 32-GiB A2: the resident process already
 uses about 27.7 GiB, so independent weight copies do not fit. Weight sharing
 could revisit that idea later, but a single merged Talker executable removes
 the same dispatch bubbles without a second model replica.
+
+### Outer Talker graph: distribution and graph-owned codec state
+
+The next accepted change moves the codec-head projection, repetition penalty,
+bounded top-k/top-p filtering and softmax into the existing outer FULL_DECODE
+graph. Native `torch.multinomial` deliberately remains outside the graph. Real
+runtime gates at codec steps 1, 16 and 50 compare candidate logits,
+probabilities and the sampled token against eager execution with an identical
+cloned generator state. All three gates passed and the complete quality run
+reported zero fail-closed events. The implementation is opt-in through
+`VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_DISTRIBUTION` and the profile:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_fused_distribution_experimental.yaml
+```
+
+On the matched 2-warmup + 8-request, concurrency-1 screen, this reduced request
+duration from `6.868741 s` to `6.392827 s`, mean TTFP from `477.994 ms` to
+`454.110 ms`, mean chunk RTF from `0.186887` to `0.170914`, and mean E2E from
+`858.076 ms` to `798.406 ms`. Audio throughput improved from `4.955867` to
+`5.362559` audio-seconds/s. TTFT regressed by `1.859 ms`, so this optimization
+does not solve the Thinker first-token path.
+
+A first attempt to replace the growing codec history with a host-maintained
+16-code ring was rejected. Against its immediately adjacent control it
+regressed duration by 4.70%, TTFP by 4.01%, mean chunk RTF by 7.42%, P99 chunk
+RTF by 6.09%, and E2E by 4.70%. The external scalar ring write formed another
+opaque producer/consumer boundary; fixed shape alone is not sufficient when
+the state transition is still outside the executable. The implementation and
+profile remain diagnostic-only and are not submission defaults.
+
+The accepted replacement advances both the fixed 16-code FIFO and the
+6562-entry repetition-frequency vector at the start of the next outer Talker
+graph replay. Only the previous native sampled scalar crosses the graph
+boundary. This is enabled by `VLLM_OMNI_MINICPMO45_NPU_GRAPH_CODEC_STATE` and:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_graph_codec_state_experimental.yaml
+```
+
+Two repeated concurrency-1 runs reproduced the favorable direction. The
+stronger repeat used exactly the same `34.52 s` of generated audio as the
+control and produced the following matched result:
+
+| Metric | Control | Graph-owned state | Change |
+| --- | ---: | ---: | ---: |
+| Duration | 6.2393 s | 5.9242 s | -5.05% |
+| Audio throughput | 5.5327x | 5.8269x | +5.32% |
+| Mean TTFP | 441.24 ms | 423.79 ms | -3.95% |
+| Mean chunk RTF | 0.16544 | 0.15691 | -5.16% |
+| Median chunk RTF | 0.12946 | 0.12030 | -7.07% |
+| P99 chunk RTF | 0.26530 | 0.25739 | -2.98% |
+| Mean E2E | 779.45 ms | 740.07 ms | -5.05% |
+
+The 32-item, concurrency-4 Seed-TTS quality gate then completed 32/32 requests
+with WER `0.0500515` and SIM `0.832275`. The safe control was WER `0.0483154`
+and SIM `0.831314`: WER changed by only +0.174 percentage points, comfortably
+inside the +2-point rule, while SIM improved by `0.000961`. On this same
+official-shape local protocol, duration fell from `21.9106 s` to `18.5383 s`
+(-15.39%), audio throughput rose from `6.3166x` to `7.4700x` (+18.26%), mean
+TTFP fell from `2204.40 ms` to `1869.83 ms` (-15.18%), and mean E2E fell from
+`2585.15 ms` to `2191.32 ms` (-15.23%). These concurrency-4 values include
+scheduler contention and must not be compared directly with the public
+leaderboard's hidden evaluation result.
+
+This closes the codec-distribution and codec-state host boundary, but it still
+executes one dependent codec step per scheduler command. The remaining large
+Talker target is therefore a parity-gated two-code merged command with two
+fixed KV/slot-mapping slabs, followed by four/eight-code unrolling only if the
+native sampler state and EOS commit decisions remain exact. That change can
+remove scheduler crossings; another isolated elementwise fusion cannot.

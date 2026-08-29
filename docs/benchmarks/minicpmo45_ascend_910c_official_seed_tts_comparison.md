@@ -8128,3 +8128,38 @@ device-side sampled-token advance between dependent full-model replays.
 /tmp/lunanexa-bench/graph-codec-state-hf32-v72-zh8/
 /tmp/lunanexa-bench/graph-codec-state-hf32-v72-repeat2-zh8/
 ```
+
+### Calibrated Talker static-W8A8 kernel rejection
+
+The earlier dynamic-W8A8 screen left one important uncertainty: whether its
+loss came mainly from recomputing the activation scale for every batch-one
+Talker token. A second implementation therefore loaded the existing
+32-request activation calibration, quantized only the 20 `gate_up_proj`
+weights once, and used a fixed per-layer activation scale. Focused profile and
+operator tests passed, but the real A2 `[1,768] x [768,6144]` kernel screen
+rejected the path before an expensive service restart:
+
+| Gate/up implementation | A2 latency | Relative to BF16 |
+| --- | ---: | ---: |
+| BF16 linear | 29.15 us | 1.000x |
+| Fixed-scale W8A8, divide-mode quantize | 134.70 us | 0.216x |
+| Fixed-scale W8A8, multiply-mode quantize | 105.10 us | 0.277x |
+| Dynamic W8A8 | 124.04 us | 0.235x |
+
+The fixed-scale result was numerically plausible (`MAE 0.00427`, maximum
+absolute error `0.02148`, reference mean absolute value `0.26367`), but it was
+not a speed optimization. Even the faster multiply-mode form would add roughly
+`(105.10 - 29.15) * 20 = 1.52 ms` to every Talker token before counting any
+other operator. That cannot improve the current roughly 6.7-ms Talker token
+interval. On this batch-one shape, quantize launch and small INT8 matmul
+overheads dominate the saved Cube work. The implementation, profile and
+calibration copy were removed; the accepted graph-owned-codec profile remains
+unchanged.
+
+This closes the isolated precision/quantization branch. The next major target
+is scheduler-owned multi-code Talker execution: reserve lookahead KV/slot
+state, execute dependent replays under one device command, advance the sampled
+code and position on device, and return two parity-checked codec tokens per
+scheduler crossing. That architecture targets the launch/IPC/device-idle
+budget that remains visible in the trace, rather than making the already-small
+batch-one matrix arithmetic more expensive.

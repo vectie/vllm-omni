@@ -92,6 +92,7 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._request_generators = {}
     talker._request_audio_states = {}
     talker._request_repetition_frequencies = {}
+    talker._request_codec_rings = {}
     talker._deferred_cleanup_ids = set()
     talker._static_w8a8_calibration_path = None
     talker._static_w8a8_collectors = {}
@@ -102,6 +103,7 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._fused_codec_distribution_enabled = False
     talker._fused_codec_distribution_disabled = False
     talker._fused_codec_distribution_validated_steps = set()
+    talker._fixed_codec_ring_enabled = False
     talker._fused_codec_sampler_prepared = False
     talker._fused_codec_sampler_request_id = None
     return talker
@@ -567,6 +569,57 @@ def test_incremental_repetition_frequencies_match_sliding_window() -> None:
     expected_history = torch.cat([history[-15:], sampled.reshape(1)])
     expected = torch.bincount(expected_history, minlength=8).to(logits.dtype).reshape(1, -1)
     assert torch.equal(talker._request_repetition_frequencies["req"], expected)
+
+
+def test_fixed_codec_ring_matches_growing_history_for_many_wraps() -> None:
+    talker = _make_talker()
+    talker._fixed_codec_ring_enabled = True
+    logits = torch.zeros(1, 8)
+    history = torch.empty(0, dtype=torch.long)
+    frequencies = talker._repetition_frequencies("req-ring", history, logits)
+    reference: list[int] = []
+
+    for value in [0, 1, 1, 2, 3, 5, 7, 6, 4, 4, 3, 2, 1, 0, 7, 6, 5, 4, 3, 2] * 3:
+        sampled = torch.tensor(value)
+        talker._advance_repetition_frequencies(
+            "req-ring",
+            history,
+            sampled,
+            frequencies,
+        )
+        reference.append(value)
+        reference = reference[-16:]
+        frequencies = talker._request_repetition_frequencies["req-ring"]
+        history = talker._codec_ring_history("req-ring", history)
+        expected = torch.bincount(
+            torch.tensor(reference),
+            minlength=8,
+        ).to(logits.dtype).reshape(1, -1)
+        assert torch.equal(frequencies, expected)
+
+    entry = talker._request_codec_rings["req-ring"]
+    assert entry["slab"].numel() == 16
+    assert entry["length"] == 16
+    assert sorted(history.tolist()) == sorted(reference)
+
+
+def test_fixed_codec_ring_initializes_from_legacy_history() -> None:
+    talker = _make_talker()
+    talker._fixed_codec_ring_enabled = True
+    history = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7] * 3)
+    logits = torch.zeros(1, 8)
+
+    frequencies = talker._repetition_frequencies("req-restore", history, logits)
+    talker._advance_repetition_frequencies(
+        "req-restore",
+        history,
+        torch.tensor(3),
+        frequencies,
+    )
+
+    expected_history = torch.cat([history[-15:], torch.tensor([3])])
+    expected = torch.bincount(expected_history, minlength=8).to(logits.dtype).reshape(1, -1)
+    assert torch.equal(talker._request_repetition_frequencies["req-restore"], expected)
 
 
 def test_bounded_codec_candidates_match_full_warper_distribution() -> None:

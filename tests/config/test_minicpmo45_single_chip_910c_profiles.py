@@ -120,6 +120,20 @@ def test_a2_evaluator_fused_distribution_candidate_is_talker_only():
     )
 
 
+def test_a2_evaluator_fixed_codec_ring_candidate_is_talker_only():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_fused_distribution_ring_experimental.yaml"
+    )
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_DISTRIBUTION"] == "1"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_FIXED_CODEC_RING"] == "1"
+    assert "VLLM_OMNI_MINICPMO45_NPU_FIXED_CODEC_RING" not in (stage0.env or {})
+    assert "VLLM_OMNI_MINICPMO45_NPU_FIXED_CODEC_RING" not in (stage2.env or {})
+
+
 def test_a2_evaluator_sampler_sync_diagnostic_is_explicitly_talker_only():
     deploy = _load_profile(
         "minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_sampler_graph_sync_diagnostic.yaml"
@@ -142,6 +156,9 @@ def test_a2_evaluator_async_safe_profile_does_not_enable_rejected_sampler():
     for stage in deploy.stages:
         assert "VLLM_OMNI_MINICPMO45_NPU_CODEC_SAMPLER_GRAPH" not in (stage.env or {})
         assert "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_DISTRIBUTION" not in (
+            stage.env or {}
+        )
+        assert "VLLM_OMNI_MINICPMO45_NPU_FIXED_CODEC_RING" not in (
             stage.env or {}
         )
 

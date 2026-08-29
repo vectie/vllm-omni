@@ -1,0 +1,14 @@
+# A2 score candidate layered on the native-multinomial outer-graph codec
+# distribution. The Talker keeps its 16-code repetition window in one fixed
+# circular NPU slab, replacing the per-code torch.cat allocation and using a
+# logical cursor to select the evicted code. Sampling probabilities, RNG and
+# the observable codec stream are unchanged.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_fused_distribution_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_FIXED_CODEC_RING: "1"

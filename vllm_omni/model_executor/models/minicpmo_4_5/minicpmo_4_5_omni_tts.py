@@ -55,6 +55,7 @@ _NPU_FUSED_CODEC_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_SAMPLER"
 _NPU_FUSED_CODEC_DISTRIBUTION_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_DISTRIBUTION"
 )
+_NPU_FIXED_CODEC_RING_ENV = "VLLM_OMNI_MINICPMO45_NPU_FIXED_CODEC_RING"
 _NPU_BATCHED_CODEC_OUTPUT_ENV = "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
 _NPU_DEFERRED_CHUNK_EOS_ENV = "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS"
 _DIRECT_STOP_SAMPLER_ENV = "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER"
@@ -417,6 +418,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._request_repetition_frequencies: dict[str, torch.Tensor] = {}
+        self._request_codec_rings: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
         self._static_w8a8_calibration_path: str | None = None
         self._static_w8a8_collectors: dict[str, torch.Tensor] = {}
@@ -449,6 +451,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
         self._fused_codec_distribution_disabled = False
         self._fused_codec_distribution_validated_steps: set[int] = set()
+        # The legacy path grows a 16-code history with torch.cat after every
+        # codec. On a launch-bound NPU decode loop that is one allocation and
+        # one Cat kernel per step. Keep the exact same multiset in a fixed
+        # circular slab and use its cursor to identify the evicted code.
+        self._fixed_codec_ring_enabled = _env_enabled(
+            _NPU_FIXED_CODEC_RING_ENV,
+            default=False,
+        )
         self._fused_codec_sampler_prepared = False
         self._fused_codec_sampler_request_id: str | None = None
         # Code2Wav consumes codec chunks, not Talker's per-token hidden row.
@@ -770,6 +780,95 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
+    def _codec_ring_entry(
+        self,
+        request_id: str,
+        history: torch.Tensor,
+        device: torch.device,
+    ) -> dict[str, Any] | None:
+        """Return the request's fixed 16-code history slab.
+
+        The slab is initialized once from the legacy history so enabling the
+        optimization is safe across prefill/decode transitions and restored
+        request metadata. Physical ring order is intentionally opaque; only
+        frequency counts, the eviction cursor, and the latest code are used by
+        the Talker hot path.
+        """
+        if not getattr(self, "_fixed_codec_ring_enabled", False):
+            return None
+        entry = self._request_codec_rings.get(request_id)
+        if entry is not None:
+            slab = entry.get("slab")
+            if (
+                isinstance(slab, torch.Tensor)
+                and slab.device == device
+                and slab.dtype == torch.long
+                and slab.numel() == _REPETITION_WINDOW
+            ):
+                return entry
+
+        recent = history.reshape(-1)[-_REPETITION_WINDOW:].to(
+            device=device,
+            dtype=torch.long,
+        )
+        slab = torch.empty(
+            (_REPETITION_WINDOW,),
+            device=device,
+            dtype=torch.long,
+        )
+        length = int(recent.numel())
+        if length:
+            slab[:length].copy_(recent)
+        entry = {
+            "slab": slab,
+            "length": length,
+            "cursor": length % _REPETITION_WINDOW,
+        }
+        self._request_codec_rings[request_id] = entry
+        return entry
+
+    def _codec_ring_history(
+        self,
+        request_id: str,
+        fallback: torch.Tensor,
+    ) -> torch.Tensor:
+        entry = self._request_codec_rings.get(request_id)
+        if not isinstance(entry, dict):
+            return fallback
+        slab = entry.get("slab")
+        if not isinstance(slab, torch.Tensor):
+            return fallback
+        return slab[: int(entry.get("length", 0))]
+
+    def _codec_ring_expired(
+        self,
+        request_id: str,
+        history: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        entry = self._codec_ring_entry(request_id, history, device)
+        if entry is None or int(entry["length"]) < _REPETITION_WINDOW:
+            return None
+        return entry["slab"][int(entry["cursor"])].reshape(())
+
+    def _record_codec_ring_sample(
+        self,
+        request_id: str,
+        history: torch.Tensor,
+        sampled: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        entry = self._codec_ring_entry(request_id, history, device)
+        if entry is None:
+            return
+        cursor = int(entry["cursor"])
+        entry["slab"][cursor].copy_(sampled.reshape(()))
+        entry["cursor"] = (cursor + 1) % _REPETITION_WINDOW
+        entry["length"] = min(
+            _REPETITION_WINDOW,
+            int(entry["length"]) + 1,
+        )
+
     def _repetition_frequencies(
         self,
         request_id: str,
@@ -784,7 +883,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             and frequencies.shape[-1] == logits.shape[-1]
         ):
             return frequencies
-        recent = history.reshape(-1)[-_REPETITION_WINDOW:].to(device=logits.device, dtype=torch.long)
+        entry = self._codec_ring_entry(request_id, history, logits.device)
+        if entry is None:
+            recent = history.reshape(-1)[-_REPETITION_WINDOW:].to(
+                device=logits.device,
+                dtype=torch.long,
+            )
+        else:
+            recent = entry["slab"][: int(entry["length"])]
         if recent.numel() == 0:
             frequencies = logits.new_zeros(logits.shape)
         else:
@@ -803,10 +909,24 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         """Advance the 16-code frequency window using device-native compares."""
         vocab_ids = self._codec_vocab_ids.to(device=frequencies.device)
         next_frequencies = frequencies + (vocab_ids == sampled).to(dtype=frequencies.dtype)
-        if history.numel() >= _REPETITION_WINDOW:
-            expired = history.reshape(-1)[-_REPETITION_WINDOW].to(device=frequencies.device)
+        expired = self._codec_ring_expired(
+            request_id,
+            history,
+            frequencies.device,
+        )
+        if expired is None and history.numel() >= _REPETITION_WINDOW:
+            expired = history.reshape(-1)[-_REPETITION_WINDOW].to(
+                device=frequencies.device,
+            )
+        if expired is not None:
             next_frequencies = next_frequencies - (vocab_ids == expired).to(dtype=frequencies.dtype)
         self._request_repetition_frequencies[request_id] = next_frequencies
+        self._record_codec_ring_sample(
+            request_id,
+            history,
+            sampled,
+            frequencies.device,
+        )
 
     def prepare_fused_codec_sampler_inputs(
         self,
@@ -880,9 +1000,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         min_tokens = int(state.get("min_tokens", self._codec_min_tokens))
         self._fused_codec_mask_eos.fill_(step < min_tokens)
         self._fused_codec_expired.fill_(-1)
-        if codes.numel() >= _REPETITION_WINDOW:
+        expired = self._codec_ring_expired(
+            request_id,
+            codes,
+            self._fused_codec_expired.device,
+        )
+        if expired is None and codes.numel() >= _REPETITION_WINDOW:
+            expired = codes[-_REPETITION_WINDOW]
+        if expired is not None:
             self._fused_codec_expired.copy_(
-                codes[-_REPETITION_WINDOW].reshape(1, 1)
+                expired.reshape(1, 1)
             )
         if getattr(self, "_fused_codec_sampler_enabled", False):
             self._fused_codec_uniform.uniform_(
@@ -908,7 +1035,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._fused_codec_sampler_request_id = None
         self._fused_codec_frequencies.copy_(self._fused_codec_next_frequencies)
         self._request_repetition_frequencies[request_id] = self._fused_codec_frequencies
-        return self._fused_codec_sampled.reshape(())
+        sampled = self._fused_codec_sampled.reshape(())
+        state = self._request_audio_states.get(request_id, {})
+        history = state.get("codes")
+        if not isinstance(history, torch.Tensor):
+            history = sampled.new_empty(0, dtype=torch.long)
+        self._record_codec_ring_sample(
+            request_id,
+            history,
+            sampled,
+            sampled.device,
+        )
+        return sampled
 
     def _consume_fused_codec_distribution(
         self,
@@ -1085,9 +1223,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             graph_entry["frequencies"].copy_(frequencies)
             graph_entry["mask_eos"].fill_(mask_eos)
             graph_entry["expired"].fill_(-1)
-            if history.numel() >= _REPETITION_WINDOW:
+            expired = self._codec_ring_expired(
+                request_id,
+                history,
+                graph_entry["expired"].device,
+            )
+            if expired is None and history.numel() >= _REPETITION_WINDOW:
+                expired = history.reshape(-1)[-_REPETITION_WINDOW]
+            if expired is not None:
                 graph_entry["expired"].copy_(
-                    history.reshape(-1)[-_REPETITION_WINDOW].reshape(1, 1)
+                    expired.reshape(1, 1)
                 )
             generator = self._request_generator(request_id, hidden_state.device)
             sampler_shadow = _env_enabled(
@@ -1184,6 +1329,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # the pre-draw request state so the native sample advances the
             # repetition window exactly once.
             frequencies.copy_(next_frequencies)
+            self._record_codec_ring_sample(
+                request_id,
+                history,
+                sampled,
+                frequencies.device,
+            )
             if not graph_entry["runtime_validated"]:
                 valid_sample = bool(
                     ((sampled >= 0) & (sampled < self._num_audio_tokens)).all().item()
@@ -1702,7 +1853,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # Deferred EOS may feed a few terminal-tail samples speculatively;
             # the transport boundary trims all of them from observable output.
             if (defer_eos or not is_eos) and not reached_limit:
-                codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)])
+                if getattr(self, "_fixed_codec_ring_enabled", False):
+                    codes = self._codec_ring_history(request_id, codes)
+                else:
+                    codes = torch.cat(
+                        [codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)]
+                    )
                 delta = sampled.reshape(1, 1)
             else:
                 delta = empty_delta
@@ -1841,6 +1997,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators.pop(request_id, None)
             request_audio_states.pop(request_id, None)
             self._request_repetition_frequencies.pop(request_id, None)
+            self._request_codec_rings.pop(request_id, None)
             transport_codes.pop(request_id, None)
             transport_chunks.pop(request_id, None)
         self._deferred_cleanup_ids.clear()

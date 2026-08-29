@@ -1,0 +1,35 @@
+# A2 single-chip isolation profile for stage-aware CPU/NUMA binding.
+#
+# All three workers share logical NPU 0. Ascend's ordinary per-NPU binder would
+# assign them the same host cores, so this profile subdivides the NPU-local CPU
+# pool 1:2:1 and gives the host-bound Talker half. IRQ affinity is deliberately
+# left untouched because it belongs to the shared NPU rather than one stage.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        env:
+          VLLM_ASCEND_ENABLE_ADD_RMS_NORM_BIAS: "0"
+          VLLM_ASCEND_CPU_BINDING_STAGE_SLICE: "0:1,2,1"
+        additional_config:
+          enable_cpu_binding: true
+          ascend_compilation_config:
+            fuse_norm_quant: false
+      - stage_id: 1
+        env:
+          VLLM_ASCEND_ENABLE_ADD_RMS_NORM_BIAS: "0"
+          VLLM_ASCEND_CPU_BINDING_STAGE_SLICE: "1:1,2,1"
+        additional_config:
+          enable_cpu_binding: true
+          ascend_compilation_config:
+            fuse_norm_quant: false
+          fia_graph_seq_len_bucket_size: 16
+          enable_fia_bucket_async_replay: true
+      - stage_id: 2
+        env:
+          VLLM_ASCEND_CPU_BINDING_STAGE_SLICE: "2:1,2,1"
+        additional_config:
+          enable_cpu_binding: true

@@ -7707,6 +7707,39 @@ WER-failing audio candidate releasable.  The previously qualified full results
 lineage, not a waiver for this rejected sampler.  The inverse-CDF profile stays
 explicitly experimental and the resident eager sampler remains the A2 default.
 
+An initial post-replay synchronization diagnostic did not recover output
+equivalence: all eight whole-audio hashes and all eight per-request chunk-hash
+sequences differed from the resident eager sampler, and the synchronized graph
+run took 7.17 seconds versus 6.75 seconds for the safe control. A second run
+with both pre-replay and post-replay fences took 7.21 seconds and produced the
+same 32.84 seconds of audio as the post-only run, while the safe control
+produced 34.04 seconds. However, a same-service repeat produced 38.84 seconds,
+so end-to-end WAV hashes are not stable enough to attribute the divergence to
+the sampler alone. The next diagnostic compares graph inverse-CDF and resident
+multinomial draws inside the same forward pass from an identical generator
+state and fails on the first codec-token mismatch. All synchronization and
+shadow profiles remain ineligible for submission.
+
+The same-forward shadow then found the first actionable divergence at codec
+step 1: uniform `0.916076303`, graph token `1303`, eager inverse-CDF token
+`4218`, and resident multinomial token `4218`. This proves that the RNG mapping
+and eager inverse-CDF arithmetic agree with the resident sampler for the real
+runtime distribution. A second diagnostic fenced before replay, immediately
+after replay, and before copying graph outputs. It still returned token `1303`
+instead of `4218`. Cross-stream output ordering is therefore rejected as the
+root cause: in the real FULL_DECODE service context this nested graph retained
+the capture-time scalar rather than consuming the fixed-address uniform update.
+
+Graph construction now includes a post-capture runtime-input probe, but the
+same nested-graph failure allowed that capture-context probe to pass. The
+authoritative gate therefore runs on the first real codec step from an
+identical pre-draw generator state. If graph inverse-CDF, eager inverse-CDF and
+native multinomial do not return the same token, serving returns the native
+token, advances the canonical rolling frequency state and permanently disables
+the sampler graph. The gate costs one shadow draw once and fails closed without
+killing Stage 1. A future graph-internal RNG or multi-code Talker graph must
+pass this real-runtime canary before any WER budget is spent.
+
 ```text
 b64aa0073cee42b804a9742ebc0b9cb24e563a410dec034909510a120d78156e  resident-control-zh32.json
 a13e96ee73dd2d0680c083d000f4203d759a455ba108003396d58b83ec43ad54  inverse-cdf-zh32.json
@@ -7816,3 +7849,112 @@ not explain bounded-eager versus bounded-graph divergence.  It does mean the
 bounded optimization must retain its own official quality evidence; it must
 not be described as unconditionally bitwise-equivalent to the original full
 sort.
+
+### 2026-08-29 12:09 leaderboard refresh
+
+The public vLLM-Omni table moved materially again. The new top ten is:
+
+| Rank | Team | RTF | TTFP | TTFT |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | 纠纠在努力 | 0.0768 | 158.96 ms | 6.47 ms |
+| 2 | 李炎彬 | 0.0976 | 506.12 ms | 48.03 ms |
+| 3 | iin | 0.0987 | 214.37 ms | 48.20 ms |
+| 4 | 奶龙必胜 | 0.1058 | 263.45 ms | 95.72 ms |
+| 5 | 5.6-sol | 0.1133 | 212.41 ms | 104.99 ms |
+| 6 | grounds | 0.1258 | 266.07 ms | 108.44 ms |
+| 7 | 田峻钢 | 0.1274 | 678.33 ms | 46.66 ms |
+| 8 | 榴莲大王 | 0.1290 | 698.39 ms | 47.28 ms |
+| 9 | yesoryes | 0.1360 | 509.06 ms | 370.98 ms |
+| 10 | LinguistWantsTech | 0.1398 | 207.62 ms | 47.30 ms |
+
+The table refresh time is `2026-08-29 12:09:56`. The last published
+`向量贴贴` result, RTF `0.2423`, is no longer in the truncated top ten. It is
+68.30% above the leader and 42.29% above the tenth-place boundary. Even the
+latest qualified local A2 path cannot close that gap with another Stage-2 or
+metadata micro-optimization.
+
+The ranking movement strengthens the architectural conclusion from the hot
+trace. The next large experiment must execute several dependent codec steps
+inside one isolated Talker worker command, with fixed-address KV/metadata,
+graph-internal RNG or a proven native-sampler boundary, and device EOS masks.
+It must retain the current asynchronous scheduler around that inner loop. The
+minimum useful screen is a static two-step unroll: it should nearly halve the
+per-code scheduler crossing count while preserving every sampled code and RNG
+state. Only after two-step parity should the unroll grow to four or eight.
+
+### Real-runtime sampler gate result
+
+The first real Seed-TTS request confirmed that the capture-context probe was
+not sufficient. On codec step 1 the nested graph returned code `1303`, while
+eager inverse-CDF and the resident native multinomial both returned `4218` for
+the same uniform value `0.916076303`. The real-runtime gate disabled the graph,
+returned the native code, and allowed the request to finish. Stage 1 produced
+122 stream units with mean ITL `5.789 ms`, the request returned HTTP 200, and
+the service remained healthy. This is the required fail-closed behavior: the
+experimental sampler can no longer terminate Stage 1 or silently reach an
+accuracy run after its first observed mismatch.
+
+The graph sampler remains diagnostic-only. The result also sharpens the design
+requirement for a merged Talker graph: runtime RNG/state updates must be part of
+the outer executable or use an Ascend graph-task update hook with explicit event
+ordering. A nested capture that merely copies a scalar into a fixed-address
+buffer is not a valid substitute in the FULL_DECODE service context.
+
+### More aggressive host-bound plan
+
+The Ascend multi-step graph RFC describes the closest upstream analogue to our
+Talker bottleneck: capture one merged multi-step graph, update attention runtime
+parameters once, and allocate distinct slot-mapping buffers for each internal
+step. Applying that design to MiniCPM-o means a two-code Talker command first,
+with two fixed KV/metadata slabs and one graph-visible EOS/commit decision.
+Parity is checked after every internal code, including generator state. A
+successful two-code screen is then extended to four codes. This attacks the
+roughly 83.5% device-idle share in the earlier Talker trace rather than the
+already-short device kernels.
+
+The current three-stage single-NPU deployment also disabled CPU binding. Simply
+enabling the stock per-NPU binder is unsafe because Thinker, Talker and Code2Wav
+would all receive the same NPU-local CPU pool. The experimental profile below
+instead partitions that pool into disjoint `1:2:1` slices, gives the host-bound
+Talker half, keeps every slice NUMA-local, and deliberately leaves the shared
+NPU IRQ placement untouched:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_1npu_a2_evaluator_stage_cpu_slice_experimental.yaml
+```
+
+The supporting vLLM-Ascend implementation uses
+`VLLM_ASCEND_CPU_BINDING_STAGE_SLICE=index:weight,weight,...`. It is opt-in and
+must not replace the submission profile until a matched official-shape A/B run
+improves RTF, P99 and TTFP. This is a high-leverage screen because the upstream
+A2 CPU-binding experiment improved total token throughput from 124.08 to
+146.93 token/s and TPOT from 11.78 to 9.90 ms in a host-bound decode workload;
+the exact gain is workload-specific and is not assumed here.
+
+The A2 screen confirmed the intended topology: Talker received CPUs 128-159
+on NUMA 4, while Thinker and Code2Wav received disjoint 16-core slices on NUMA
+5. The container did not permit `migratepages`; this is handled as a warning,
+so affinity remained active without claiming page migration. The complete CPU
+binding test file passed 89/89 tests. The 2-warmup + 8-request Seed-TTS run then
+completed 8/8 requests with mean TTFP `489.319 ms`, mean chunk RTF `0.192519`
+over 31 chunks, median chunk RTF `0.151948`, and Stage-1 ITL between roughly
+`5.56` and `5.99 ms`. The immediately following safe control used the same
+prompts, seed, 2 warmups and 8 measured requests. It completed in `6.8967 s`
+with mean TTFP `479.319 ms`, mean TTFT `74.611 ms`, and mean chunk RTF
+`0.187680` over the same 31 chunks. The stage-sliced candidate was worse by
+2.60% in duration, 2.09% in TTFP, 5.04% in TTFT and 2.58% in mean chunk RTF.
+It is therefore rejected as a submission default and retained only as an
+opt-in experiment. The safe service was restored and returned HTTP 200 after
+the control run.
+
+After merged Talker execution, the next architecture screen is to deepen and
+measure the overlap already enabled by `async_chunk`: prove on a two-process
+timeline that Code2Wav chunk `n` overlaps Talker generation of chunk `n+1`,
+then remove any remaining connector-side host fence. Inside Code2Wav, CFM and
+HiFT can similarly use events and ping-pong buffers if the timeline shows idle
+space rather than Cube/Vector contention. This follows the useful SGLang-Omni
+separation between an AR scheduler and a streaming vocoder scheduler. Same-NPU
+replicas are not the first move on this 32-GiB A2: the resident process already
+uses about 27.7 GiB, so independent weight copies do not fit. Weight sharing
+could revisit that idea later, but a single merged Talker executable removes
+the same dispatch bubbles without a second model replica.

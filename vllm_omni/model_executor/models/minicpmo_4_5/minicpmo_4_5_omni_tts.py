@@ -633,6 +633,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 torch.full((1,), -1, dtype=torch.long),
                 persistent=False,
             )
+            self.register_buffer(
+                "_fused_codec_sample_position",
+                torch.zeros((1, 1), dtype=torch.long),
+                persistent=False,
+            )
 
         self.has_preprocess = True
         self.has_postprocess = False
@@ -1201,6 +1206,40 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             step in validation_steps
             and step not in self._fused_codec_distribution_validated_steps
         )
+        fixed_native_outputs = (
+            getattr(self, "_graph_codec_state_enabled", False)
+            and isinstance(
+                getattr(self, "_fused_codec_sample_position", None),
+                torch.Tensor,
+            )
+        )
+
+        def sample_graph_distribution() -> torch.Tensor:
+            if not fixed_native_outputs:
+                position = torch.multinomial(
+                    probabilities,
+                    num_samples=1,
+                    generator=generator,
+                )
+                return candidate_ids.gather(-1, position).reshape(())
+            # Preserve native MultinomialWithReplacement and its generator
+            # mapping, but write both tiny results into stable model-owned
+            # slabs. This removes two allocator calls and the following D2D
+            # pending-sample copy from every codec step.
+            torch.multinomial(
+                probabilities,
+                num_samples=1,
+                generator=generator,
+                out=self._fused_codec_sample_position,
+            )
+            torch.gather(
+                candidate_ids,
+                -1,
+                self._fused_codec_sample_position,
+                out=self._fused_codec_pending_sample.reshape(1, 1),
+            )
+            return self._fused_codec_pending_sample.reshape(())
+
         if validate:
             shadow_generator = torch.Generator(device=probabilities.device)
             shadow_generator.set_state(generator.get_state())
@@ -1220,17 +1259,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     )
                 ),
             )
-            graph_position = torch.multinomial(
-                probabilities,
-                num_samples=1,
-                generator=generator,
-            )
             eager_position = torch.multinomial(
                 eager_probabilities,
                 num_samples=1,
                 generator=shadow_generator,
             )
-            graph_sample = candidate_ids.gather(-1, graph_position).reshape(())
+            graph_sample = sample_graph_distribution()
             eager_sample = eager_ids.gather(-1, eager_position).reshape(())
             ids_match = torch.equal(candidate_ids, eager_ids)
             probs_match = torch.allclose(
@@ -1292,17 +1326,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
             sampled = graph_sample
         else:
-            sampled_position = torch.multinomial(
-                probabilities,
-                num_samples=1,
-                generator=generator,
-            )
-            sampled = candidate_ids.gather(-1, sampled_position).reshape(())
+            sampled = sample_graph_distribution()
 
         if getattr(self, "_graph_codec_state_enabled", False):
             # The next outer replay consumes this fixed-address scalar and
             # advances both the frequency vector and FIFO inside the graph.
-            self._fused_codec_pending_sample.copy_(sampled.reshape(1))
+            if not fixed_native_outputs:
+                self._fused_codec_pending_sample.copy_(sampled.reshape(1))
             self._request_repetition_frequencies[request_id] = (
                 self._fused_codec_frequencies
             )

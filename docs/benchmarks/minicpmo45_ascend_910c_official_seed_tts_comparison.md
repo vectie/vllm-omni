@@ -8423,3 +8423,51 @@ and submission source keep the explicit ownership copy.
 /tmp/lunanexa-bench/rtf-control-residency-no-clone-q2-zh32-20260830/
 /tmp/lunanexa-bench/rtf-control-residency-no-clone-q2-zh32-repeat-20260830/
 ```
+
+### Accepted fixed-output native Talker sampler
+
+The retained graph-owned Talker still allocated a one-element position tensor
+for native `torch.multinomial`, allocated another one-element gather result,
+then copied that result into the fixed pending-sample input of the next outer
+graph.  The next exact optimization keeps Ascend's native
+`MultinomialWithReplacement` implementation and request generator unchanged,
+but supplies model-owned `out=` slabs to both `torch.multinomial` and
+`torch.gather`.  The gathered codec ID therefore lands directly at the stable
+address consumed by the next replay; two tiny allocations and one D2D copy are
+removed per codec token.  The path is restricted to graph-owned codec state;
+the standalone, fallback and non-graph paths retain their canonical code.
+
+An A2 micro-screen compared the canonical allocating path with the fixed-output
+path for 1,000 consecutive draws.  Sampled tokens matched 1,000/1,000, final
+generator state matched, and both output addresses remained stable.  Five
+focused remote tests passed.  In the real service, the eager distribution and
+sample gates passed at codec steps 1, 16 and 50 with no fail-closed event.
+
+The adjacent eight-request screen emitted the same `816,960` frames / `34.04
+s` on both paths and improved mean chunk RTF from `0.231265` to `0.229283`
+(-0.86%).  The longer comparison also emitted exactly the same `3,323,520`
+frames / `138.48 s` on both paths:
+
+| Metric (lower is better except throughput) | Control residency | Fixed native outputs | Change |
+| --- | ---: | ---: | ---: |
+| Benchmark duration | 23.815255 s | **23.640800 s** | **-0.73%** |
+| Audio throughput | 5.814760x | **5.857670x** | **+0.74%** |
+| Mean audio RTF | 0.173685 | **0.172394** | **-0.74%** |
+| Mean all-chunk RTF | 0.157028 | **0.155829** | **-0.76%** |
+| Median all-chunk RTF | 0.120263 | **0.119030** | **-1.02%** |
+| P99 all-chunk RTF | 0.258882 | **0.257629** | **-0.48%** |
+| Mean TTFP | 433.73 ms | **431.73 ms** | **-0.46%** |
+| Mean E2E | 743.80 ms | **738.31 ms** | **-0.74%** |
+
+Mean TTFT moved from `74.87 ms` to `76.13 ms`; this Talker-only change cannot
+shorten the Thinker first-token path, and the 1.26-ms movement is retained as
+a guardrail observation rather than attributed to the sampler.  The exact
+native operator and same-output evidence mean the preceding qualified quality
+gate remains applicable, but the organizer's complete pre-submission gate is
+still required.
+
+```text
+/tmp/lunanexa-bench/fixed-native-sampler-control-zh8-20260830/
+/tmp/lunanexa-bench/fixed-native-sampler-candidate-zh8-20260830/
+/tmp/lunanexa-bench/fixed-native-sampler-candidate-zh32-20260830/
+```

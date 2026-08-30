@@ -109,6 +109,8 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._graph_codec_state_enabled = False
     talker._graph_codec_state_request_id = None
     talker._fused_codec_mask_eos_value = None
+    talker._fused_codec_sample_position = torch.zeros((1, 1), dtype=torch.long)
+    talker._fused_codec_pending_sample = torch.full((1,), -1, dtype=torch.long)
     talker._fused_codec_sampler_prepared = False
     talker._fused_codec_sampler_request_id = None
     return talker
@@ -314,6 +316,59 @@ def test_fused_codec_distribution_keeps_native_multinomial_mapping() -> None:
         reference_generator.get_state(),
     )
     assert talker._request_repetition_frequencies["req-distribution"][0, int(expected)] == 1
+
+
+def test_graph_codec_state_samples_into_fixed_native_output_slabs() -> None:
+    talker = _make_talker()
+    talker._codec_temperature = 0.8
+    talker._codec_top_k = 5
+    talker._codec_top_p = 0.85
+    talker._codec_repetition_penalty = 1.05
+    talker._fused_codec_distribution_enabled = True
+    talker._graph_codec_state_enabled = True
+    talker._fused_codec_sampler_prepared = True
+    talker._fused_codec_sampler_request_id = "req-fixed-native"
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_penalty = torch.tensor([1.05])
+    talker.head_code = nn.ModuleList([nn.Linear(4, 8, bias=False)])
+    hidden = torch.tensor([[0.5, -0.25, 0.75, 1.0]])
+    state = {"step": 2, "min_tokens": 2, "max_tokens": 64}
+    talker._request_audio_states["req-fixed-native"] = state
+    probabilities, candidate_ids = _bounded_codec_distribution(
+        hidden,
+        talker._fused_codec_frequencies,
+        talker.head_code[0].weight,
+        talker._fused_codec_penalty,
+        temperature=0.8,
+        top_k=5,
+        top_p=0.85,
+        eos_id=7,
+        mask_eos=False,
+    )
+    talker._fused_codec_probabilities = probabilities.clone()
+    talker._fused_codec_candidate_ids = candidate_ids.clone()
+    output_ptr = talker._fused_codec_pending_sample.data_ptr()
+    reference_generator = torch.Generator().manual_seed(42)
+    expected_position = torch.multinomial(
+        probabilities,
+        num_samples=1,
+        generator=reference_generator,
+    )
+    expected = candidate_ids.gather(-1, expected_position).reshape(())
+
+    sampled = talker._consume_fused_codec_distribution(
+        hidden,
+        torch.empty(0, dtype=torch.long),
+        "req-fixed-native",
+        2,
+    )
+
+    assert torch.equal(sampled, expected)
+    assert sampled.data_ptr() == output_ptr
+    assert torch.equal(
+        talker._request_generators["req-fixed-native"].get_state(),
+        reference_generator.get_state(),
+    )
 
 
 def test_fused_codec_distribution_fails_closed_on_stale_graph_output() -> None:

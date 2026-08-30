@@ -8620,3 +8620,40 @@ screened separately for diminishing returns and longer command occupancy.
 /tmp/lunanexa-bench/exact4-candidate-zh8/
 /tmp/lunanexa-bench/exact4-candidate-zh8-repeat/
 ```
+
+### Qualified exact eight-step Talker command
+
+The eight-step screen reserves seven lookahead KV slots and applies the same
+per-target publication/EOS gate used by the two- and four-step profiles. Its
+complete one-request diagnostic again matched all 140 sampled tokens, 122
+published tokens, 139 candidate sets, 139 probability vectors, step metadata
+and final RNG digest from the synchronized control.
+
+The first hot eight-request run emitted exactly `940,800` frames / `39.20 s`:
+
+| Metric (lower is better except throughput) | Async baseline | Exact 4-step | Exact 8-step | 8-step vs async |
+| --- | ---: | ---: | ---: | ---: |
+| Benchmark duration | 7.870085 s | 6.499383 s | **6.076571 s** | **-22.79%** |
+| Weighted overall RTF | 0.200767 | 0.165801 | **0.155015** | **-22.79%** |
+| Audio throughput | 4.980886x | 6.031342x | **6.451007x** | **+29.51%** |
+| Mean all-chunk RTF | 0.215572 | 0.181793 | **0.170773** | **-20.78%** |
+| Median all-chunk RTF | 0.114933 | 0.086176 | **0.075220** | **-34.55%** |
+| Mean TTFP | 443.00 ms | 370.97 ms | **347.62 ms** | **-21.53%** |
+| Mean TTFT | 86.04 ms | 81.43 ms | **77.60 ms** | **-9.81%** |
+
+Against four-step on the same-output first run, eight-step lowers weighted RTF
+another 6.51% and TTFP another 6.29%. The already-hot repeat completed 8/8
+requests with weighted RTF `0.120924`, mean TTFP `341.95 ms`, mean TTFT
+`74.65 ms`, and audio throughput `8.269665x`; it generated `40.56 s` of audio
+and is therefore a stability result rather than the same-output headline.
+
+Eight-step becomes the best bounded single-request Talker profile. It remains
+experimental for concurrent traffic because a longer command can reduce
+scheduler fairness even though it wins the competition's concurrency-one RTF
+path. Complete organizer quality gates are still mandatory before submission.
+
+```text
+/tmp/lunanexa-bench/exact8-candidate-parity-smoke/
+/tmp/lunanexa-bench/exact8-candidate-zh8/
+/tmp/lunanexa-bench/exact8-candidate-zh8-repeat/
+```

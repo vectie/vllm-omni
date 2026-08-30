@@ -8471,3 +8471,60 @@ still required.
 /tmp/lunanexa-bench/fixed-native-sampler-candidate-zh8-20260830/
 /tmp/lunanexa-bench/fixed-native-sampler-candidate-zh32-20260830/
 ```
+
+### Rejected Talker transport-allocation candidates
+
+Three follow-up screens tried to remove the remaining per-code ownership
+allocation without changing native sampling, codec chunk geometry or EOS
+rules. None met the promotion bar.
+
+The first candidate copied every native sampled scalar into one request-owned
+fixed transport slab and cloned only the contiguous prefix at the Code2Wav
+boundary. Its same-output eight-request hot repeat regressed mean audio RTF
+from `0.173939` to `0.174775` (+0.48%) and mean chunk RTF from `0.156909` to
+`0.158276` (+0.87%). A 32-request run moved in the opposite direction by only
+0.42--0.47%, inside the observed noise band. The extra per-token D2D copy
+replaced allocator work but did not remove an NPU launch, so the candidate was
+removed.
+
+The second candidate attempted to reuse the graph-owned 100-code repetition
+FIFO directly as the transport accumulator. Unit tests covered normal chunk
+publication and max-token tail exclusion, but the real A2 gate exposed an
+invalid graph boundary: eight requests emitted only `438,720` PCM frames /
+`18.28 s`, versus the qualified trajectory's `828,480` frames / `34.52 s`.
+Mean TTFP rose to `626.34 ms` and mean audio RTF to approximately `0.32`.
+The codec-distribution runtime gates still passed at steps 1, 16 and 50, which
+isolates the failure to reading graph-internal mutable state as if it were a
+graph-visible output. A future zero-copy transport ring must be an explicit
+graph output with a recorded event/current-stream wait or live entirely inside
+a scheduler-owned multi-code executable; an undeclared FIFO alias is unsafe.
+
+The last candidate cached the request-invariant empty codec payload and the
+two host `finished` metadata scalars. Six focused transport/EOS tests passed,
+and the change could not alter model arithmetic. Initial A/B pairs appeared
+faster, but TTFT also shifted by 6--9% even though the candidate does not touch
+Stage 0, proving a machine-state confound. A reverse A-B-A control on the exact
+same `3,293,760` frames rejected the candidate:
+
+| Metric (lower is better) | Resident-empty candidate | Reverse control | Candidate change |
+| --- | ---: | ---: | ---: |
+| Benchmark duration | 23.647043 s | **23.577498 s** | +0.29% |
+| Mean audio RTF | 0.173833 | **0.173539** | +0.17% |
+| Mean chunk RTF | 0.157703 | **0.155880** | +1.17% |
+| Median chunk RTF | 0.120677 | **0.114856** | +5.07% |
+| P99 chunk RTF | 0.268489 | **0.267436** | +0.39% |
+
+The source and remote service therefore remain on the accepted fixed-output
+native sampler. These results close isolated transport-allocation tuning as a
+material RTF lever. The next large target remains a scheduler-owned two-code
+Talker command with distinct KV/slot slabs and native-sampler parity after
+each internal step.
+
+```text
+/tmp/lunanexa-bench/fixed-transport-control-zh8-20260830/
+/tmp/lunanexa-bench/fixed-transport-candidate-zh8-repeat-20260830/
+/tmp/lunanexa-bench/fixed-transport-candidate-zh32-20260830/
+/tmp/lunanexa-bench/graph-history-transport-candidate-zh8-20260830/
+/tmp/lunanexa-bench/resident-empty-candidate-repeat-zh32-20260830/
+/tmp/lunanexa-bench/resident-empty-reverse-control-repeat-zh32-20260830/
+```

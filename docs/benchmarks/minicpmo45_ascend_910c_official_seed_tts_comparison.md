@@ -8657,3 +8657,33 @@ path. Complete organizer quality gates are still mandatory before submission.
 /tmp/lunanexa-bench/exact8-candidate-zh8/
 /tmp/lunanexa-bench/exact8-candidate-zh8-repeat/
 ```
+
+#### Rejected fixed-output codec embedding
+
+A follow-up candidate replaced the per-step `nn.Embedding` allocation plus
+copy into the FULL ACLGraph input slab with `index_select(..., out=slab)`.
+The real A2 implementation passed the complete 140-token / 139-distribution
+parity gate, including candidate IDs, full probability vectors and final RNG
+state. It did not, however, remove an NPU launch or a graph replay boundary.
+
+Two adjacent hot A/B pairs show no repeatable gain:
+
+| Metric (lower is better except throughput) | Exact 8-step A | Fixed output A | Exact 8-step B | Fixed output B |
+| --- | ---: | ---: | ---: | ---: |
+| Weighted overall RTF | 0.155015 | **0.154854** | **0.120924** | 0.121919 |
+| Audio throughput | 6.451007x | **6.457690x** | **8.269665x** | 8.202143x |
+| Mean all-chunk RTF | 0.170773 | **0.170698** | **0.110891** | 0.112252 |
+| Median all-chunk RTF | **0.075220** | 0.075249 | **0.072815** | 0.074691 |
+| Mean TTFP | 347.62 ms | **347.27 ms** | **341.95 ms** | 342.64 ms |
+| Mean TTFT | **77.60 ms** | 83.25 ms | **74.65 ms** | 77.64 ms |
+
+The first pair differs by only -0.10% RTF, while the repeat regresses RTF by
+0.82%, mean chunk RTF by 1.23% and TTFT by 4.00%. The candidate is therefore
+removed rather than adding another opt-in hot-path branch. This result further
+narrows the next useful target to eliminating scheduler/replay boundaries,
+not reshaping a single embedding write.
+
+```text
+/tmp/lunanexa-bench/exact8-fixed-embed-zh8/
+/tmp/lunanexa-bench/exact8-fixed-embed-zh8-repeat/
+```

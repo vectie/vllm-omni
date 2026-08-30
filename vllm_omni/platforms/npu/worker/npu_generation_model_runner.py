@@ -17,10 +17,9 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
-from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerAttnMetadata
@@ -43,6 +42,7 @@ from vllm_omni.platforms.npu.worker.npu_model_runner import (
 )
 from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker.vllm_runner_compat import EMPTY_MODEL_RUNNER_OUTPUT, IntermediateTensors
 
 
 class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):

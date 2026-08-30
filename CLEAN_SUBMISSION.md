@@ -20,6 +20,9 @@ are byte-for-byte unchanged from that commit.
   fingerprints;
 - exact inference-time HiFT weight-normalization materialization and the
   supported Ascend SDPA path;
+- vLLM 0.25/0.26-compatible runner symbol resolution, so the official
+  `v0.25.0-a3` image and newer development images use their respective symbol
+  locations without source edits;
 - NPU-specific Code2Wav/DiT layout, cache, graph, and allocation fast paths,
   each guarded by model/platform capability checks.
 
@@ -48,6 +51,7 @@ Before packaging, the following checks are required:
 ```bash
 git diff --check
 python -m py_compile <all changed Python files>
+pytest -q tests/worker/test_vllm_runner_compat.py
 python -c 'import runpy; d=runpy.run_path("tests/config/test_minicpmo45_submission_integrity.py"); [d[n]() for n in d if n.startswith("test_")]'
 git diff --exit-code upstream/minicpm-challenge -- \
   vllm_omni/benchmarks vllm_omni/deploy \

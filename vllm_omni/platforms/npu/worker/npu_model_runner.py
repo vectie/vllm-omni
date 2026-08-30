@@ -11,7 +11,6 @@ from vllm.config import CUDAGraphMode
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
-from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.gpu_model_runner import PerLayerAttnMetadata
 from vllm_ascend.ascend_forward_context import get_forward_context, set_ascend_forward_context
@@ -25,6 +24,7 @@ from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.vllm_runner_compat import IntermediateTensors
 
 logger = init_logger(__name__)
 

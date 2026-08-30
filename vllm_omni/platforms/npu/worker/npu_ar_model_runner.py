@@ -18,10 +18,8 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import logger
-from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
     make_empty_encoder_model_runner_output,
@@ -53,6 +51,7 @@ from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner, 
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+from vllm_omni.worker.vllm_runner_compat import EMPTY_MODEL_RUNNER_OUTPUT, IntermediateTensors
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:

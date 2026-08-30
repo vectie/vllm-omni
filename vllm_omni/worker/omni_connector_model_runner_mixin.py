@@ -1596,7 +1596,7 @@ class OmniConnectorModelRunnerMixin:
 
         from copy import copy
 
-        from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+        from vllm_omni.worker.vllm_runner_compat import EMPTY_MODEL_RUNNER_OUTPUT
 
         wrapped = copy(result if result is not None else EMPTY_MODEL_RUNNER_OUTPUT)
         wrapped.omni_connector_output = omni_output

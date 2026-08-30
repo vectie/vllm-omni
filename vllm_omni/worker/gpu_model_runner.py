@@ -13,7 +13,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
-from vllm.sequence import IntermediateTensors
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv
@@ -35,6 +34,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.vllm_runner_compat import IntermediateTensors
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput

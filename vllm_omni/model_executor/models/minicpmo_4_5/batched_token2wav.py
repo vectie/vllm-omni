@@ -4254,7 +4254,16 @@ class BatchedToken2Wav(nn.Module):
             self._npu_dit_full_block_graph_enabled = False
             logger.warning("MiniCPM-o NPU full-block graph disabled: block or causal-pack layout is incompatible")
             return
-        graph_fn = self._get_npu_dit_full_block_graph()
+        try:
+            graph_fn = self._get_npu_dit_full_block_graph()
+        except (ImportError, AttributeError, RuntimeError):
+            self._npu_dit_full_block_graph_enabled = False
+            logger.warning(
+                "MiniCPM-o NPU full-block graph disabled: the installed "
+                "vLLM-Ascend does not provide its optional converter",
+                exc_info=True,
+            )
+            return
         hidden = weight.new_zeros((2, 50, 512))
         time_embedding = weight.new_zeros((2, 1, 512))
         cnn_cache = weight.new_zeros((2, 1024, 2))

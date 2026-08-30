@@ -1,0 +1,14 @@
+# Adjacent control for the exact two-step Talker experiment.
+#
+# This retains the accepted single-chip Stage-2 and codec-state settings while
+# changing only the Talker scheduler from async to sync.  Compare this profile
+# directly with ``minicpmo_4_5_1npu_a2_talker_exact_two_step_experimental`` to
+# isolate the benefit of executing two causal target-model steps per command.
+
+base_config: minicpmo_4_5_1npu_a2_graph_codec_state_cfm1_static_graph_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        async_scheduling: false

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Mapping
 from copy import copy, deepcopy
@@ -53,6 +54,18 @@ from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner, 
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+
+
+_MINICPMO45_TALKER_EXACT_TWO_STEP_ENV = (
+    "VLLM_OMNI_MINICPMO45_TALKER_EXACT_TWO_STEP"
+)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -140,7 +153,168 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        # This is a stage-local environment switch injected only into the
+        # MiniCPM-o Talker process.  Do not infer stage identity from generic
+        # model fields: in the three-stage pipeline the Talker legitimately
+        # reports ``engine_output_type='latent'`` while carrying audio codes
+        # in its Omni multimodal payload.
+        self._talker_exact_two_step = _env_flag(
+            _MINICPMO45_TALKER_EXACT_TWO_STEP_ENV
+        )
+        if _env_flag(_MINICPMO45_TALKER_EXACT_TWO_STEP_ENV):
+            logger.info(
+                "MiniCPM-o exact two-step configured=%s stage_id=%r "
+                "engine_output_type=%r",
+                self._talker_exact_two_step,
+                getattr(self.model_config, "stage_id", None),
+                getattr(self.model_config, "engine_output_type", None),
+            )
+        self._talker_exact_two_step_applied = False
+        self._talker_exact_two_step_count = 0
+        self._talker_exact_two_step_guard_signatures: set[tuple[Any, ...]] = set()
         #  -------------------------------------- Omni-new -------------------------------------------------
+
+    def _maybe_run_exact_talker_second_step(
+        self,
+        *,
+        first_output: Any,
+        scheduler_output: SchedulerOutput,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        model_kwargs: dict[str, Any],
+        batch_desc: BatchDescriptor,
+        cudagraph_mode: CUDAGraphMode,
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> Any:
+        """Run one additional causally exact Talker decode on a reserved slot."""
+        self._talker_exact_two_step_applied = False
+        if not self._talker_exact_two_step:
+            return first_output
+        guard_signature = (
+            int(self.input_batch.num_reqs),
+            int(scheduler_output.total_num_scheduled_tokens),
+            bool(scheduler_output.scheduled_spec_decode_tokens),
+            bool(getattr(self, "with_prefill", False)),
+            bool(self.use_async_scheduling),
+            self.speculative_config is not None,
+            type(first_output).__name__,
+        )
+        if (
+            guard_signature not in self._talker_exact_two_step_guard_signatures
+            and len(self._talker_exact_two_step_guard_signatures) < 8
+        ):
+            self._talker_exact_two_step_guard_signatures.add(guard_signature)
+            logger.info(
+                "MiniCPM-o exact two-step guard: reqs=%d scheduled=%d "
+                "spec_tokens=%s prefill=%s async=%s speculative=%s output=%s",
+                *guard_signature,
+            )
+        if (
+            self.input_batch.num_reqs != 1
+            or scheduler_output.total_num_scheduled_tokens != 1
+            or scheduler_output.scheduled_spec_decode_tokens
+            or getattr(self, "with_prefill", False)
+            or self.use_async_scheduling
+            or self.speculative_config is not None
+        ):
+            return first_output
+        if not hasattr(first_output, "multimodal_outputs"):
+            return first_output
+
+        req_id = self.input_batch.req_ids[0]
+        get_model = getattr(self, "get_model", None)
+        target_model = get_model() if callable(get_model) else self.model
+        can_run = getattr(target_model, "can_run_exact_second_step", None)
+        if not callable(can_run):
+            logger.info_once(
+                "MiniCPM-o exact two-step model hook unavailable on %s",
+                type(target_model).__name__,
+            )
+            return first_output
+        if not can_run(req_id, first_output):
+            return first_output
+
+        info = self.model_intermediate_buffer.get(req_id)
+        preprocess = getattr(target_model, "preprocess", None)
+        if not isinstance(info, dict) or not callable(preprocess):
+            return first_output
+
+        next_input_ids = input_ids[:1]
+        next_input_ids, next_inputs_embeds, update = preprocess(
+            input_ids=next_input_ids,
+            input_embeds=None,
+            **info,
+        )
+        if update:
+            self._update_intermediate_buffer(req_id, update)
+
+        if inputs_embeds is None or next_inputs_embeds is None:
+            return first_output
+
+        # FULL ACLGraph replay is address-bound. ``preprocess`` intentionally
+        # allocates the embedding for the newly sampled codec token, but
+        # passing that allocation directly would replay the graph with the
+        # address captured for the first step. Keep the captured input slab
+        # and replace only its contents before replay two.
+        stable_inputs_embeds = inputs_embeds[:1]
+        stable_inputs_embeds.copy_(next_inputs_embeds[:1])
+
+        # The scheduler reserved one lookahead token. Repoint the normal
+        # fixed-address decode metadata at that slot and advance sequence
+        # length by exactly one before replaying the same width-1 executable.
+        next_positions = positions[:1]
+        next_positions.add_(1)
+        self.optimistic_seq_lens_cpu[0].add_(1)
+        self.seq_lens[:1].add_(1)
+        self.input_batch.block_table.compute_slot_mapping(
+            1,
+            self.query_start_loc.gpu[:2],
+            next_positions,
+        )
+        update_cos_sin(next_positions)
+        next_attn_metadata, _ = self._build_attention_metadata(
+            num_tokens=1,
+            num_tokens_padded=batch_desc.num_tokens,
+            num_reqs=1,
+            num_reqs_padded=batch_desc.num_reqs or 1,
+            max_query_len=1,
+            num_scheduled_tokens={req_id: 1},
+            num_scheduled_tokens_np=np.ones(1, dtype=np.int32),
+        )
+
+        with set_ascend_forward_context(
+            next_attn_metadata,
+            self.vllm_config,
+            num_tokens=batch_desc.num_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            aclgraph_runtime_mode=cudagraph_mode,
+            batch_descriptor=batch_desc,
+            num_actual_tokens=1,
+            model_instance=self.model,
+            has_sinks=self._has_sinks,
+            input_ids=next_input_ids,
+            eplb_heat_collection_status=(
+                self.eplb_heat_collection_status if self.dynamic_eplb else False
+            ),
+        ):
+            second_output = self._model_forward(
+                batch_desc.num_tokens,
+                next_input_ids,
+                next_positions,
+                intermediate_tensors,
+                stable_inputs_embeds,
+                **model_kwargs,
+            )
+        self._talker_exact_two_step_applied = True
+        self._talker_exact_two_step_count += 1
+        if self._talker_exact_two_step_count == 1:
+            logger.info_once(
+                "MiniCPM-o exact two-step Talker active: one scheduler command "
+                "now executes two causally exact target-model decode steps"
+            )
+        return second_output
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -766,6 +940,18 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        hidden_states = self._maybe_run_exact_talker_second_step(
+            first_output=hidden_states,
+            scheduler_output=scheduler_output,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            model_kwargs=model_kwargs,
+            batch_desc=batch_desc,
+            cudagraph_mode=cudagraph_mode,
+            num_tokens_across_dp=num_tokens_across_dp,
+        )
         with record_function_or_nullcontext("post process"):
             #  -------------------------------------- Omni-new -------------------------------------------------
             # [Omni] Map pending ropes metadata to req_ids.
@@ -1061,6 +1247,16 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        if self._talker_exact_two_step_applied:
+            if len(valid_sampled_token_ids) != 1:
+                raise RuntimeError(
+                    "MiniCPM-o exact two-step Talker expected one request, "
+                    f"got {len(valid_sampled_token_ids)}"
+                )
+            # The first step was admitted only after proving that it neither
+            # published a chunk nor stopped.  Expose its real deterministic
+            # continue token before the second step's sampled stop control.
+            valid_sampled_token_ids[0].insert(0, 0)
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:

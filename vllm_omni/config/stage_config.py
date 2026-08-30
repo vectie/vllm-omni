@@ -57,6 +57,9 @@ _MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT_ENV = (
 _MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT_ENV = (
     "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT"
 )
+_MINICPMO45_TALKER_EXACT_TWO_STEP_ENV = (
+    "VLLM_OMNI_MINICPMO45_TALKER_EXACT_TWO_STEP"
+)
 _MINICPMO45_ASCEND_SINGLE_TOKEN_SLOT_GRAPH_ENV = (
     "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"
 )
@@ -1047,6 +1050,40 @@ def _apply_minicpmo45_single_chip_policy(
             if name not in talker.env:
                 talker.env[name] = value
                 changed.append("talker-" + name.rsplit("_", 1)[-1].lower())
+
+        exact_two_step_raw = os.environ.get(
+            _MINICPMO45_TALKER_EXACT_TWO_STEP_ENV
+        )
+        if exact_two_step_raw is not None:
+            exact_two_step_raw = exact_two_step_raw.strip().lower()
+            if exact_two_step_raw not in {
+                "0",
+                "false",
+                "no",
+                "off",
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                raise ValueError(
+                    f"Invalid {_MINICPMO45_TALKER_EXACT_TWO_STEP_ENV}="
+                    f"{exact_two_step_raw!r}"
+                )
+            talker.env[_MINICPMO45_TALKER_EXACT_TWO_STEP_ENV] = (
+                exact_two_step_raw
+            )
+            changed.append("talker-exact-two-step")
+            if exact_two_step_raw in {"1", "true", "yes", "on"}:
+                # The exact two-step worker consumes the scheduler's one-slot
+                # lookahead itself.  Async scheduling may already have the
+                # next command in flight for the same request, so combining
+                # the two would double-own the next KV slot.  Keep this first
+                # correctness candidate on the synchronous scheduler; a true
+                # async-compatible multi-step executable needs a single owner
+                # for scheduling, replay and output publication.
+                talker.async_scheduling = False
+                changed.append("talker-sync-two-step")
 
         slot_fastpath_raw = os.environ.get(
             _MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT_ENV, "1"

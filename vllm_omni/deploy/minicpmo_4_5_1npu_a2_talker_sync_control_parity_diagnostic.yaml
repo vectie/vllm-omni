@@ -1,0 +1,10 @@
+# Diagnostic-only synchronized control for exact two-step codec parity.
+
+base_config: minicpmo_4_5_1npu_a2_talker_sync_control_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_CODEC_PARITY_TRACE: /tmp/lunanexa-exact2-control-parity.jsonl

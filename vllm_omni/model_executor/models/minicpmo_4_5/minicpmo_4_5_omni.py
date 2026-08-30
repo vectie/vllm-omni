@@ -638,6 +638,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         prepare = getattr(self.talker, "prepare_fused_codec_sampler_inputs", None)
         return bool(prepare(**kwargs)) if callable(prepare) else False
 
+    def can_run_exact_second_step(
+        self,
+        request_id: str,
+        first_output: OmniOutput,
+    ) -> bool:
+        if self.model_stage != "tts":
+            return False
+        can_run = getattr(self.talker, "can_run_exact_second_step", None)
+        return bool(can_run(request_id, first_output)) if callable(can_run) else False
+
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         # Handle OmniOutput type
         if isinstance(hidden_states, OmniOutput):

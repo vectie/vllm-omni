@@ -1856,6 +1856,87 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._request_transport_chunks[request_id] = chunk_index + 1
         return output, is_eos
 
+    def can_run_exact_second_step(
+        self,
+        request_id: str,
+        first_output: OmniOutput,
+    ) -> bool:
+        """Whether a second exact Talker step can stay inside this command.
+
+        The first step must be an unobservable steady decode step.  In
+        particular, never hide a chunk publication or terminal transition in
+        the middle of the worker command.  Deferred EOS deliberately permits
+        post-EOS work only until the normal chunk boundary, where the existing
+        transport code trims it exactly as it does across worker commands.
+        """
+        def reject(reason: str) -> bool:
+            reasons = getattr(self, "_exact_two_step_reject_reasons", None)
+            if reasons is None:
+                reasons = set()
+                self._exact_two_step_reject_reasons = reasons
+            if reason not in reasons and len(reasons) < 8:
+                reasons.add(reason)
+                logger.info(
+                    "MiniCPM-o exact two-step model gate rejected: %s",
+                    reason,
+                )
+            return False
+
+        if not self.deferred_chunk_eos or not self.batched_codec_output:
+            return reject("transport flags disabled")
+        state = self._request_audio_states.get(request_id)
+        if not isinstance(state, dict) or state.get("finished"):
+            return reject("missing or finished audio state")
+        if int(state.get("step", 0)) >= int(state.get("max_tokens", 2048)):
+            return reject("max-token boundary")
+
+        multimodal = first_output.multimodal_outputs
+        if not isinstance(multimodal, dict):
+            return reject("missing multimodal payload")
+        codes = multimodal.get("codes")
+        if not isinstance(codes, dict) or codes.get("audio"):
+            return reject("audio already published")
+        meta = multimodal.get("meta")
+        if not isinstance(meta, dict):
+            return reject("missing sparse metadata")
+        # Quiet codec steps retain owner metadata.  ``req_id`` therefore does
+        # not imply an observable publication, and ``finished`` is commonly
+        # ``[tensor(False)]`` (a truthy list).  Only an actual terminal value
+        # closes the internal-step window.
+        finished_values = meta.get("finished") or []
+        if any(
+            bool(value.item())
+            if isinstance(value, torch.Tensor) and value.numel() == 1
+            else bool(value)
+            for value in finished_values
+        ):
+            return reject("terminal metadata")
+
+        pending = self._request_transport_codes.get(request_id)
+        if not isinstance(pending, list) or not pending:
+            return reject("no pending codec sample")
+        chunk_index = self._request_transport_chunks.get(request_id, 0)
+        default_chunk = max(
+            1,
+            int(os.environ.get(_CODEC_CHUNK_FRAMES_ENV, "25")),
+        )
+        threshold = (
+            max(
+                1,
+                int(
+                    os.environ.get(
+                        _INITIAL_CODEC_CHUNK_FRAMES_ENV,
+                        str(default_chunk),
+                    )
+                ),
+            )
+            if chunk_index == 0
+            else default_chunk
+        )
+        if len(pending) >= threshold:
+            return reject("chunk publication boundary")
+        return True
+
     def make_omni_output(
         self,
         model_outputs: torch.Tensor | OmniOutput,

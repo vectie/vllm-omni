@@ -8528,3 +8528,56 @@ each internal step.
 /tmp/lunanexa-bench/resident-empty-candidate-repeat-zh32-20260830/
 /tmp/lunanexa-bench/resident-empty-reverse-control-repeat-zh32-20260830/
 ```
+
+### Qualified exact two-step Talker command
+
+The next candidate coalesces two causally dependent Talker decode steps into
+one scheduler command while retaining two ordinary width-one target-model
+replays.  The scheduler reserves one lookahead KV slot; the worker consumes it
+only for a single-request, non-prefill, non-speculative, quiet codec step.  A
+chunk publication or terminal transition remains a command boundary.  Stage 1
+uses the synchronous scheduler for this path, because the worker must settle
+both target steps before returning the two deterministic stop-control tokens.
+
+The first implementation passed a quick speed screen but was rejected by the
+codec parity gate: its third sampled code diverged even though both runs used
+the same number of RNG draws.  FULL ACLGraph replay had retained the captured
+embedding address while the second replay passed a newly allocated decode
+embedding.  The corrected implementation copies the new codec embedding into
+the graph's fixed input slab before replay.  A one-request trace then matched
+the synchronous control exactly:
+
+- 140/140 sampled codec IDs;
+- 122/122 published codec IDs;
+- 139/139 pre-sample distributions and step numbers;
+- identical final request-generator SHA-256,
+  `53d9815b4f2aa0927add0e2b1ecbceeb223744c94487252e383fc6e6dfd40218`.
+
+Four focused remote tests passed.  The first hot eight-request run emitted the
+same `940,800` frames / `39.20 s` as the adjacent async accepted baseline:
+
+| Metric (lower is better except throughput) | Async accepted baseline | Exact two-step | Change |
+| --- | ---: | ---: | ---: |
+| Benchmark duration | 7.870085 s | **7.174552 s** | **-8.84%** |
+| Weighted overall RTF | 0.200767 | **0.183024** | **-8.84%** |
+| Audio throughput | 4.980886x | **5.463755x** | **+9.69%** |
+| Mean all-chunk RTF | 0.215572 | **0.198346** | **-7.99%** |
+| Median all-chunk RTF | 0.114933 | **0.103890** | **-9.61%** |
+| Mean TTFP | 443.00 ms | **402.54 ms** | **-9.13%** |
+| Mean TTFT | 86.04 ms | **79.90 ms** | **-7.13%** |
+
+A second already-hot run completed 8/8 requests with weighted RTF `0.148640`,
+mean TTFP `396.37 ms`, and mean TTFT `78.31 ms`.  It generated `40.56 s` of
+audio rather than `39.20 s`, so it is retained as a stability observation and
+not used for the headline same-output comparison.  The exact token parity gate
+qualifies the scheduling transformation itself; the organizer's complete
+Seed-TTS WER/SIM, Daily-Omni and Video-MME gate is still required before this
+experimental profile becomes a submission default.
+
+```text
+/tmp/lunanexa-bench/exact2-async-baseline-zh8-20260830/
+/tmp/lunanexa-bench/exact2-sync-control-zh8-20260830/
+/tmp/lunanexa-bench/exact2-candidate-v7-parity-smoke-rerun/
+/tmp/lunanexa-bench/exact2-candidate-v7-zh8/
+/tmp/lunanexa-bench/exact2-candidate-v7-zh8-repeat/
+```

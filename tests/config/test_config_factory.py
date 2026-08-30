@@ -1380,6 +1380,32 @@ class TestDeployConfigLoading:
 
         assert "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH" not in deploy.stages[1].env
 
+    def test_minicpmo_single_chip_exact_two_step_uses_sync_scheduler(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "VLLM_OMNI_MINICPMO45_TALKER_EXACT_TWO_STEP", "1"
+        )
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        talker = deploy.stages[1]
+        assert talker.async_scheduling is False
+        assert talker.env[
+            "VLLM_OMNI_MINICPMO45_TALKER_EXACT_TWO_STEP"
+        ] == "1"
+
     def test_minicpmo_single_chip_policy_can_disable_decode_metadata(
         self, monkeypatch
     ):

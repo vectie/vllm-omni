@@ -1,0 +1,15 @@
+# Exact two-step Talker candidate.
+#
+# One synchronous scheduler command reserves a lookahead KV slot and executes
+# two real target-model steps when the first step neither publishes a codec
+# chunk nor terminates.  It does not use a draft model, alter sampling, skip a
+# target evaluation, or cross an observable chunk/EOS boundary.
+
+base_config: minicpmo_4_5_1npu_a2_talker_sync_control_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_TALKER_EXACT_TWO_STEP: "1"

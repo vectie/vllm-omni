@@ -554,6 +554,44 @@ def test_talker_deferred_eos_trims_terminal_tail_at_chunk_boundary(monkeypatch) 
     assert talker._request_transport_codes["req-deferred-eos"] == []
 
 
+def test_talker_exact_second_step_gate_allows_only_unpublished_steady_work(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "3")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "3")
+    talker = _make_talker()
+    talker.batched_codec_output = True
+    talker.deferred_chunk_eos = True
+    talker._request_audio_states["req-two-step"] = {
+        "step": 1,
+        "max_tokens": 10,
+        "finished": False,
+    }
+    talker._request_transport_codes["req-two-step"] = [torch.tensor([2])]
+    empty = SimpleNamespace(
+        multimodal_outputs={
+            "codes": {"audio": []},
+            "meta": {
+                "req_id": ["req-two-step"],
+                "finished": [torch.tensor(False)],
+            },
+        }
+    )
+
+    assert talker.can_run_exact_second_step("req-two-step", empty)
+
+    published = SimpleNamespace(
+        multimodal_outputs={
+            "codes": {"audio": [torch.tensor([[1, 2, 3]])]},
+            "meta": {"req_id": ["req-two-step"], "finished": [False]},
+        }
+    )
+    assert not talker.can_run_exact_second_step("req-two-step", published)
+
+    talker._request_audio_states["req-two-step"]["finished"] = True
+    assert not talker.can_run_exact_second_step("req-two-step", empty)
+
+
 def test_talker_codec_parity_trace_records_complete_sample_and_publish_sequences(
     monkeypatch,
     tmp_path,

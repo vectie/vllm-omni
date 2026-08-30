@@ -148,6 +148,32 @@ def test_a2_evaluator_graph_codec_state_candidate_is_talker_only():
     assert "VLLM_OMNI_MINICPMO45_NPU_GRAPH_CODEC_STATE" not in (stage2.env or {})
 
 
+def test_a2_rtf_first_static_cfm_graph_keeps_native_solver_and_talker_state():
+    deploy = _load_profile(
+        "minicpmo_4_5_1npu_a2_graph_codec_state_cfm1_static_graph_experimental.yaml"
+    )
+    stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+    extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_FUSED_CODEC_DISTRIBUTION"] == "1"
+    assert stage1.env["VLLM_OMNI_MINICPMO45_NPU_GRAPH_CODEC_STATE"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE"] == "1"
+    assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_SLOTS"] == "2"
+    assert "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS" not in stage2.env
+    assert "VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH" not in (stage0.env or {})
+    assert "VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH" not in (stage1.env or {})
+
+    assert extra["codec_chunk_frames"] == 25
+    assert extra["npu_cfm_fixed_kv_slabs"] is True
+    assert extra["npu_cfm_planar_kv_slabs"] is True
+    assert extra["npu_dit_bsh_attention"] is True
+    assert extra["npu_dit_fused_conv_pack"] is True
+    assert extra["npu_dit_cache_major"] is True
+
+
 def test_a2_graph_codec_state_hf32_candidate_is_single_variable():
     deploy = _load_profile(
         "minicpmo_4_5_1npu_a2_graph_codec_state_hf32_experimental.yaml"

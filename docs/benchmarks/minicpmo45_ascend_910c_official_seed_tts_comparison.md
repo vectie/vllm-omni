@@ -8295,3 +8295,74 @@ dependent one-token calls speculatively.
 ```text
 /tmp/lunanexa-bench/queue4-v79-zh8/
 ```
+
+### Accepted RTF-first fixed-slab CFM1 steady graph
+
+The next candidate kept the accuracy-qualified source-default one-step CFM
+solver, native sampling, 25-code streaming geometry and the default two-batch
+Stage-1 queue.  It changed only recurrent Stage 2 work: the width-50/cache-402
+CFM invocation now uses fixed-address planar KV slabs, BSH attention,
+cache-major causal-pack state and two raw-NPUGraph output slots.  Prompt,
+cache-fill and variable-width terminal work remain eager.  Runtime logs proved
+that the fixed slabs were active and that both steady slots captured and
+replayed; all startup numerical gates stayed below approximately `1e-6`.
+
+The strict adjacent comparison completed the same eight requests and emitted
+exactly `828,480` PCM frames / `34.52 s` of audio on both paths.  Excluding the
+first and terminal packet of each request isolates the fixed steady shape for
+the `steady chunk RTF` row:
+
+| Metric (lower is better except throughput) | Adjacent safe control | Fixed-slab CFM1 graph | Change |
+| --- | ---: | ---: | ---: |
+| Benchmark duration | 6.059480 s | 6.028794 s | -0.51% |
+| Audio throughput | 5.696858x | 5.725855x | +0.51% |
+| Mean all-chunk RTF | 0.160083 | 0.159014 | -0.67% |
+| Steady chunk RTF | 0.116831 | 0.106959 | -8.45% |
+| Mean E2E | 756.92 ms | 753.08 ms | -0.51% |
+
+A hot 32-request, concurrency-one stability run completed 32/32 requests,
+emitted `3,323,520` frames / `138.48 s` of audio, and sustained `5.745616x`
+audio throughput.  Its mean all-chunk RTF was `0.158998`, steady chunk RTF
+was `0.109759`, mean TTFP was `438.61 ms`, and mean E2E was `752.70 ms`.
+One cold eight-request run encountered a variable-width terminal compilation
+outlier; it is not a steady-graph failure, but terminal shapes must remain a
+separate cold-start concern.
+
+The first same-protocol Seed-TTS quality gate also passed.  On the fixed first
+32 Chinese rows, the candidate completed 32/32 with WER `0.0658364` and SIM
+`0.832320`.  The matching qualified graph-state baseline was WER `0.0500515`
+and SIM `0.832275`; the WER change is +1.5785 percentage points, inside the
+two-point budget, while SIM is effectively unchanged.  Daily-Omni and
+Video-MME were not rerun because this profile changes only the TTS Code2Wav
+stage; that architectural isolation is not a substitute for the organizer's
+full pre-submission gate.
+
+Decision: retain
+`minicpmo_4_5_1npu_a2_graph_codec_state_cfm1_static_graph_experimental.yaml`
+as the fastest currently qualified local RTF candidate.  The 8.45% steady
+CFM gain becomes only a 0.51% same-output request-duration gain, which proves
+that further isolated Stage-2 kernel work is no longer the primary lever.
+The next RTF work must reduce the dependent Talker-token cadence and the eager
+first/tail packet tax without changing the native sampled codec sequence.
+
+```text
+/tmp/lunanexa-bench/graph-native-codec-v74-adjacent-control-repeat-zh8/
+/tmp/lunanexa-bench/rtf-cfm1-static-q2-zh8-r2/
+/tmp/lunanexa-bench/rtf-cfm1-static-q2-zh32/
+/tmp/lunanexa-bench/rtf-cfm1-static-q2-quality-zh32/
+/tmp/lunanexa-bench/rtf-cfm1-static-q2-sim-zh32/
+```
+
+A one-slot output-pool diagnostic was then rejected.  Its fully hot run
+emitted the same `828,480` frames / `34.52 s` as the accepted two-slot run,
+and logs proved `slot=1/1` capture plus one-slot replay.  Mean all-chunk RTF
+regressed from `0.159014` to `0.162756` (+2.35%), steady chunk RTF from
+`0.106959` to `0.109450` (+2.33%), and duration from `6.028794 s` to
+`6.144140 s` (+1.91%).  The second output set is therefore earning its HBM
+cost by avoiding a replay/output-consumer dependency.  The one-slot profile
+was removed and the two-slot service restored.
+
+```text
+/tmp/lunanexa-bench/rtf-cfm1-static-slots1-zh8-r1/
+/tmp/lunanexa-bench/rtf-cfm1-static-slots1-zh8-r2/
+```

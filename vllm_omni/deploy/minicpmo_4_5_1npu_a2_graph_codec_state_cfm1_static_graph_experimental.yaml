@@ -1,0 +1,42 @@
+# A2 single-chip RTF-first CFM1 static-graph candidate.
+#
+# Preserve the accuracy-qualified one-step solver, native sampling sequence and
+# default two-batch async queue.  Only the recurrent width-50/cache-402
+# Code2Wav path changes: fixed-address KV slabs, BSH attention and the native
+# causal-pack operator make the whole single-step CFM invocation eligible for
+# raw NPUGraph capture.  Prompt, cache-fill and variable-width tail work remain
+# eager.  Promotion requires real capture/replay evidence plus an adjacent RTF
+# comparison; enabling these flags alone is not considered a result.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_async_replay_graph_codec_state_experimental.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      npu_dit_mlp_graph: true
+      npu_dit_mlp_graph_width: 50
+      npu_dit_graph_buckets: [20, 302]
+      npu_dit_preamble_graph: true
+      npu_dit_wide_adaln: true
+      npu_dit_wide_final_adaln: true
+      npu_dit_final_addcmul: true
+      npu_dit_conv_mlp_graph: true
+      npu_dit_prompt_conv_mlp_graph: true
+      npu_dit_fused_conv_pack: true
+      # Native causal-pack ABI.  Keeping [batch, taps, channels] removes the
+      # transpose/contiguous pair at both Conv sites in all sixteen DiT blocks.
+      npu_dit_cache_major: true
+      npu_single_request_cache_passthrough: true
+      npu_cfm_fixed_kv_slabs: true
+      npu_cfm_planar_kv_slabs: true
+      npu_dit_bsh_attention: true
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "1"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_SLOTS: "2"

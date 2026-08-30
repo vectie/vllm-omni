@@ -1,0 +1,15 @@
+# Exact four-step Talker candidate.
+#
+# Extends the parity-qualified exact two-step path to at most four real
+# target-model steps per synchronous scheduler command. The worker stops the
+# internal loop before every codec publication or terminal boundary.
+
+base_config: minicpmo_4_5_1npu_a2_talker_exact_two_step_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_TALKER_EXACT_STEPS: "4"
+          VLLM_OMNI_MINICPMO45_TALKER_EXACT_TWO_STEP: "1"

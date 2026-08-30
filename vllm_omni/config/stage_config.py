@@ -60,6 +60,9 @@ _MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT_ENV = (
 _MINICPMO45_TALKER_EXACT_TWO_STEP_ENV = (
     "VLLM_OMNI_MINICPMO45_TALKER_EXACT_TWO_STEP"
 )
+_MINICPMO45_TALKER_EXACT_STEPS_ENV = (
+    "VLLM_OMNI_MINICPMO45_TALKER_EXACT_STEPS"
+)
 _MINICPMO45_ASCEND_SINGLE_TOKEN_SLOT_GRAPH_ENV = (
     "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"
 )
@@ -1084,6 +1087,30 @@ def _apply_minicpmo45_single_chip_policy(
                 # for scheduling, replay and output publication.
                 talker.async_scheduling = False
                 changed.append("talker-sync-two-step")
+
+        exact_steps_raw = os.environ.get(
+            _MINICPMO45_TALKER_EXACT_STEPS_ENV
+        )
+        if exact_steps_raw is not None:
+            try:
+                exact_steps = int(exact_steps_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid {_MINICPMO45_TALKER_EXACT_STEPS_ENV}="
+                    f"{exact_steps_raw!r}"
+                ) from exc
+            if exact_steps not in {1, 2, 4, 8}:
+                raise ValueError(
+                    f"Invalid {_MINICPMO45_TALKER_EXACT_STEPS_ENV}="
+                    f"{exact_steps_raw!r}; expected one of 1, 2, 4, 8"
+                )
+            talker.env[_MINICPMO45_TALKER_EXACT_STEPS_ENV] = str(
+                exact_steps
+            )
+            changed.append(f"talker-exact-{exact_steps}-step")
+            if exact_steps > 1:
+                talker.async_scheduling = False
+                changed.append("talker-sync-exact-steps")
 
         slot_fastpath_raw = os.environ.get(
             _MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT_ENV, "1"

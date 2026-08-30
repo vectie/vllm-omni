@@ -41,6 +41,9 @@ _MINICPMO45_TALKER_IPC_COALESCE_ENV = "VLLM_OMNI_MINICPMO45_TALKER_IPC_COALESCE"
 _MINICPMO45_TALKER_EXACT_TWO_STEP_ENV = (
     "VLLM_OMNI_MINICPMO45_TALKER_EXACT_TWO_STEP"
 )
+_MINICPMO45_TALKER_EXACT_STEPS_ENV = (
+    "VLLM_OMNI_MINICPMO45_TALKER_EXACT_STEPS"
+)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -48,6 +51,24 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _exact_talker_steps() -> int:
+    raw = os.environ.get(_MINICPMO45_TALKER_EXACT_STEPS_ENV)
+    if raw is None or not raw.strip():
+        return 2 if _env_flag(_MINICPMO45_TALKER_EXACT_TWO_STEP_ENV) else 1
+    try:
+        steps = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {_MINICPMO45_TALKER_EXACT_STEPS_ENV}={raw!r}"
+        ) from exc
+    if steps not in {1, 2, 4, 8}:
+        raise ValueError(
+            f"Invalid {_MINICPMO45_TALKER_EXACT_STEPS_ENV}={raw!r}; "
+            "expected one of 1, 2, 4, 8"
+        )
+    return steps
 
 
 class SampledLogprobContractError(RuntimeError):
@@ -149,21 +170,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._talker_ipc_pending_token_ids: dict[str, list[int]] = {}
         # Stage-local opt-in: MiniCPM-o's Talker uses a latent engine output
         # type and transports codec audio through its Omni multimodal payload.
-        self._talker_exact_two_step = _env_flag(
-            _MINICPMO45_TALKER_EXACT_TWO_STEP_ENV
-        )
-        if self._talker_exact_two_step:
-            # The worker may execute one additional *exact* target-model step.
-            # Reserve its KV slot without enabling draft/target speculative
-            # decoding.  The worker only consumes this lookahead in the stable
-            # single-request decode path and reports both real output tokens.
+        self._talker_exact_steps = _exact_talker_steps()
+        if self._talker_exact_steps > 1:
+            # The worker may execute additional *exact* target-model steps.
+            # Reserve their KV slots without enabling draft/target speculative
+            # decoding. The worker consumes lookahead only in the stable
+            # single-request decode path and reports every real output token.
             self.num_lookahead_tokens = max(
                 int(getattr(self, "num_lookahead_tokens", 0)),
-                1,
+                self._talker_exact_steps - 1,
             )
             logger.info(
-                "MiniCPM-o exact two-step scheduler active: reserved "
-                "%d lookahead KV slot",
+                "MiniCPM-o exact %d-step scheduler active: reserved "
+                "%d lookahead KV slots",
+                self._talker_exact_steps,
                 self.num_lookahead_tokens,
             )
 
@@ -621,16 +641,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+            exact_extra_tokens = len(generated_token_ids) - num_tokens_scheduled
             if (
-                getattr(self, "_talker_exact_two_step", False)
+                getattr(self, "_talker_exact_steps", 1) > 1
                 and not scheduler_output.scheduled_spec_decode_tokens.get(req_id)
-                and len(generated_token_ids) == num_tokens_scheduled + 1
+                and 0 < exact_extra_tokens < self._talker_exact_steps
             ):
                 # schedule() accounted for the first target token.  The worker
-                # used the reserved lookahead slot for a second causally exact
-                # target step, so make the scheduler's computed-token cursor
-                # agree with the KV cache before the next allocation.
-                request.num_computed_tokens += 1
+                # used reserved lookahead slots for more causally exact target
+                # steps, so make the scheduler's computed-token cursor agree
+                # with the KV cache before the next allocation.
+                request.num_computed_tokens += exact_extra_tokens
             status_before_stop = request.status
             new_logprobs = None
             logprob_validation_failed = False

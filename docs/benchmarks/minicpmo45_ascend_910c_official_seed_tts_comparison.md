@@ -8581,3 +8581,42 @@ experimental profile becomes a submission default.
 /tmp/lunanexa-bench/exact2-candidate-v7-zh8/
 /tmp/lunanexa-bench/exact2-candidate-v7-zh8-repeat/
 ```
+
+### Qualified exact four-step Talker command
+
+The exact scheduler path was generalized to bounded command sizes of 1, 2, 4
+or 8 target steps.  A four-step command reserves three lookahead KV slots and
+reuses the same fixed-address width-one graph input slab for every dependent
+replay.  It checks the model's quiet-step gate after every target evaluation,
+so publication, EOS and max-token boundaries still return immediately rather
+than being hidden inside the command.
+
+The four-step one-request diagnostic exactly matched the synchronized control
+for all 140 sampled tokens, 122 published tokens, 139 candidate-ID sets, 139
+full probability vectors, step metadata and the final RNG digest. Three
+focused configuration/boundary tests passed before the real-service run.
+
+The first hot eight-request run emitted the same `940,800` frames / `39.20 s`
+as both the async baseline and the qualified two-step comparison:
+
+| Metric (lower is better except throughput) | Async baseline | Exact 2-step | Exact 4-step | 4-step vs async |
+| --- | ---: | ---: | ---: | ---: |
+| Benchmark duration | 7.870085 s | 7.174552 s | **6.499383 s** | **-17.42%** |
+| Weighted overall RTF | 0.200767 | 0.183024 | **0.165801** | **-17.42%** |
+| Audio throughput | 4.980886x | 5.463755x | **6.031342x** | **+21.09%** |
+| Mean all-chunk RTF | 0.215572 | 0.198346 | **0.181793** | **-15.67%** |
+| Median all-chunk RTF | 0.114933 | 0.103890 | **0.086176** | **-25.02%** |
+| Mean TTFP | 443.00 ms | 402.54 ms | **370.97 ms** | **-16.26%** |
+| Mean TTFT | 86.04 ms | **79.90 ms** | 81.43 ms | -5.36% |
+
+The second already-hot run completed 8/8 requests at weighted RTF `0.130658`,
+mean TTFP `362.60 ms`, and mean TTFT `76.97 ms`. It generated `40.56 s` of
+audio, so the exact same-output first run remains the promotion comparison.
+Four-step is retained as the best bounded Talker command while eight-step is
+screened separately for diminishing returns and longer command occupancy.
+
+```text
+/tmp/lunanexa-bench/exact4-candidate-parity-smoke/
+/tmp/lunanexa-bench/exact4-candidate-zh8/
+/tmp/lunanexa-bench/exact4-candidate-zh8-repeat/
+```

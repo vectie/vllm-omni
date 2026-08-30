@@ -81,10 +81,10 @@ def _exact_talker_steps() -> int:
         raise ValueError(
             f"Invalid {_MINICPMO45_TALKER_EXACT_STEPS_ENV}={raw!r}"
         ) from exc
-    if steps not in {1, 2, 4, 8}:
+    if steps not in {1, 2, 4, 8, 16, 24}:
         raise ValueError(
             f"Invalid {_MINICPMO45_TALKER_EXACT_STEPS_ENV}={raw!r}; "
-            "expected one of 1, 2, 4, 8"
+            "expected one of 1, 2, 4, 8, 16, 24"
         )
     return steps
 

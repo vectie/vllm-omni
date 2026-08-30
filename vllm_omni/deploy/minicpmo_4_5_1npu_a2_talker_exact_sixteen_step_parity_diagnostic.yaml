@@ -1,0 +1,12 @@
+# Diagnostic-only sixteen-step profile with complete codec/RNG tracing.
+
+base_config: minicpmo_4_5_1npu_a2_talker_exact_sixteen_step_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_CODEC_PARITY_TRACE: /tmp/lunanexa-exact16-candidate-parity.jsonl
+          VLLM_OMNI_MINICPMO45_TALKER_EXACT_STEPS: "16"
+          VLLM_OMNI_MINICPMO45_TALKER_EXACT_TWO_STEP: "1"

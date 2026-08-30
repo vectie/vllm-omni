@@ -1099,10 +1099,10 @@ def _apply_minicpmo45_single_chip_policy(
                     f"Invalid {_MINICPMO45_TALKER_EXACT_STEPS_ENV}="
                     f"{exact_steps_raw!r}"
                 ) from exc
-            if exact_steps not in {1, 2, 4, 8}:
+            if exact_steps not in {1, 2, 4, 8, 16, 24}:
                 raise ValueError(
                     f"Invalid {_MINICPMO45_TALKER_EXACT_STEPS_ENV}="
-                    f"{exact_steps_raw!r}; expected one of 1, 2, 4, 8"
+                    f"{exact_steps_raw!r}; expected one of 1, 2, 4, 8, 16, 24"
                 )
             talker.env[_MINICPMO45_TALKER_EXACT_STEPS_ENV] = str(
                 exact_steps

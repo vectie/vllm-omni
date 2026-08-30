@@ -1,0 +1,15 @@
+# Exact sixteen-step Talker candidate.
+#
+# Reserves fifteen lookahead KV slots and executes at most sixteen real target
+# steps. Every replay retains the native model, sampler and publication/EOS
+# gate; only scheduler command boundaries are removed.
+
+base_config: minicpmo_4_5_1npu_a2_talker_exact_eight_step_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_TALKER_EXACT_STEPS: "16"
+          VLLM_OMNI_MINICPMO45_TALKER_EXACT_TWO_STEP: "1"

@@ -108,6 +108,7 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._fixed_codec_ring_enabled = False
     talker._graph_codec_state_enabled = False
     talker._graph_codec_state_request_id = None
+    talker._fused_codec_mask_eos_value = None
     talker._fused_codec_sampler_prepared = False
     talker._fused_codec_sampler_request_id = None
     return talker
@@ -228,6 +229,37 @@ def test_fused_codec_distribution_staging_does_not_advance_rng() -> None:
 
     assert talker._request_generators == {}
     assert talker._fused_codec_mask_eos.item() is True
+
+
+def test_graph_codec_state_stages_invariant_controls_only_when_needed() -> None:
+    talker = _make_talker()
+    talker._fused_codec_distribution_enabled = True
+    talker._graph_codec_state_enabled = True
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_history_slab = torch.full((16,), -1, dtype=torch.long)
+    talker._fused_codec_pending_sample = torch.full((1,), -1, dtype=torch.long)
+    talker._fused_codec_mask_eos = torch.ones(1, dtype=torch.bool)
+    talker._fused_codec_expired = torch.tensor([[123]], dtype=torch.long)
+    state = {"codes": torch.tensor([1]), "step": 2, "min_tokens": 5}
+    talker._request_audio_states["req-controls"] = state
+
+    assert talker.prepare_fused_codec_sampler_inputs(
+        model_intermediate_buffer=[{"request_id": "req-controls"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+    )
+    assert talker._fused_codec_mask_eos_value is True
+    # The graph-owned FIFO does not consume the legacy expired-code slab.
+    assert talker._fused_codec_expired.item() == 123
+
+    state["step"] = 5
+    assert talker.prepare_fused_codec_sampler_inputs(
+        model_intermediate_buffer=[{"request_id": "req-controls"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+    )
+    assert talker._fused_codec_mask_eos_value is False
+    assert talker._fused_codec_mask_eos.item() is False
 
 
 def test_fused_codec_distribution_keeps_native_multinomial_mapping() -> None:

@@ -513,6 +513,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 f"{_NPU_FIXED_CODEC_RING_ENV} are mutually exclusive"
             )
         self._graph_codec_state_request_id: str | None = None
+        self._fused_codec_mask_eos_value: bool | None = None
         self._fused_codec_sampler_prepared = False
         self._fused_codec_sampler_request_id: str | None = None
         # Code2Wav consumes codec chunks, not Talker's per-token hidden row.
@@ -1068,6 +1069,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 self._fused_codec_history_slab.fill_(-1)
                 self._fused_codec_pending_sample.fill_(-1)
                 self._graph_codec_state_request_id = request_id
+                self._fused_codec_mask_eos_value = None
             frequencies = self._fused_codec_frequencies
         else:
             frequencies = self._repetition_frequencies(
@@ -1081,9 +1083,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._request_repetition_frequencies[request_id] = self._fused_codec_frequencies
         step = int(state.get("step", 0))
         min_tokens = int(state.get("min_tokens", self._codec_min_tokens))
-        self._fused_codec_mask_eos.fill_(step < min_tokens)
-        self._fused_codec_expired.fill_(-1)
+        mask_eos = step < min_tokens
+        if getattr(self, "_fused_codec_mask_eos_value", None) is not mask_eos:
+            # This graph input changes only once in a normal request. Avoid a
+            # tiny NPU fill launch before every codec token while preserving
+            # the fixed address captured by the outer Talker graph.
+            self._fused_codec_mask_eos.fill_(mask_eos)
+            self._fused_codec_mask_eos_value = mask_eos
         if not graph_state_enabled:
+            # Graph-owned state advances its FIFO internally and never reads
+            # this legacy eviction input. Do not enqueue a dead fill on that
+            # hot path.
+            self._fused_codec_expired.fill_(-1)
             expired = self._codec_ring_expired(
                 request_id,
                 codes,

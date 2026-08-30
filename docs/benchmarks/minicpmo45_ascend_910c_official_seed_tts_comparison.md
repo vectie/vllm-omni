@@ -8366,3 +8366,60 @@ was removed and the two-slot service restored.
 /tmp/lunanexa-bench/rtf-cfm1-static-slots1-zh8-r1/
 /tmp/lunanexa-bench/rtf-cfm1-static-slots1-zh8-r2/
 ```
+
+### Accepted graph-owned Talker control residency
+
+The next exact-math change removes two per-codec host launches from the
+graph-owned Talker path without changing its native sampler.  The captured
+EOS-mask input is now written only when its Python boolean changes (normally
+once at the minimum-code boundary), rather than before every replay.  The
+legacy expired-code slab is not filled at all when the graph-owned FIFO is
+active because that branch does not read it.  Request transitions invalidate
+the cached boolean and retain the existing fixed tensor address.  Native
+`torch.multinomial`, candidate probabilities, the repetition FIFO, EOS rules,
+codec chunking and every model weight are unchanged.
+
+The focused remote suite passed 8/8 tests for fused-distribution staging,
+graph-owned controls and codec transport.  After correcting a parameter
+wiring issue found only by a non-deferred-EOS fallback test, all 39 tests that
+do not require the unavailable remote `pytest-mock` plugin passed.  The real
+runtime distribution gates passed at codec steps 1, 16 and 50 with no
+fail-closed event.  The first adjacent eight-request run also emitted the same
+`816,960` frames / `34.04 s` as its control and improved mean chunk RTF from
+`0.233439` to `0.231540` (-0.81%).
+
+The retained decision uses the longer same-trajectory comparison.  Both
+32-request paths emitted `3,323,520` frames / `138.48 s` of audio:
+
+| Metric (lower is better except throughput) | Fixed-slab CFM1 control | Control residency | Change |
+| --- | ---: | ---: | ---: |
+| Benchmark duration | 24.101855 s | **23.815255 s** | **-1.19%** |
+| Audio throughput | 5.745616x | **5.814760x** | **+1.20%** |
+| Mean audio RTF | 0.175709 | **0.173685** | **-1.15%** |
+| Mean all-chunk RTF | 0.158998 | **0.157028** | **-1.24%** |
+| Median all-chunk RTF | 0.120768 | **0.120263** | **-0.42%** |
+| P99 all-chunk RTF | 0.275375 | **0.258882** | **-5.99%** |
+| Mean TTFP | 438.61 ms | **433.73 ms** | **-1.11%** |
+| Mean E2E | 752.70 ms | **743.80 ms** | **-1.18%** |
+
+Because this changes only redundant writes into already captured control
+slabs, the preceding CFM1 Seed-TTS WER/SIM gate remains the relevant model
+quality evidence.  It does not replace the organizer's final Daily-Omni,
+Video-MME and Seed-TTS submission gate.
+
+An additional attempt retained the newly allocated native
+`multinomial + gather` scalar directly until the chunk boundary instead of
+cloning it.  Its two hot 32-request runs had mean chunk RTF `0.171393` and
+`0.152871`; their mean, `0.162132`, was 3.25% slower than control residency,
+and both P99 values (`0.279031` / `0.266401`) were worse than `0.258882`.
+The faster second run did not compensate for the large variance and first-run
+regression on the ranked mean, so direct retention was removed.  The service
+and submission source keep the explicit ownership copy.
+
+```text
+/tmp/lunanexa-bench/rtf-control-q2-20260830/
+/tmp/lunanexa-bench/rtf-control-residency-q2-candidate-20260830/
+/tmp/lunanexa-bench/rtf-control-residency-q2-candidate-zh32-20260830/
+/tmp/lunanexa-bench/rtf-control-residency-no-clone-q2-zh32-20260830/
+/tmp/lunanexa-bench/rtf-control-residency-no-clone-q2-zh32-repeat-20260830/
+```

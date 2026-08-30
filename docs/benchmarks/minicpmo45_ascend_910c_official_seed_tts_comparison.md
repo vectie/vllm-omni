@@ -8658,6 +8658,64 @@ path. Complete organizer quality gates are still mandatory before submission.
 /tmp/lunanexa-bench/exact8-candidate-zh8-repeat/
 ```
 
+### Qualified exact sixteen-step Talker command
+
+The next bounded command reserves fifteen lookahead KV slots. It passed the
+same complete one-request gate as exact eight-step: all 140 sampled IDs, 122
+published IDs, 139 distribution samples and steps, candidate-ID arrays, full
+probability vectors and final request RNG state matched exactly. Nine remote
+configuration tests passed.
+
+Both adjacent A2 runs improved the primary whole-audio RTF metric:
+
+| Metric (lower is better except throughput) | Exact 8-step A | Exact 16-step A | Exact 8-step B | Exact 16-step B |
+| --- | ---: | ---: | ---: | ---: |
+| Weighted overall RTF | 0.155015 | **0.153064** | 0.120924 | **0.118923** |
+| Audio throughput | 6.451007x | **6.533219x** | 8.269665x | **8.408824x** |
+| Mean all-chunk RTF | 0.170773 | **0.170183** | 0.110891 | **0.108079** |
+| Median all-chunk RTF | 0.075220 | **0.074584** | **0.072815** | 0.073284 |
+| Mean TTFP | 347.62 ms | **342.91 ms** | **341.95 ms** | 344.32 ms |
+| Mean TTFT | 77.60 ms | **76.91 ms** | **74.65 ms** | 81.23 ms |
+
+The same-output A pair lowers RTF by 1.26%; the already-hot B pair lowers it
+by 1.65%. TTFP shifts in opposite directions (-1.35%, +0.69%), so this is an
+RTF promotion rather than a first-packet claim. Exact sixteen-step becomes the
+best bounded command under the competition's concurrency-one, RTF-first
+policy.
+
+```text
+/tmp/lunanexa-bench/exact16-candidate-parity-smoke/
+/tmp/lunanexa-bench/exact16-candidate-zh8/
+/tmp/lunanexa-bench/exact16-candidate-zh8-repeat/
+```
+
+#### Exact twenty-four-step ceiling: parity-qualified, performance rejected
+
+Twenty-four steps is the useful scheduling ceiling for the 25-codec-frame
+publication window. Its complete trace also matched exact eight-step in every
+sample/distribution/RNG field, but the two performance pairs changed direction:
+
+| Metric (lower is better except throughput) | Exact 16-step A | Exact 24-step A | Exact 16-step B | Exact 24-step B |
+| --- | ---: | ---: | ---: | ---: |
+| Weighted overall RTF | **0.153064** | 0.154256 | 0.118923 | **0.117411** |
+| Audio throughput | **6.533219x** | 6.482749x | 8.408824x | **8.517104x** |
+| Mean all-chunk RTF | 0.170183 | **0.169301** | 0.108079 | **0.107103** |
+| Median all-chunk RTF | 0.074584 | **0.072477** | 0.073284 | **0.072344** |
+| Mean TTFP | **342.91 ms** | 354.99 ms | 344.32 ms | **337.46 ms** |
+| Mean TTFT | **76.91 ms** | 87.16 ms | 81.23 ms | **76.47 ms** |
+
+The A run regresses RTF by 0.78%, while B improves it by 1.27%. Their
+two-pair mean advantage is only about 0.12%, inside machine noise, while the
+larger command reserves eight more KV slots and holds the synchronous worker
+longer. Exact twenty-four-step remains a reproducible experimental profile but
+is not the selected best version.
+
+```text
+/tmp/lunanexa-bench/exact24-candidate-parity-smoke/
+/tmp/lunanexa-bench/exact24-candidate-zh8/
+/tmp/lunanexa-bench/exact24-candidate-zh8-repeat/
+```
+
 #### Rejected fixed-output codec embedding
 
 A follow-up candidate replaced the per-step `nn.Embedding` allocation plus

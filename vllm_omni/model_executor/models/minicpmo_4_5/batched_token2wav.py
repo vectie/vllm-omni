@@ -64,6 +64,12 @@ _NPU_CFM_CACHE_FILL_GRAPH_ENV = (
 _NPU_CFM_CACHE_FILL_GRAPH_LENGTHS_ENV = (
     "VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH_LENGTHS"
 )
+_NPU_CFM_TAIL_GRAPH_WIDTHS_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_CFM_TAIL_GRAPH_WIDTHS"
+)
+_NPU_CFM_APPEND_WORKSPACE_WIDTH_ENV = (
+    "VLLM_OMNI_MINICPMO45_NPU_CFM_APPEND_WORKSPACE_WIDTH"
+)
 _NPU_CFM_GRAPH_ATTN_MAX_ABS_DRIFT = 3.125e-2
 _NPU_CFM_GRAPH_ATTN_MEAN_ABS_DRIFT = 3.0e-3
 _NPU_INITIAL_CFM_TIMESTEPS_ENV = (
@@ -337,10 +343,60 @@ def _npu_cfm_cache_fill_graph_lengths() -> tuple[int, ...]:
     return lengths
 
 
+def _npu_cfm_tail_graph_widths() -> tuple[int, ...]:
+    """Resolve exact terminal widths admitted to outer CFM capture.
+
+    Terminal encoder output retains its right-context rows, so a full 50-code
+    final payload is width 54 on the MiniCPM-o 4.5 checkpoint.  Keep this an
+    explicit whitelist: arbitrary short tails are usually one-shot shapes and
+    their capture cost is larger than their replay saving.
+    """
+    raw = os.environ.get(_NPU_CFM_TAIL_GRAPH_WIDTHS_ENV, "")
+    if not raw.strip():
+        return ()
+    try:
+        widths = tuple(
+            dict.fromkeys(
+                int(item.strip())
+                for item in raw.split(",")
+                if item.strip()
+            )
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {_NPU_CFM_TAIL_GRAPH_WIDTHS_ENV}={raw!r}"
+        ) from exc
+    if any(width <= 0 for width in widths):
+        raise ValueError(
+            f"Invalid {_NPU_CFM_TAIL_GRAPH_WIDTHS_ENV}={raw!r}"
+        )
+    return widths
+
+
+def _npu_cfm_append_workspace_width(steady_width: int) -> int:
+    """Reserve a fixed cache-output append width without capturing a graph."""
+    raw = os.environ.get(_NPU_CFM_APPEND_WORKSPACE_WIDTH_ENV)
+    if raw in (None, ""):
+        return steady_width
+    try:
+        width = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {_NPU_CFM_APPEND_WORKSPACE_WIDTH_ENV}={raw!r}"
+        ) from exc
+    if width < steady_width:
+        raise ValueError(
+            f"Invalid {_NPU_CFM_APPEND_WORKSPACE_WIDTH_ENV}={raw!r}; "
+            f"expected at least steady width {steady_width}"
+        )
+    return width
+
+
 def _npu_cfm_graph_phase(
     *,
     fixed_kv_slabs: bool,
     cache_fill_lengths: tuple[int, ...],
+    tail_widths: tuple[int, ...],
     steady_graph: bool,
     width: int,
     cache_length: int | None,
@@ -351,6 +407,8 @@ def _npu_cfm_graph_phase(
         return "dynamic"
     if steady_graph:
         return "steady"
+    if width in tail_widths and has_cache_outputs:
+        return "tail"
     if (
         cache_length in cache_fill_lengths
         and width == 50
@@ -2362,6 +2420,10 @@ class BatchedToken2Wav(nn.Module):
         self._npu_prompt_cfm_used = False
         self._npu_cfm_cache_fill_graph_lengths = (
             _npu_cfm_cache_fill_graph_lengths()
+        )
+        self._npu_cfm_tail_graph_widths = _npu_cfm_tail_graph_widths()
+        self._npu_cfm_append_workspace_width = (
+            _npu_cfm_append_workspace_width(self._npu_dit_mlp_graph_width)
         )
         self._npu_dit_mlp_graph_enabled = _npu_dit_mlp_graph_enabled(npu_dit_mlp_graph)
         self._npu_dit_mlp_graph_width = _npu_dit_mlp_graph_width(npu_dit_mlp_graph_width)
@@ -6191,6 +6253,7 @@ class BatchedToken2Wav(nn.Module):
         graph_phase = _npu_cfm_graph_phase(
             fixed_kv_slabs=self._npu_cfm_fixed_kv_slabs_enabled,
             cache_fill_lengths=self._npu_cfm_cache_fill_graph_lengths,
+            tail_widths=self._npu_cfm_tail_graph_widths,
             steady_graph=steady_graph,
             width=int(mu.shape[2]),
             cache_length=(
@@ -6198,9 +6261,9 @@ class BatchedToken2Wav(nn.Module):
             ),
             has_cache_outputs=cnn_output is not None and att_output is not None,
         )
-        # Prompt CFM and variable-width tails remain eager. The opt-in
-        # cache-fill policy admits only explicitly configured fixed width-50
-        # shapes before cache-402 steady state.
+        # Prompt CFM and arbitrary variable-width tails remain eager. The
+        # cache-fill and terminal policies admit only explicitly configured
+        # shapes backed by fixed output addresses.
         if graph_phase is None:
             return self._decode_cfm_eager(
                 mu,
@@ -6216,12 +6279,12 @@ class BatchedToken2Wav(nn.Module):
         flat_capture = (
             self._npu_cfm_fixed_kv_slabs_enabled
             and self._npu_dit_bsh_attention_enabled
-            and graph_phase in {"cache-fill", "steady"}
+            and graph_phase in {"cache-fill", "steady", "tail"}
         )
         key = tuple(self._optional_tensor_signature(value) for value in inputs)
         entry = self._npu_cfm_graphs.get(key)
-        # Cache-fill shapes execute once per request, so one persistent output
-        # set is safe. Steady state uses the configured single or ping-pong
+        # Cache-fill/tail shapes execute once per request, so one persistent
+        # output set is safe. Steady state uses the configured single/ping-pong
         # output policy; the proven width-50 default remains two slots.
         slot_count = (
             self._npu_cfm_graph_slot_count()
@@ -6715,7 +6778,13 @@ class BatchedToken2Wav(nn.Module):
                     row["estimator_att_cache"],
                     row["estimator_cnn_cache"],
                     prompt_length,
-                    steady_width=self._npu_dit_mlp_graph_width,
+                    steady_width=max(
+                        (
+                            self._npu_dit_mlp_graph_width,
+                            self._npu_cfm_append_workspace_width,
+                            *self._npu_cfm_tail_graph_widths,
+                        )
+                    ),
                     planar=self._npu_cfm_planar_kv_slabs_enabled,
                     bsh_attention=self._npu_dit_bsh_attention_enabled,
                     cnn_cache_major=(

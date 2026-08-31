@@ -1,0 +1,15 @@
+# Selected exact-16 A2 profile with a fixed terminal cache-output workspace.
+#
+# A full terminal payload retains four right-context rows and can reach CFM at
+# width 54.  Reserving those rows once prevents the terminal invocation from
+# abandoning the request-owned KV slab for a dynamic output allocation.  This
+# does not capture arbitrary tail shapes and does not alter model arithmetic.
+
+base_config: minicpmo_4_5_1npu_a2_talker_exact_sixteen_step_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_APPEND_WORKSPACE_WIDTH: "54"

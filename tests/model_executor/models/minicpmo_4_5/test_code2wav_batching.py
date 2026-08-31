@@ -43,6 +43,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _npu_cfm_cache_fill_graph_lengths,
     _npu_cfm_graph_enabled,
     _npu_cfm_graph_phase,
+    _npu_cfm_append_workspace_width,
+    _npu_cfm_tail_graph_widths,
     _npu_cfm_integration_dtype,
     _npu_initial_cfm_timesteps,
     _npu_prompt_cfm_timesteps,
@@ -124,13 +126,22 @@ def test_flat_capture_forces_explicit_attention_only_for_bsh_cache():
 
 
 @pytest.mark.parametrize(
-    ("steady", "width", "cache_length", "has_outputs", "expected"),
+    (
+        "steady",
+        "width",
+        "cache_length",
+        "has_outputs",
+        "tail_widths",
+        "expected",
+    ),
     [
-        (False, 50, 302, True, "cache-fill"),
-        (True, 50, 402, True, "steady"),
-        (False, 50, 352, True, None),
-        (False, 44, 302, True, None),
-        (False, 50, None, False, None),
+        (False, 50, 302, True, (), "cache-fill"),
+        (True, 50, 402, True, (), "steady"),
+        (False, 54, 402, True, (54,), "tail"),
+        (False, 50, 352, True, (), None),
+        (False, 44, 302, True, (54,), None),
+        (False, 54, 402, False, (54,), None),
+        (False, 50, None, False, (), None),
     ],
 )
 def test_fixed_slab_cfm_graph_phase_is_shape_strict(
@@ -138,16 +149,45 @@ def test_fixed_slab_cfm_graph_phase_is_shape_strict(
     width: int,
     cache_length: int | None,
     has_outputs: bool,
+    tail_widths: tuple[int, ...],
     expected: str | None,
 ):
     assert _npu_cfm_graph_phase(
         fixed_kv_slabs=True,
         cache_fill_lengths=(302,),
+        tail_widths=tail_widths,
         steady_graph=steady,
         width=width,
         cache_length=cache_length,
         has_cache_outputs=has_outputs,
     ) == expected
+
+
+def test_tail_cfm_graph_widths_are_explicit_and_deduplicated(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_TAIL_GRAPH_WIDTHS", raising=False
+    )
+    assert _npu_cfm_tail_graph_widths() == ()
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_TAIL_GRAPH_WIDTHS", "54,20,54"
+    )
+    assert _npu_cfm_tail_graph_widths() == (54, 20)
+
+
+def test_cfm_append_workspace_width_is_bounded_by_steady_width(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_APPEND_WORKSPACE_WIDTH", raising=False
+    )
+    assert _npu_cfm_append_workspace_width(50) == 50
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_APPEND_WORKSPACE_WIDTH", "54"
+    )
+    assert _npu_cfm_append_workspace_width(50) == 54
+    monkeypatch.setenv(
+        "VLLM_OMNI_MINICPMO45_NPU_CFM_APPEND_WORKSPACE_WIDTH", "49"
+    )
+    with pytest.raises(ValueError, match="at least steady width 50"):
+        _npu_cfm_append_workspace_width(50)
 
 
 def test_fixed_kv_slabs_reserve_one_configured_steady_append():

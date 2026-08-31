@@ -1,0 +1,15 @@
+# Exact-16 plus the recurrent full terminal Code2Wav shape.
+#
+# A final payload containing all 50 codec frames retains four encoder
+# right-context rows and reaches CFM as width 54.  Give that exact shape a
+# fixed-address outer graph while leaving arbitrary short terminal tails eager.
+
+base_config: minicpmo_4_5_1npu_a2_talker_exact_sixteen_step_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "2"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_TAIL_GRAPH_WIDTHS: "54"

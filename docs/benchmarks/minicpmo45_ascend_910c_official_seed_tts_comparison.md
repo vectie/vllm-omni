@@ -8745,3 +8745,36 @@ not reshaping a single embedding write.
 /tmp/lunanexa-bench/exact8-fixed-embed-zh8/
 /tmp/lunanexa-bench/exact8-fixed-embed-zh8-repeat/
 ```
+
+### Qualified 54-frame terminal append workspace
+
+The fixed estimator slab originally reserved only the recurrent width-50
+append.  A full terminal payload retains four encoder right-context rows and
+can require 54 output rows; that invocation therefore abandoned the fixed
+destination and allocated a dynamic cache output.  The selected exact-16
+profile now reserves those four rows once.  Model arithmetic, sampling, CFM
+step count and emitted audio are unchanged.  Arbitrary terminal shapes remain
+eager; the separately implemented exact-tail graph whitelist was not enabled
+because neither measured run produced a reusable width-54 graph capture.
+
+Ten targeted remote tests passed.  Both A2 comparisons improved the primary
+whole-audio RTF metric:
+
+| Metric (lower is better except throughput) | Exact-16 A | Append-54 A | Exact-16 B | Append-54 B |
+| --- | ---: | ---: | ---: | ---: |
+| Weighted overall RTF | 0.153064 | **0.150011** | 0.118923 | **0.118144** |
+| Audio throughput | 6.533219x | **6.666188x** | 8.408824x | **8.464229x** |
+| Mean all-chunk RTF | 0.170183 | **0.165581** | 0.108079 | **0.107694** |
+| Median all-chunk RTF | 0.074584 | **0.074299** | **0.073284** | 0.073964 |
+| Mean TTFP | 342.91 ms | **339.18 ms** | 344.32 ms | **338.36 ms** |
+| Mean TTFT | 76.91 ms | 77.24 ms | 81.23 ms | **78.09 ms** |
+
+The same-output A run lowers RTF by 1.99%; the hot B repeat lowers it by
+0.66%.  TTFP also improves in both runs.  This is the selected final-round
+profile because its benefit comes from removing a real dynamic-output
+fallback and it adds no graph-capture latency to unseen tail widths.
+
+```text
+/tmp/lunanexa-bench/exact16-tail54-zh8/
+/tmp/lunanexa-bench/exact16-tail54-zh8-repeat/
+```

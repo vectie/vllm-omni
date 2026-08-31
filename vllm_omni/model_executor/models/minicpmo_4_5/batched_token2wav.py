@@ -2422,11 +2422,11 @@ class BatchedToken2Wav(nn.Module):
             _npu_cfm_cache_fill_graph_lengths()
         )
         self._npu_cfm_tail_graph_widths = _npu_cfm_tail_graph_widths()
+        self._npu_dit_mlp_graph_enabled = _npu_dit_mlp_graph_enabled(npu_dit_mlp_graph)
+        self._npu_dit_mlp_graph_width = _npu_dit_mlp_graph_width(npu_dit_mlp_graph_width)
         self._npu_cfm_append_workspace_width = (
             _npu_cfm_append_workspace_width(self._npu_dit_mlp_graph_width)
         )
-        self._npu_dit_mlp_graph_enabled = _npu_dit_mlp_graph_enabled(npu_dit_mlp_graph)
-        self._npu_dit_mlp_graph_width = _npu_dit_mlp_graph_width(npu_dit_mlp_graph_width)
         extra_graph_widths = _npu_dit_graph_buckets(npu_dit_graph_buckets)
         self._npu_dit_graph_widths = tuple(
             dict.fromkeys((self._npu_dit_mlp_graph_width, *extra_graph_widths))

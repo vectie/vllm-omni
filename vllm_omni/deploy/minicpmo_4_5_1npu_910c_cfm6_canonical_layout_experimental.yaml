@@ -1,0 +1,37 @@
+# Atlas 800I A3 / Ascend 910C single-chip canonical-layout candidate.
+#
+# This profile deliberately keeps Stage 2 in FP32 and CFM at the accuracy-
+# accepted six steps. It isolates fixed planar KV slabs, the cache-major causal
+# Conv state, and single-request cache passthrough from the rejected BF16 bundle.
+# Prompt/final buckets stay eager or GE-visible; only the steady 50-frame path
+# uses the fixed-capacity representation.
+
+base_config: minicpmo_4_5.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      raw_tensor_shm: false
+      shm_event_notifications: true
+      shm_notification_namespace: minicpmo45-910c-1npu
+      token2wav_n_timesteps: 6
+      npu_dit_mlp_graph: true
+      npu_dit_mlp_graph_width: 50
+      npu_dit_graph_buckets: [20, 302]
+      npu_dit_preamble_graph: true
+      # Cache-major plus wide AdaLN regressed the composed serving gate.
+      npu_dit_wide_adaln: false
+      npu_dit_conv_mlp_graph: true
+      npu_dit_prompt_conv_mlp_graph: true
+      npu_dit_fused_conv_pack: true
+      npu_dit_cache_major: true
+      npu_single_request_cache_passthrough: true
+      npu_cfm_fixed_kv_slabs: true
+      npu_cfm_planar_kv_slabs: true
+

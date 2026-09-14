@@ -231,6 +231,407 @@ def test_hift_weight_norm_materialization_preserves_unrelated_parametrization(
     assert parametrize.is_parametrized(layer, "weight")
 
 
+def test_hift_resblock_stage_shapes_match_flashcosyvoice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    hift = SimpleNamespace(
+        conv_pre=SimpleNamespace(out_channels=512),
+        ups=torch.nn.ModuleList(
+            (
+                torch.nn.ConvTranspose1d(512, 256, 16, stride=8, padding=4),
+                torch.nn.ConvTranspose1d(256, 128, 11, stride=5, padding=3),
+                torch.nn.ConvTranspose1d(128, 64, 7, stride=3, padding=2),
+            )
+        ),
+    )
+
+    assert module._hift_resblock_stage_shape(hift, mel_width=58, stage=0) == (1, 256, 464)
+    assert module._hift_resblock_stage_shape(hift, mel_width=58, stage=1) == (1, 128, 2320)
+    assert module._hift_resblock_stage_shape(hift, mel_width=58, stage=2) == (1, 64, 6961)
+
+
+def test_hift_fixed_istft_matches_torch_istft(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    width = 17
+    window = torch.hann_window(16, periodic=True)
+    constants = module._hift_fixed_istft_constants(
+        width=width,
+        window=window,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    raw = torch.linspace(-2.0, 2.0, steps=18 * width).reshape(1, 18, width)
+    magnitude = torch.exp(raw[:, :9, :])
+    phase = torch.sin(raw[:, 9:, :])
+    real = torch.clip(magnitude, max=1e2) * torch.cos(phase)
+    imag = torch.clip(magnitude, max=1e2) * torch.sin(phase)
+
+    expected = torch.istft(torch.complex(real, imag), 16, 4, 16, window=window)
+    actual = module._hift_fixed_istft(magnitude, phase, *constants)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_hift_stft_window_placement_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    hift = SimpleNamespace(stft_window=torch.arange(16, dtype=torch.float32))
+    target = torch.device("meta")
+
+    assert module._place_hift_stft_window(hift, target) is True
+    assert hift.stft_window.device == target
+    assert module._place_hift_stft_window(hift, target) is False
+
+
+def test_hift_stft_window_placement_rejects_missing_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    with pytest.raises(TypeError, match="stft_window tensor"):
+        module._place_hift_stft_window(SimpleNamespace(stft_window=None), torch.device("cpu"))
+
+
+def test_hift_resident_harmonics_is_exact_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+
+    class FakeSineGen:
+        harmonic_num = 3
+        sine_amp = 0.1
+        noise_std = 0.003
+
+        def _f02sine(self, value):
+            return torch.sin(value)
+
+        def _f02uv(self, value):
+            return (value > 0).to(torch.float32)
+
+        def forward(self, f0):
+            harmonics = torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device)
+            return module._sinegen_forward_with_harmonics(self, f0, harmonics)
+
+    sine_gen = FakeSineGen()
+    hift = SimpleNamespace(m_source=SimpleNamespace(l_sin_gen=sine_gen))
+    f0 = torch.linspace(0, 440, steps=48).reshape(1, 12, 4)[:, :, :1]
+
+    torch.manual_seed(7)
+    expected = sine_gen.forward(f0)
+    assert module.prepare_hift_resident_harmonics_for_npu(hift, torch.device("cpu"))
+    patched_forward = sine_gen.forward
+    assert not module.prepare_hift_resident_harmonics_for_npu(hift, torch.device("cpu"))
+    assert sine_gen.forward is patched_forward
+    torch.manual_seed(7)
+    actual = sine_gen.forward(f0)
+
+    assert sine_gen._step_audio2_npu_harmonics.shape == (1, 1, 4)
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+
+
+def test_hift_resident_harmonics_falls_back_for_other_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    calls: list[torch.dtype] = []
+
+    class FakeSineGen:
+        harmonic_num = 1
+
+        def forward(self, f0):
+            calls.append(f0.dtype)
+            return (f0, f0, f0)
+
+    sine_gen = FakeSineGen()
+    hift = SimpleNamespace(m_source=SimpleNamespace(l_sin_gen=sine_gen))
+    module.prepare_hift_resident_harmonics_for_npu(hift, torch.device("cpu"))
+    f0 = torch.ones(1, 8, 1, dtype=torch.float64)
+
+    actual = sine_gen.forward(f0)
+
+    assert calls == [torch.float64]
+    assert all(actual_tensor is f0 for actual_tensor in actual)
+
+
+def test_hift_source_noise_scratch_is_exact_reuses_storage_and_preserves_rng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+
+    class FakeSineGen(torch.nn.Module):
+        def forward(self, value):
+            uv = (value > 0).to(value.dtype)
+            return torch.sin(value), uv, torch.zeros_like(value)
+
+    class FakeSource(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l_sin_gen = FakeSineGen()
+            self.l_linear = torch.nn.Linear(1, 1)
+            self.l_tanh = torch.nn.Tanh()
+            self.sine_amp = 0.1
+
+        def forward(self, value):
+            with torch.no_grad():
+                sine_wavs, uv, _ = self.l_sin_gen(value)
+            sine_merge = self.l_tanh(self.l_linear(sine_wavs))
+            noise = torch.randn_like(uv) * self.sine_amp / 3
+            return sine_merge, noise, uv
+
+    source = FakeSource().eval()
+    hift = SimpleNamespace(m_source=source)
+    value = torch.linspace(-1, 1, steps=24).reshape(1, 24, 1)
+
+    torch.manual_seed(17)
+    expected = source(value)
+    expected_next = torch.randn(7)
+
+    assert module.prepare_hift_source_noise_scratch_for_npu(hift)
+    patched_forward = source.forward
+    assert not module.prepare_hift_source_noise_scratch_for_npu(hift)
+    assert source.forward is patched_forward
+
+    torch.manual_seed(17)
+    actual = source(value)
+    actual_next = torch.randn(7)
+    first_pointer = actual[1].data_ptr()
+    actual_noise = actual[1].clone()
+    second = source(value)
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual_noise, expected[1], rtol=0, atol=0)
+    torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+    torch.testing.assert_close(actual_next, expected_next, rtol=0, atol=0)
+    assert second[1].data_ptr() == first_pointer
+    assert len(source._step_audio2_npu_source_noise_scratch) == 1
+
+
+def test_hift_source_noise_scratch_keeps_separate_shape_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+
+    class FakeSource:
+        sine_amp = 0.1
+        l_sin_gen = staticmethod(lambda value: (value, torch.ones_like(value), value))
+        l_linear = staticmethod(lambda value: value)
+        l_tanh = staticmethod(torch.tanh)
+
+        def forward(self, value):
+            return value, torch.randn_like(value) * self.sine_amp / 3, value
+
+    source = FakeSource()
+    module.prepare_hift_source_noise_scratch_for_npu(SimpleNamespace(m_source=source))
+
+    first = source.forward(torch.ones(1, 8, 1))[1]
+    second = source.forward(torch.ones(1, 12, 1))[1]
+    third = source.forward(torch.ones(1, 8, 1))[1]
+
+    assert first.data_ptr() != second.data_ptr()
+    assert first.data_ptr() == third.data_ptr()
+    assert len(source._step_audio2_npu_source_noise_scratch) == 2
+
+
+@pytest.mark.parametrize(("width", "window_size"), [(1, 16), (17, 15)])
+def test_hift_fixed_istft_constants_reject_invalid_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    window_size: int,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    with pytest.raises(ValueError):
+        module._hift_fixed_istft_constants(
+            width=width,
+            window=torch.ones(window_size),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+
+def test_hift_fixed_istft_uses_original_off_npu(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    hift = SimpleNamespace(
+        _step_audio2_original_istft=lambda magnitude, phase: calls.append((magnitude, phase))
+        or magnitude[:, 0],
+    )
+    magnitude = torch.ones(1, 9, 17)
+    phase = torch.zeros_like(magnitude)
+
+    actual = module._istft_with_npu_graph(hift, magnitude, phase)
+
+    assert calls == [(magnitude, phase)]
+    torch.testing.assert_close(actual, magnitude[:, 0])
+
+
+def test_hift_resblock_graph_uses_eager_fallback_off_npu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    calls: list[str] = []
+
+    block = SimpleNamespace(
+        _step_audio2_npu_resblock_graph_shape=(1, 4, 8),
+        _step_audio2_npu_resblock_graph_disabled=False,
+        _step_audio2_npu_resblock_graph_replayed=False,
+        _step_audio2_original_forward=lambda value: calls.append("eager") or value + 1,
+        _step_audio2_npu_resblock_graph=lambda _value: (_ for _ in ()).throw(
+            AssertionError("CPU must not enter the NPU graph")
+        ),
+    )
+    value = torch.zeros(1, 4, 8)
+
+    output = module._resblock_with_npu_graph(block, value)
+
+    assert calls == ["eager"]
+    torch.testing.assert_close(output, value + 1)
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", 0), ("2", 2)])
+def test_hift_resblock_graph_stage_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: int,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_RESBLOCK_GRAPH_STAGE_ENV, value)
+    assert module._hift_resblock_graph_stage() == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "bad"])
+def test_hift_resblock_graph_stage_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_RESBLOCK_GRAPH_STAGE_ENV, value)
+    with pytest.raises(ValueError):
+        module._hift_resblock_graph_stage()
+
+
+@pytest.mark.parametrize(("value", "expected"), [("58", 58), ("1", 1)])
+def test_hift_resblock_graph_mel_width_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: int,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV, value)
+    assert module._positive_int_env(module._HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV, 58) == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "bad"])
+def test_hift_resblock_graph_mel_width_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV, value)
+    with pytest.raises(ValueError):
+        module._positive_int_env(module._HIFT_RESBLOCK_GRAPH_MEL_WIDTH_ENV, 58)
+
+
+def test_hift_f0_feature_partition_matches_sequential_stack(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    layers: list[torch.nn.Module] = []
+    channels = (3, 4, 4, 4, 4, 4)
+    for in_channels, out_channels in zip(channels, channels[1:]):
+        layers.extend(
+            (
+                torch.nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1),
+                torch.nn.ELU(),
+            )
+        )
+    condnet = torch.nn.Sequential(*layers).eval()
+    convolutions = [layer for layer in condnet if isinstance(layer, torch.nn.Conv1d)]
+    value = torch.randn(1, 3, 11)
+
+    expected = condnet(value)
+    actual = module._hift_f0_features(
+        value,
+        *(tensor for layer in convolutions for tensor in (layer.weight, layer.bias)),
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_hift_f0_predictor_partition_keeps_original_linear(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    layers: list[torch.nn.Module] = []
+    channels = (3, 4, 4, 4, 4, 4)
+    for in_channels, out_channels in zip(channels, channels[1:]):
+        layers.extend(
+            (
+                torch.nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1),
+                torch.nn.ELU(),
+            )
+        )
+    condnet = torch.nn.Sequential(*layers).eval()
+    classifier = torch.nn.Linear(4, 1).eval()
+    convolutions = [layer for layer in condnet if isinstance(layer, torch.nn.Conv1d)]
+    value = torch.randn(1, 3, 11)
+
+    expected = torch.abs(classifier(condnet(value).transpose(1, 2)).squeeze(-1))
+    actual = module._hift_f0_predictor(
+        value,
+        *(tensor for layer in convolutions for tensor in (layer.weight, layer.bias)),
+        classifier.weight,
+        classifier.bias,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_hift_f0_frozen_weights_guard_static_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_patch_module(monkeypatch)
+    weights = (torch.randn(2, 3), torch.randn(2))
+
+    module._mark_frozen_graph_weights(weights)
+
+    assert all(weight._dynamo_static_input_type == "guarded" for weight in weights)
+
+
+@pytest.mark.parametrize(("value", "expected"), [("58", 58), ("1", 1)])
+def test_hift_f0_graph_width_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: int,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_F0_GRAPH_WIDTH_ENV, value)
+    assert module._hift_f0_graph_width() == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "bad"])
+def test_hift_f0_graph_width_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_F0_GRAPH_WIDTH_ENV, value)
+    with pytest.raises(ValueError):
+        module._hift_f0_graph_width()
+
+
+def test_hift_f0_graph_buckets_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_F0_GRAPH_BUCKETS_ENV, "50,58,50")
+    assert module._hift_f0_graph_buckets() == (50, 58)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "bad", "50,bad"])
+def test_hift_f0_graph_buckets_reject_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.setenv(module._HIFT_F0_GRAPH_BUCKETS_ENV, value)
+    with pytest.raises(ValueError):
+        module._hift_f0_graph_buckets()
+
+
 @pytest.mark.parametrize(("value", "expected"), [("1", True), ("true", True), ("yes", True), ("0", False)])
 def test_hift_weight_norm_materialization_env_flag(
     monkeypatch: pytest.MonkeyPatch,
@@ -240,3 +641,19 @@ def test_hift_weight_norm_materialization_env_flag(
     module = _load_patch_module(monkeypatch)
     monkeypatch.setenv(module._HIFT_MATERIALIZE_WEIGHT_NORM_ENV, value)
     assert module._env_flag_enabled(module._HIFT_MATERIALIZE_WEIGHT_NORM_ENV) is expected
+
+
+def test_hift_optimizations_default_off_with_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_patch_module(monkeypatch)
+    monkeypatch.delenv(module._HIFT_MATERIALIZE_WEIGHT_NORM_ENV, raising=False)
+    monkeypatch.delenv(module._HIFT_F0_GRAPH_ENV, raising=False)
+    monkeypatch.delenv(module._HIFT_RESBLOCK_GRAPH_ENV, raising=False)
+
+    assert not module._env_flag_enabled(module._HIFT_MATERIALIZE_WEIGHT_NORM_ENV)
+    assert not module._env_flag_enabled(module._HIFT_F0_GRAPH_ENV)
+    assert not module._env_flag_enabled(module._HIFT_RESBLOCK_GRAPH_ENV)
+
+    monkeypatch.setenv(module._HIFT_F0_GRAPH_ENV, "1")
+    assert module._env_flag_enabled(module._HIFT_F0_GRAPH_ENV)

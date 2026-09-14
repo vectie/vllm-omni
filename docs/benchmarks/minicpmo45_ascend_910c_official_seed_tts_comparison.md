@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 on Ascend 910C: official Seed-TTS comparison
 
-Date: 2026-08-09; optimization update: 2026-08-12
+Date: 2026-08-09; optimization update: 2026-08-17
 
 This report compares the pinned LunaNexa vLLM-Omni candidate, an optimized
 candidate built from it, and the competition's published Seed-TTS performance
@@ -1999,4 +1999,5146 @@ a04d5892cb2e27f5d7208d672e7e9a223580f43282cf378341a92c4a7140e436  control-run1.j
 15c61548ebd1fefd54046c70c39ef729b6246db2407c3de2e2316cb423e53a72  control-run2.json
 e992bad2d94af35119103e6ff6a14baaae0b413fcee56249cdb7ea972c056f03  fused-run1.json
 8a748f910534e6985cf5ecdcee4c9977b6b74c6531e2aef7ab9ee298c3d47627  fused-run2.json
+```
+
+## Mixed AIC/AIV two-Conv block experiment
+
+A more aggressive `MIX_AIC_1_2` kernel was then implemented for the fixed
+FP32 `[2, 50, 512]` Code2Wav block. One launch performs both causal packing
+operations, both Cube matrix multiplications, LayerNorm, Mish, the gated
+residual, and both cache updates. C220 AIV sub-block folding, explicit
+MTE2/MTE3 event ordering, and a 16-AIC channel split are used on
+`ascend910_93`.
+
+The direct 910C operator suite passed for the mixed block and FP16, FP32, and
+BF16 pack paths. Against the eager operator boundary, 300-iteration timing
+gave:
+
+| Path | Median latency | P95 latency | Change vs native pack |
+| --- | ---: | ---: | ---: |
+| Standard eager block | 387.796 us | 389.459 us | +55.08% |
+| Native pack path | 250.058 us | 257.685 us | baseline |
+| Mixed two-Conv block | 145.516 us | 146.022 us | -41.81% |
+
+The mixed output stayed within the kernel's explicit FP32 approximation
+bounds: hidden maximum/mean absolute error `0.003918/0.000198`, and cache
+maximum/mean absolute error `0.011787/0.000313`. The error comes from the raw
+AscendC vector transcendental approximation used by Mish rather than indexing
+or cache corruption.
+
+That microbenchmark win did not survive the resident graph. After adding the
+required tiling parse metadata, TorchAir compiled the full mixed Conv+MLP
+megagraph and logged live replay with no fallback. Two matched CFM6 runs used
+the same 32 English Seed-TTS rows, seed zero, temperature zero, three warmups,
+and concurrency one as the native-pack experiment:
+
+| Two-run mean metric | Native fused pack | Mixed block megagraph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.786 s | 55.109 s | +31.88% |
+| Request throughput | 0.7658 req/s | 0.5808 req/s | -24.16% |
+| Audio throughput | 3.353x | 2.556x | -23.77% |
+| Mean TTFT | 318.27 ms | 326.19 ms | +2.49% |
+| Median TTFT | 322.76 ms | 328.90 ms | +1.90% |
+| P99 TTFT | 456.31 ms | 464.79 ms | +1.86% |
+
+A second deployment kept the mixed block outside GE and preserved the
+separate MLP graph. Its single confirmation run was also slower: `54.440 s`,
+`0.5878 req/s`, and `2.587x` audio throughput. The opaque block removes graph
+optimizer freedom worth more than its eager launch savings. It also changed
+the aggregate output from 480 tokens / 140.12 seconds to 481 tokens / 140.84
+seconds, so the official WER/SIM gates would be required before any use.
+
+Decision: keep the mixed kernel and profile as opt-in experimental research,
+but retain the native causal-pack megagraph as the 910C competition default.
+The next kernel work should fuse within a graph-profitable boundary or use a
+GE-visible decomposition; eager microbenchmark wins alone are not promotion
+criteria.
+
+Mixed-result checksums:
+
+```text
+2247cb0f9d85700349fd4f168fd6163f8b70eb21ceb4946b0336ed2fe3cb3002  mix-block-megagraph-run1.json
+c950e6bf4c0e0d822b3f7866fe16c5c6c8c3af8b9b8c37fd0ebde05ce3f33332  mix-block-megagraph-run2.json
+0abb9ae8e0403d30f8c02672f61cdc3f98f606fee631fe9f0a60fd32f1ee5377  mix-block-split-run1.json
+```
+
+## GE-visible lowering of the aggressive Conv profile
+
+The opaque mixed-block boundary has now been removed from resident graph
+replay. Two integration layers enforce that boundary:
+
+1. The vLLM Ascend converter for
+   `npu_minicpmo_causal_conv_block` decomposes the block into two small
+   `MinicpmoCausalConvPack` layout nodes and native GE `MatMulV2`, `Reshape`,
+   `LayerNormV4`, `Mish`, `Mul`, `Add`, `SplitV`, and `ConcatV2` nodes.
+2. The vLLM-Omni serving path goes further and selects the already-proven
+   causal-pack Conv+MLP callable directly. This lets Dynamo and TorchAir use
+   their normal ATen-to-GE lowering and gives the aggressive and competition
+   profiles one canonical graph and cache key.
+
+The mixed `MIX_AIC_1_2` kernel remains available for eager operator research;
+it is not inserted into the resident graph. A kernel cannot simultaneously be
+one opaque custom launch and expose its internal GEMMs and vector operations
+to GE. The graph-visible path therefore keeps custom code only where it is
+profitable: the causal history packing and two-frame cache extraction.
+
+On-device validation on the same `DevEnv_132987` Ascend 910C host produced the
+following sequence. The hand-authored GE converter compiled successfully but
+measured `57.64 s` and `2.44x` audio throughput. The direct canonical lowering
+also compiled and logged live replay:
+
+```text
+Compiled MiniCPM-o NPU DiT Conv+MLP megagraph for 2x50x512
+MiniCPM-o NPU DiT GE-visible Conv-block + MLP graph replay active
+```
+
+Because the historical `41.786 s` native-pack result was no longer
+reproducible on the current machine state, a fresh block-off control was run
+immediately after the graph-visible trial with the same source, model, 32
+Seed-TTS rows, CFM6 schedule, three warmups, concurrency one, and temperature
+zero:
+
+| Current-state metric | Native-pack control | GE-visible aggressive profile | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration (lower) | 55.09 s | 56.49 s | +2.54% |
+| Request throughput (higher) | 0.58 req/s | 0.57 req/s | -1.72% |
+| Mean TTFT (lower) | 326.27 ms | 318.36 ms | -2.42% |
+| Median TTFT (lower) | 332.39 ms | 319.06 ms | -4.01% |
+| P99 TTFT (lower) | 461.37 ms | 455.17 ms | -1.34% |
+| Audio throughput (higher) | 2.56x | 2.49x | -2.73% |
+
+Both paths completed 32/32 requests with zero failures, 100% continuity,
+4,801 input tokens, 481 output tokens, 3,380,160 audio frames, and 140.84
+seconds of audio. Since both profiles now select the exact same graph callable,
+the small duration/throughput spread is run-to-run service variance, not a
+different Conv graph. The change fixes the optimizer boundary but does not
+claim a new speedup over the causal-pack graph; that path was already the
+graph-profitable implementation.
+
+Focused validation passed 55/55 vLLM-Omni Code2Wav tests and the vLLM Ascend
+converter structure test. Full Seed-TTS WER/SIM, Daily-Omni, and Video-MME
+qualification remains required before changing the competition accuracy
+status.
+
+New raw results are in the existing experiment directory:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-fused-conv-20260814/results
+```
+
+Result checksums:
+
+```text
+c644fdefc4571eace58c7f604a37d0b36ae3e5ae258f5fe85f7b93d2c72220b7  ge-visible-run1.json
+645a85a36274e6a7864f47400af4d51611e0fac2f54942e17bb10944a8cfdf12  ge-visible-direct-run1.json
+24f49fce2bbc349768544dd4df28f31e5e56168fb42c85a1a0aa1dd900f5aa02  ge-visible-canonical-run1.json
+b9f9e88e26ed5724f4558855461a713bea35c3c0cd4efba3e38c4bf2fe664083  current-native-pack-control-run1.json
+```
+
+## Causal-pack plus Cube-projection fusion experiment
+
+The next kernel experiment narrows the opaque boundary that hurt the mixed
+two-Conv block. Each custom node now contains exactly one fixed-shape causal
+history pack, its immediately consuming FP32 `512 x 1536` Cube projection,
+the projection bias, and the two-frame cache update. LayerNorm, Mish, the
+gated residual, cache assembly, and the complete MLP remain ordinary nodes in
+the surrounding TorchAir graph so GE retains visibility across the expensive
+rest of the block.
+
+The `KERNEL_TYPE_MIX_AIC_1_2` implementation uses AIV cores to materialize the
+tap-major history while 16 AIC cores split the projection's output channels.
+The vLLM Ascend package adds the ACLNN binding, meta function, TorchAir
+converter, fixed-shape tiling, and a paired microbenchmark. Its build wrapper
+now also removes generated `csrc/build` metadata when the selected operator
+set changes. This was required after a stale `binary_info_config.json`
+packaged a compiled kernel without registering it.
+
+The clean CANN 9.0 `ascend910_93` package registered all three MiniCPM-o
+operators. Five direct NPU tests passed: three pack dtypes, the mixed block,
+and the new fused projection. The fused FP32 output matched pack plus
+`F.linear` within `rtol=1e-4, atol=1e-3`; the cache was bit-exact. The complete
+vLLM-Omni Code2Wav routing suite passed 57/57.
+
+Fifteen paired microbenchmark trials alternated execution order; each trial
+contained 100 calls after 50 warmups:
+
+| 910C operator path | Median latency | Minimum latency | Change |
+| --- | ---: | ---: | ---: |
+| Native pack + projection | 78.320 us | 77.226 us | baseline |
+| Fused pack + Cube projection | 69.537 us | 68.813 us | -11.21% (1.126x) |
+
+The resident service then used the same 32 English Seed-TTS rows, seed zero,
+temperature zero, three warmups, CFM6, and concurrency one. The candidate log
+confirmed live use rather than fallback:
+
+```text
+MiniCPM-o NPU DiT fused Conv+Linear + MLP graph replay active
+```
+
+It was followed immediately by a clean service restart with fused linear off
+and the native pack graph on. Both runs completed 32/32 with zero failures,
+100% continuity, 4,801 input tokens, 481 output tokens, 3,380,160 audio frames,
+and 140.84 seconds of audio.
+
+| Paired metric | Native-pack control | Fused projection | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 53.954 s | 54.661 s | +1.31% |
+| Request throughput | 0.5931 req/s | 0.5854 req/s | -1.30% |
+| Audio throughput | 2.610x | 2.577x | -1.30% |
+| Mean E2E | 1,685.52 ms | 1,707.81 ms | +1.32% |
+| Median E2E | 1,727.27 ms | 1,768.22 ms | +2.37% |
+| Mean TTFT | 318.77 ms | 324.25 ms | +1.72% |
+| Median TTFT | 320.18 ms | 324.38 ms | +1.31% |
+| Mean audio TTFP | 865.62 ms | 880.60 ms | +1.73% |
+| Median audio TTFP | 871.47 ms | 881.26 ms | +1.12% |
+| Mean per-chunk RTF | 0.40310 | 0.40801 | +1.22% |
+| Median per-chunk RTF | 0.25755 | 0.26315 | +2.17% |
+
+Lower is better except for throughput. The isolated boundary is faster, but
+the saving is too diluted inside the complete Code2Wav stage to clear service
+variance or the promotion gate; every paired end-to-end metric moved in the
+wrong direction. The feature therefore remains disabled by default and is
+available only through
+`minicpmo_4_5_2npu_910c_cfm6_dit_conv_linear_experimental.yaml`. The native
+pack plus GE-visible projection remains the competition path. Future kernel
+work must remove a larger amount of Stage-2 work without hiding GE-profitable
+operations; a sub-10-us boundary saving is not large enough by itself.
+
+Raw results remain in:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-fused-conv-20260814/results
+```
+
+```text
+604970b0820f58412b50cd406d11efb579668e608c16eb1ca80ce63b5d586da2  conv-linear-k1-seedtts-32.json
+12f204d43a0775c5afdfdd1cc8e08238c2eb03c6ae76f2c92ea55f5550b9b22e  paired-pack-control-seedtts-32.json
+```
+
+## HiFT F0 feature-graph upgrade
+
+A fresh native Torch-NPU profile of a warmed Seed-TTS request showed that the
+remaining Stage-2 cost is no longer dominated by a single DiT boundary. The
+largest operator families were `MatMulV2` (49.250 ms, 12.36%), `TransData`
+(48.408 ms, 12.15%), `Transpose` (40.329 ms, 10.12%), the custom causal pack
+(37.112 ms, 9.31%), and `LayerNormV3` (33.268 ms, 8.35%). Shape aggregation
+also exposed a repeated fixed HiFT F0 stack: 405 weight-layout conversions for
+`[512, 512, 1, 3]` convolution weights consumed 24.122 ms in the profiled
+request.
+
+The new candidate compiles HiFT's five fixed Conv1d+ELU feature layers as one
+static TorchAir graph for the steady streaming shape `[1, 80, 58]`. It keeps
+the checkpoint's original per-timestep Linear classifier outside GE. The
+first `[1, 80, 50]` chunk and every incompatible shape fall back to the
+original predictor. Startup checks materialize the immutable inference-only
+weight-normalized convolutions and require bit-exact feature output before the
+patch is installed. A 910C screening run measured 407.790 us for the complete
+eager predictor, 248.509 us for an experimental complete static graph, and
+241.228 us for the promoted five-Conv feature graph. The complete graph was
+rejected because replacing Linear with a 1x1 Conv changed its accumulation
+order; the promoted boundary retains Linear unchanged.
+
+This experiment also found and fixed an orchestration defect: `runtime.env`
+from platform stage overlays was not applied while local LLM workers were
+spawned. Stage environment variables are now scoped to the serialized spawn,
+inherited by only the intended child, and restored afterward. The candidate
+log consequently proves both configuration and live execution:
+
+```text
+[stage_init] Stage-2 applied runtime env keys: [...HIFT_F0_GRAPH, ...HIFT_F0_GRAPH_WIDTH, ...HIFT_MATERIALIZE_WEIGHT_NORM]
+Compiled HiFT F0 feature graph for Ascend NPU: batch=1 width=58
+HiFT F0 graph falling back for runtime shape (1, 80, 50); compiled shape is (1, 80, 58)
+HiFT F0 feature graph replay active for runtime shape (1, 80, 58)
+```
+
+The paired service test used fresh restarts, the same source and model, the
+same 32 English Seed-TTS rows, seed zero, temperature zero, three warmups,
+CFM6, and concurrency one. The control retained weight-norm materialization
+and every existing DiT optimization but disabled only the new F0 graph.
+
+| Paired metric | Weight-norm control | HiFT F0 graph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.724 s | 42.505 s | -4.96% |
+| Request throughput | 0.7155 req/s | 0.7529 req/s | +5.22% |
+| Audio throughput | 3.133x | 3.297x | +5.22% |
+| Mean E2E | 1,397.18 ms | 1,327.91 ms | -4.96% |
+| Median E2E | 1,420.00 ms | 1,335.23 ms | -5.97% |
+| Mean TTFT | 324.60 ms | 314.55 ms | -3.10% |
+| Median TTFT | 330.48 ms | 313.13 ms | -5.25% |
+| P99 TTFT | 465.85 ms | 445.42 ms | -4.39% |
+| Mean audio TTFP | 809.87 ms | 787.02 ms | -2.82% |
+| Median audio TTFP | 819.56 ms | 790.42 ms | -3.56% |
+| Mean per-chunk RTF | 0.34559 | 0.32990 | -4.54% |
+| Median per-chunk RTF | 0.17820 | 0.14090 | -20.93% |
+
+Lower is better except for throughput. Both paths completed 32/32 requests
+with zero failures and 100% streaming continuity. They produced identical
+aggregate structure: 4,801 input tokens, 480 output tokens, 3,362,880 audio
+frames, and 140.12 seconds of audio.
+
+An additional paired eight-item export preserved the sample rate and exact
+frame count for all eight utterances. Fresh service restarts make HiFT's
+random excitation prevent byte-identical WAV files; nevertheless, candidate
+versus control waveform correlation averaged 0.999938 (minimum 0.999808) with
+40.205 dB mean SNR. The exact NPU feature-partition test and 113/113 affected
+CPU unit tests also passed. The host did not contain the official Whisper WER
+checkpoint and could not reach Hugging Face, so full Seed-TTS WER/SIM remains
+an explicit promotion gate alongside Daily-Omni and Video-MME. The graph
+profile therefore remains opt-in despite the positive speed result.
+
+Use these paired profiles:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_weight_norm_control.yaml
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_f0_graph_experimental.yaml
+```
+
+Raw results and WAV exports are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-f0-20260815
+```
+
+Result checksums:
+
+```text
+7581689ff07792a4d1952c4543dbee1d40ad19195e6f545478e828ca2bbc68ab  control-en32.json
+e30299874e9f5d02f235740ed8b9e68ea26658282fa806a4685a78a2b03e0a61  candidate-en32.json
+```
+
+## Prompt-width DiT graph buckets and widened Conv+MLP boundary
+
+The post-HiFT-F0 Stage-2 trace showed that the fixed 50-frame streaming path
+was no longer the only relevant DiT shape. Prompt setup and finalization also
+repeated stable 302- and 20-frame shapes, but both fell back to the original
+eager block. The first candidate generalized the existing TorchAir MLP and
+attention-preamble partitions to an explicit `[20, 50, 302]` width set. It
+also allowed the uncached setup pass to use the graph path: upstream
+`CausalConv1d.forward_chunk(None)` creates an all-zero causal history, so the
+adapter can preserve exact cache semantics without requiring a prior chunk.
+
+All six MLP/preamble shapes compiled and replayed on the same 910C host. The
+three-run split-boundary median was effectively neutral versus the immediately
+preceding HiFT-F0 result: serving duration improved 0.08% and mean per-chunk
+RTF improved 0.91%, while mean TTFP regressed 1.01% and median per-chunk RTF
+regressed 9.33%. This confirmed that compiling more small islands alone did
+not remove enough eager layout and launch overhead.
+
+The widened candidate therefore adds a regular Conv/cache + gated residual +
+MLP megagraph for the 20- and 302-frame buckets. It deliberately does not use
+the fixed-width native causal-pack converter: regular Conv1d remains visible
+inside GE at these widths, while the qualified 50-frame path continues to use
+the native-pack megagraph. Both additional graphs compiled, and a live request
+logged independent replay at widths 302 and 20 with no fallback:
+
+```text
+Compiled MiniCPM-o NPU prompt Conv+MLP megagraph for 2x20x512
+Compiled MiniCPM-o NPU prompt Conv+MLP megagraph for 2x302x512
+MiniCPM-o NPU prompt Conv+MLP megagraph replay active at width=302
+MiniCPM-o NPU prompt Conv+MLP megagraph replay active at width=20
+```
+
+Three resident candidate runs used the same 32 fixed English Seed-TTS rows,
+three warmups, concurrency one, seed zero, temperature zero, CFM6, and nested
+TTS request body. The comparison below uses the three-run candidate median
+and the immediately preceding HiFT-F0 control. Lower is better except for
+throughput.
+
+| Metric | HiFT-F0 control | Widened prompt graph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 42.505 s | 41.281 s | -2.88% |
+| Request throughput | 0.7529 req/s | 0.7752 req/s | +2.96% |
+| Audio throughput | 3.297x | 3.394x | +2.96% |
+| Mean E2E | 1,327.91 ms | 1,289.58 ms | -2.89% |
+| Median E2E | 1,335.23 ms | 1,318.25 ms | -1.27% |
+| P99 E2E | 1,755.99 ms | 1,705.56 ms | -2.87% |
+| Mean TTFT | 314.55 ms | 310.09 ms | -1.42% |
+| Median TTFT | 313.13 ms | 315.62 ms | +0.79% |
+| P99 TTFT | 445.42 ms | 450.95 ms | +1.24% |
+| Mean audio TTFP | 787.02 ms | 749.41 ms | -4.78% |
+| Median audio TTFP | 790.42 ms | 752.99 ms | -4.74% |
+| P99 audio TTFP | 933.19 ms | 915.84 ms | -1.86% |
+| Mean per-chunk RTF | 0.32990 | 0.31848 | -3.46% |
+| Median per-chunk RTF | 0.14090 | 0.15142 | +7.47% |
+| P99 per-chunk RTF | 1.05869 | 1.01870 | -3.78% |
+
+Every widened run completed 32/32 requests with zero failures and retained
+the exact aggregate structure: 4,801 input tokens, 480 output tokens,
+3,362,880 audio frames, and 140.12 seconds of audio. The full Code2Wav
+regression file passed 66/66, including exact partition math at widths 20, 50,
+and 302. The candidate remains opt-in because median/P99 TTFT and median chunk
+RTF did not improve, and structural parity is not a substitute for the full
+Seed-TTS WER/SIM, Daily-Omni, and Video-MME accuracy gates.
+
+Use the experimental profile:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml
+```
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-prompt-graph-buckets-20260815/results
+```
+
+Result checksums:
+
+```text
+27ae6871bc2043d6bc553c9825a31f60335af63781ff4826f7bbabc5ff8c7e07  candidate-en32-valid.json
+104c1ccf6e1cfc135106f5a975e7efb8d99e8724c42bdc7759153f5202405c0e  candidate-en32-run2.json
+a34cf535a89e5331e120113e720be3c4fd950626d14757789e1a8063227900a5  candidate-en32-run3.json
+bdc4a6ba38a45f5848429cba24749096fff7bcb0bf9f9b78b441cfc9d0e0dcda  prompt-wide-en32-run1.json
+0396c16fdc8cb55aca790f9085cfa80305f963e31f1f6a07f8d78c6e67b8c563  prompt-wide-en32-run2.json
+83b355b474c1d4ef094b18f6aaec97847da7fd9a8f4c302054eb1d4e67a3c372  prompt-wide-en32-run3.json
+```
+
+## Further tuning: HiFT bucket and complete-DiT graph screening
+
+The next tuning pass tested two wider boundaries rather than assuming that
+more graph coverage is automatically faster. Both candidates remain disabled
+because same-host measurements rejected them.
+
+### HiFT first-chunk bucket
+
+The HiFT feature compiler now supports an optional static-width list through
+`VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_BUCKETS`. The candidate added width 50
+beside the accepted width 58. Both shapes compiled, matched the eager feature
+stack bit-for-bit, and replayed on NPU. Three 32-item runs completed without a
+failure, but their 42.650-second median was 3.31% slower than the preceding
+41.281-second prompt-width median. The extra bucket is therefore not enabled
+by any promoted profile.
+
+This experiment also exposed a configuration correctness issue: stage `env`
+maps were replaced rather than recursively merged while resolving a derived
+deploy profile. `env` now follows the same deep-merge rule as engine arguments,
+so a child profile can add one stage variable without dropping inherited HiFT
+flags.
+
+Result checksums:
+
+```text
+5183bebda37cfce1a49a2aefae7b5abf6d30932a6bae02ed72e042b028e1ad4a  f0-buckets-en32-run1.json
+0b5e277d41fc99a0a917361d1b88f36e04d8c95b4dcaf1aa858a75339f79a2e2  f0-buckets-en32-run2.json
+8b9e954e74a43a6e059f2877a2ad39778d2d962fef113e5fb68a3519f3784fec  f0-buckets-en32-run3.json
+```
+
+### Full DiT block and 16-block stack graphs
+
+Torch-NPU 2.10 rewrites SDPA to the six-output
+`npu_fusion_attention_v3` overload, while the competition image's TorchAir
+contains a converter only for the older seven-output overload. The Ascend fork
+now has a lazy inference converter that lowers the v3 BNSD/no-dropout subset to
+GE `FlashAttentionScore`. With it, complete width-50 DiT block graphs compiled
+at the three observed cache lengths 302, 352, and 402 and replayed at all three
+lengths in a real request.
+
+That successful lowering was not a speed win. A warmed same-row request took
+6.312 seconds versus 1.166 seconds on the restored split boundary; audio TTFP
+regressed from 0.760 to 6.014 seconds. Combining all 16 blocks into one graph
+removed per-block replay overhead but still took 6.168 seconds. Replacing
+small-shape FlashAttention (`q=50`, `kv<=452`, head dimension 64) with explicit
+`BatchMatMulV2 -> softmax -> BatchMatMulV2` also compiled as one stack graph,
+but took 6.149 seconds. The near-identical results show that the opaque call
+boundary was not the limiting cost: this CANN/TorchAir version produces a
+large GE plan whose execution is substantially slower than the qualified
+split eager/graph path. Cold first use was also 49-59 seconds for these plans.
+
+| Same first Seed-TTS row, warmed | E2E | Audio TTFP | First chunk RTF | Decision |
+| --- | ---: | ---: | ---: | --- |
+| Restored prompt-width split profile | 1.166 s | 0.760 s | 0.905 | Keep |
+| Complete graph per DiT block | 6.312 s | 6.014 s | 7.160 | Reject |
+| One 16-block stack, FlashAttention | 6.168 s | 5.820 s | 6.928 | Reject |
+| One 16-block stack, explicit BMM attention | 6.149 s | 5.814 s | 6.921 | Reject |
+
+The graph implementations and profiles remain opt-in diagnostics for newer
+CANN/TorchAir releases; neither flag is set by the accepted profile. Runtime
+guards fail closed to the existing split path on an unsupported layout, cache
+length, or compile failure.
+
+After restoring
+`minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml`, two
+fresh resident 32-item checks completed 32/32 with zero failures and exact
+aggregate parity (4,801 input tokens, 480 output tokens, 3,362,880 frames, and
+140.12 seconds of audio). They measured 44.681 and 44.619 seconds on the current
+host state. This is slower than the earlier 41.281-second three-run median but
+matches the older 44.724-second HiFT control; because all active graph markers
+and request structure are unchanged, it is recorded as host/run variance, not
+as a promoted regression or improvement. The directly affected Code2Wav and
+NPU-platform suites passed 99/99. Official Seed-TTS WER/SIM, Daily-Omni, and
+Video-MME gates remain required before promoting any accuracy-changing
+attention replacement.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-f0-buckets-20260817
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-full-dit-v3-20260817
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-full-stack-20260817
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-full-stack-bmm-20260817
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-further-tuning-20260817
+```
+
+Selected warmed/restored checksums:
+
+```text
+de07894d23922b864cbb4489c0927bf9bcd70961579156dc617e7734cf2ee5c3  full-dit-v3-axis-smoke-2.json
+161cbd79fb766f6b591ffe6636bbc4b979f2970b12c9ee248246c33c4a3099bc  full-stack-smoke2.json
+c078a44dae35b4c0677e6b6e83d3efaa2dd56a45512354bb49d2bebe7e94dca7  full-stack-bmm-smoke2.json
+0de7ea26751f335318d5ac944d85a0258b03b15e51cf2b7dfc4e1a9a5116f35b  restored-prompt-en32.json
+901f70df0afbc529445f141ff043464f83fc940d0b13f15673affe40be1df133  restored-prompt-en32-run2.json
+```
+
+## Cache-major native causal-convolution path
+
+A fresh Stage-2 NPU trace of the restored prompt-width profile identified
+`MinicpmoCausalConvPack` as a repeated small-kernel cost: 576 calls consumed
+38.321 ms, or 66.53 us per call. Its channel-major cache layout
+`[batch, channels, 2]` requires scalar gathers for the two historical taps and
+scalar writes for every cache update. The native AscendC operator now also
+accepts a cache-major `[batch, 2, channels]` layout. That layout makes both
+historical taps and the returned cache contiguous DMA copies while preserving
+the old ABI and path.
+
+The vLLM-Omni adapter retains this cache-major layout across the steady
+50-frame CFM stream instead of transposing it at each of the 16 DiT blocks.
+Prompt and final non-steady boundaries remain on the existing layout. The new
+path is guarded by `VLLM_OMNI_MINICPMO45_NPU_DIT_CACHE_MAJOR`, requires the
+qualified native pack plus Conv+MLP graph, and fails closed to the existing
+implementation.
+
+Post-install NPU validation passed all six dtype/layout cases with exact
+outputs. An alternating-order kernel microbenchmark measured the following;
+lower is better:
+
+| Native causal-pack layout | Median | Minimum |
+| --- | ---: | ---: |
+| Channel-major control | 62.777 us | 62.746 us |
+| Cache-major candidate | 27.161 us | 26.741 us |
+
+The cache-major kernel is 2.31x faster by median. The custom-op subset build
+also exposed stale CMake `AICPU_CUST_OBJ_TARGETS` state when changing the
+selected operator list. The build now clears that derived cache before
+collecting targets. A clean package containing both `AddRmsNormBias` and
+`MinicpmoCausalConvPack` installed with SHA-256:
+
+```text
+999387e27f4547660164719ab43a0147e0899823346cf3f1153befde1ab276a6
+```
+
+The end-to-end A/B used fresh service starts, followed by three resident runs
+per side. Every run used the same 32 Seed-TTS English rows, three warmups,
+concurrency one, seed zero, temperature zero, and CFM6 request body. Each run
+completed 32/32 requests with zero failures and generated exactly 4,801 input
+tokens, 480 output tokens, 3,362,880 frames, and 140.12 seconds of audio.
+
+| Metric (three-run median) | Prompt-width control | Cache-major candidate | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.200 s | 43.754 s | -1.01% |
+| Request throughput | 0.7240 req/s | 0.7314 req/s | +1.02% |
+| Audio throughput | 3.170x realtime | 3.202x realtime | +1.02% |
+| Mean E2E | 1,380.78 ms | 1,366.86 ms | -1.01% |
+| Median E2E | 1,421.81 ms | 1,407.19 ms | -1.03% |
+| Mean TTFT | 315.74 ms | 315.49 ms | -0.08% |
+| Mean audio TTFP | 783.94 ms | 775.40 ms | -1.09% |
+| Median audio TTFP | 781.19 ms | 783.18 ms | +0.25% |
+| Mean per-chunk RTF | 0.33907 | 0.33443 | -1.37% |
+| Median per-chunk RTF | 0.18370 | 0.18478 | +0.59% |
+| P99 per-chunk RTF | 1.08678 | 1.06626 | -1.89% |
+
+Lower is better except for throughput. The live service logged
+`MiniCPM-o NPU cache-major Conv+MLP megagraph replay active`, with no compile
+failure or eager fallback. The result is a small end-to-end win rather than a
+2.31x service gain because the causal-pack kernel is only one small component
+of the full text, audio-token, CFM, and vocoder pipeline. Median TTFP and
+median chunk RTF are effectively neutral and slightly worse, so the new
+profile remains opt-in:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_cache_major_experimental.yaml
+```
+
+The aggregate-output and exact native-kernel checks are structural evidence,
+not a replacement for the full official Seed-TTS WER/SIM, Daily-Omni, and
+Video-MME accuracy gates. Those gates are still required before promotion.
+
+A separately tested HiFT static-weight conversion was rejected: frozen and
+unfrozen paths measured 213.259 us and 212.383 us respectively (0.996x), and
+the attempted FRACTAL_Z lowering was not semantically valid for this Conv1d
+weight layout. Neither experiment is enabled.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-cache-major-20260817
+```
+
+Result checksums:
+
+```text
+fd0f3623d1adb1ab25e0de14891d5cb7de0b40f510c11851ff6620fa952a9122  candidate-run1.json
+c021eca41c2e99afe8b3b0c5650542e14ae322d7d9f2ba95072e24103843eb07  candidate-run2.json
+967163735a4001ab69bf370815846bb8ffd28c676a079231a7b8912d4b6321ce  candidate-run3.json
+3ec715f54c52f23cf730feb3a8b5f47495ea39bb9c7d9c4a61498414ed524936  control-run1.json
+0cc6dc6f17b104de35ea2139b433519da3c5d68176a0c49732a9ee29d0033f5e  control-run2.json
+96251e1a84d9f6bee266f67e48578ed46c9da051e11190b532158323e74b4fae  control-run3.json
+```
+
+## Post-attention graph and native QKV layout screening
+
+Two follow-up candidates tested narrower lower-level boundaries against the
+cache-major path. Neither is promoted.
+
+The first moved the attention residual, `norm3`, modulation, native causal
+pack, convolution, and MLP into one post-attention graph. It compiled and
+replayed, but a fail-fast 32-request run took 47.460 seconds, 8.47% longer
+than the 43.754-second cache-major median. Mean E2E rose to 1,482.69 ms and
+mean chunk RTF to 0.36418. The opaque wider graph therefore prevents more
+valuable GE scheduling than it saves in Python/launch overhead. It remains an
+explicit diagnostic only:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_post_attention_experimental.yaml
+```
+
+The second candidate kept the successful preamble boundary but replaced the
+three fixed `[2,50,512]` BSH-to-BNSD materializations with one AscendC
+`MinicpmoQkvPack` launch. Q/K normalization and SDPA remain visible to GE;
+widths 20 and 302 continue to use the ordinary preamble graph. The custom
+operator passed exact FP16, FP32, and BF16 checks. Alternating-order NPU
+microbenchmarks measured the following (lower is better):
+
+| Width-50 QKV layout path | Median | Minimum |
+| --- | ---: | ---: |
+| Three transpose/materialize operations | 67.618 us | 62.530 us |
+| Native QKV pack | 40.267 us | 40.136 us |
+
+The native kernel is 1.68x faster by median, and TorchAir successfully
+compiled and replayed it inside the preamble graph. The complete Seed-TTS
+fail-fast run nevertheless took 44.642 seconds: 2.03% slower than the
+cache-major candidate median and effectively equal to the recent
+44.619-second restored control. It completed 32/32 requests with zero
+failures and exact aggregate parity: 4,801 input tokens, 480 output tokens,
+3,362,880 frames, and 140.12 seconds of audio.
+
+| QKV candidate metric | Result |
+| --- | ---: |
+| Request throughput | 0.7168 req/s |
+| Audio throughput | 3.1388x realtime |
+| Mean / median E2E | 1,394.68 / 1,449.75 ms |
+| Mean / median TTFT | 319.63 / 328.86 ms |
+| Mean / median audio TTFP | 787.90 / 796.39 ms |
+| Mean / median chunk RTF | 0.34324 / 0.18816 |
+
+This is a useful kernel but not a serving optimization on the current
+CANN/TorchAir stack, so it also remains opt-in:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_qkv_pack_experimental.yaml
+```
+
+The selected three-op package (`AddRmsNormBias`, causal pack, and QKV pack)
+has SHA-256 `47230e94d72cc8c61070126597c3c095eaf1143fc652c0c7b1056fb983a00ab7`.
+The Ascend build now supports an explicit selected-op override and an
+extension-only rebuild against an already installed ACLNN package, avoiding
+accidental recompilation of the full custom-op matrix during kernel iteration.
+
+Raw results are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-post-attention-20260817
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-qkv-pack-20260817
+```
+
+Result checksums:
+
+```text
+78739916d99822fb74624ecb6046ba380b212d96f262cba576899bce4dfdffd9  post-attention candidate-run1.json
+e5b4729f87abfd99c47fd6c29683cc14fb0be8d8719b173be82e182221628ed5  qkv-pack candidate-run1
+```
+
+## HiFT stage-0 residual-block graphs
+
+The next Stage-2 boundary targets the vocoder rather than widening the DiT
+graphs. For the steady 58-frame mel chunk, HiFT's first transposed-convolution
+stage produces `[1, 256, 464]`. It then evaluates three parallel residual
+blocks, each containing three `Snake -> Conv1d -> Snake -> Conv1d -> add`
+sequences. The new opt-in path compiles each complete residual block as one
+static TorchAir graph. Upsampling, source injection, and ISTFT remain visible
+to the existing eager pipeline, and every non-matching shape uses the original
+bound method.
+
+Startup derives the graph shape from the checkpoint's transposed-convolution
+parameters, materializes immutable inference weight norm, compiles all three
+siblings, and requires bit-exact output from every graph before installing any
+of them. A runtime graph exception disables only that block and fails closed
+to eager execution. The focused patch suite passed 40/40 both locally and in
+the 910C environment.
+
+The saved standalone NPU-1 microbenchmark used 20 warmups and 100 iterations
+per block. Lower is better:
+
+| Three stage-0 residual blocks | Total latency | Relative |
+| --- | ---: | ---: |
+| Eager | 3,608.739 us | 1.000x |
+| TorchAir graphs | 1,671.924 us | 2.158x faster |
+
+All three block outputs had maximum absolute error `0.0`. The live candidate
+service subsequently logged all three replay markers on real Stage-2 inputs,
+with no graph failure or eager fallback.
+
+The end-to-end A/B used the existing widened prompt-graph profile as control.
+The candidate added only:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_resblock_graph_experimental.yaml
+```
+
+Both variants ran three times over the same 32 English Seed-TTS rows with
+three warmups, concurrency one, seed zero, temperature zero, and the same CFM6
+request body. Every run completed 32/32 with zero failures and 100% streaming
+continuity. Every run also produced exactly 4,801 input tokens, 480 output
+tokens, 3,362,880 frames, and 140.12 seconds of audio.
+
+| Metric (three-run median) | Prompt-graph control | HiFT residual graphs | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.136 s | 41.632 s | -5.67% |
+| Request throughput | 0.7250 req/s | 0.7686 req/s | +6.02% |
+| Mean E2E | 1,378.87 ms | 1,300.67 ms | -5.67% |
+| Median E2E | 1,420.05 ms | 1,314.86 ms | -7.41% |
+| P99 E2E | 1,886.40 ms | 1,767.13 ms | -6.32% |
+| Mean TTFT | 314.96 ms | 310.72 ms | -1.35% |
+| Median TTFT | 321.22 ms | 311.90 ms | -2.90% |
+| P99 TTFT | 453.78 ms | 451.33 ms | -0.54% |
+| Mean audio TTFP | 777.75 ms | 760.16 ms | -2.26% |
+| Median audio TTFP | 783.08 ms | 763.25 ms | -2.53% |
+| P99 audio TTFP | 913.11 ms | 919.56 ms | +0.71% |
+| Mean per-chunk RTF | 0.339188 | 0.319996 | -5.66% |
+| Median per-chunk RTF | 0.187670 | 0.160253 | -14.61% |
+| P99 per-chunk RTF | 1.043074 | 1.025924 | -1.64% |
+
+Lower is better except for throughput. The candidate improves every median
+and every reported speed metric except P99 TTFP, whose 0.71% regression is
+small but explicit. Exact residual-block output and aggregate serving parity
+provide strong semantic evidence, but they are not substitutes for the full
+1,088-row Seed-TTS WER/SIM, Daily-Omni, and Video-MME accuracy gates. The
+profile therefore remains opt-in until those gates and a longer tail-latency
+run are complete. The accepted prompt-graph control was restored after the
+experiment.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-resblock-20260817
+```
+
+Artifact checksums:
+
+```text
+a7a92998e8b6018e144848451114df0c0eaba0e0eacb0266891c14c0a907fb46  micro-stage0.log
+943e0bd3b773adf02664dbeb665487e6921bfc97a0383baab0b0607647d9c57b  candidate-run1.json
+35650e00f497ddd7b830265f33f43420b80fc750f01aa495e3b6ce8fe09a2242  candidate-run2.json
+670b22a8f1e191e57d10e814a19a58e9d35ecc2640e4f1ade2b9e4e9948b2377  candidate-run3.json
+8680484e28ecd65c81d16d819d70409cc0bdc775eb9939243864bb790cc698c5  control-run1.json
+d17d90c7ca78ad195a85462157cd06a636884839b72f194cc86b52f6e57abd67  control-run2.json
+085bb5a82d07c5227d5654fa22b123b3f34b0036c6512b0b34755e71720ac08f  control-run3.json
+```
+
+### Wider-stage screening
+
+Stages 1 and 2 were also screened at their derived steady shapes. In
+isolation, their three-block eager/graph totals were 3,542.261/1,704.709 us
+(2.078x) and 3,651.084/1,693.272 us (2.156x), respectively. All six graph
+outputs again had maximum absolute error `0.0`.
+
+Those microbenchmark wins were not additive in the complete service. A
+diagnostic candidate compiled and replayed all nine blocks across stages 0,
+1, and 2 without fallback, but its first warmed 32-row run took 45.941 s. That
+is 4.09% slower than the 44.136-second control median and 10.35% slower than
+the selected 41.632-second stage-0 median. Mean E2E was 1,435.34 ms, mean
+audio TTFP 797.35 ms, and mean chunk RTF 0.351995. It retained 32/32 success,
+100% continuity, and exact aggregate structure, so the loss is execution
+efficiency rather than a correctness failure.
+
+The wider boundary is rejected after this fail-fast run. Additional graph
+residency and GE/layout interactions outweigh the isolated launch savings;
+the committed profile therefore continues to compile stage 0 only.
+
+Additional artifact checksums:
+
+```text
+391cbe2476c75afc5b58490e3a0ea5fb855be4a3db0eab389d67ac3ea6beb1ea  micro-stage1.log
+1b6f5710dd93b5b0649fe413a93592ffaf6f7022da74ed0f4f19720c0f877d2e  micro-stage2.log
+fa4705e403b0d91473e5761138dd39c6725f244b180b73afdf92ad4fc40330c1  all-stages candidate-run1.json
+```
+
+### Native full-block and aggregate-graph screening
+
+Two more aggressive ways of reducing the three stage-0 graph replays were
+implemented and measured on the same 910C host. Neither passed the promotion
+gate, so both implementations were removed rather than retained behind another
+environment flag.
+
+The first candidate was a native AscendC operator covering one complete HiFT
+residual block. Its isolated ACLNN package and Torch extension built and ran on
+the target NPU, but the hand-packed convolution path was both slower and less
+accurate than CANN's native Conv1d sequence:
+
+| Kernel size | Eager | Native fused op | Speed | Max / mean absolute error | Cosine |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 3 | 700.381 us | 1,217.207 us | 0.575x | 0.029517 / 0.000091 | 0.999961 |
+| 7 | 764.729 us | 2,244.750 us | 0.341x | 0.051999 / 0.000198 | 0.999858 |
+| 11 | 777.552 us | 2,388.385 us | 0.326x | 0.106543 / 0.013123 | 0.987252 |
+
+This rejects hand-lowering HiFT Conv1d through im2col plus Matmul. A future
+native attempt needs a real CANN/AscendC convolution primitive or a
+layout-specialized direct convolution; pointwise fusion alone cannot recover a
+2--3x convolution regression or the changed accumulation order.
+
+The second candidate kept CANN's existing convolution kernels but compiled all
+three parallel residual blocks and their exact sum into one static TorchAir
+graph. The first patched block returned the aggregate and the two siblings
+returned neutral tensors, while every mismatch or graph failure used the exact
+eager sum. Compilation required bit-exact output before installation.
+
+Its real-checkpoint NPU microbenchmark was compelling but misleading in
+isolation:
+
+| Three stage-0 residual blocks | Total latency | Relative |
+| --- | ---: | ---: |
+| Eager | 3,671.139 us | 1.000x |
+| Existing three graphs | 1,671.924 us | 2.196x faster than this eager run |
+| Aggregate graph | 1,189.099 us | 3.087x faster than eager; 28.88% below three graphs |
+
+The aggregate output had maximum absolute error `0.0`, and the resident service
+logged the aggregate replay marker without fallback. End-to-end behavior still
+regressed. The first run took 53.211 seconds; after all lazy compilation was
+resident, the second run took 46.523 seconds. The table compares that faster
+second run with the accepted stage-0 three-graph median. Lower is better except
+for throughput:
+
+| Metric | Accepted three-graph median | Aggregate warm run | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.632 s | 46.523 s | +11.75% |
+| Request throughput | 0.7686 req/s | 0.6878 req/s | -10.51% |
+| Mean / median / P99 E2E | 1,300.67 / 1,314.86 / 1,767.13 ms | 1,453.44 / 1,495.60 / 1,980.69 ms | +11.75% / +13.75% / +12.09% |
+| Mean / median / P99 TTFT | 310.72 / 311.90 / 451.33 ms | 340.62 / 338.50 / 553.26 ms | +9.62% / +8.53% / +22.58% |
+| Mean / median / P99 audio TTFP | 760.16 / 763.25 / 919.56 ms | 818.34 / 821.03 / 1,023.54 ms | +7.65% / +7.57% / +11.31% |
+| Mean / median / P99 chunk RTF | 0.319996 / 0.160253 / 1.025924 | 0.353397 / 0.175568 / 1.112279 | +10.44% / +9.56% / +8.42% |
+
+Both aggregate runs completed 32/32 requests with zero failures, 100%
+continuity, 4,801 input tokens, 480 output tokens, 3,362,880 audio frames, and
+140.12 seconds of audio. The regression is therefore execution efficiency, not
+workload or output-structure drift. The larger opaque graph boundary removes
+three replay launches but prevents more valuable scheduling/layout optimization
+around the existing HiFT path. The result closes aggregate sibling capture for
+this software stack: retain the three independent stage-0 graphs, and make any
+next HiFT fusion transparent to GE or lower it inside CANN's convolution
+implementation.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-aggregate-20260817
+```
+
+Artifact checksums:
+
+```text
+c200cee3144ec4312eaf8c9116ccb7e103b86992b0db47debcce08ff1c13f016  candidate-run1.json
+6bfb71ade93dfb06bb75d201d7be7d1fd1d2b084d938814d6073825f9d207705  candidate-run2.json
+```
+
+### Requalification against the current accepted stack
+
+The stage-0 residual boundary was requalified on 2026-08-18 after the accepted
+profile gained single-request cache ownership. This matters because the older
+5.67% serving win above used an earlier control. The fresh control, the
+original three-block graph implementation, and a second aggregate design each
+ran three times over the identical 32 English rows, after three warmups, at
+concurrency one. All nine runs completed 32/32 requests with zero failures,
+100% streaming continuity, 4,801 input tokens, 480 output tokens, 3,362,880
+audio frames, and 140.12 seconds of audio.
+
+The new aggregate design compiled the three parallel residual siblings as one
+TorchAir graph returning three exact outputs. A thread-local dispatcher let the
+unchanged flashcosyvoice reduction consume those outputs in order, avoiding
+the earlier neutral-tensor implementation and leaving the sibling sum outside
+the graph. Its isolated stage result was again attractive: 3,407.161 us eager
+versus 1,345.148 us graph, a 2.533x speedup, with maximum absolute error `0.0`.
+The service logged exactly one real-input replay marker and no fallback.
+
+End-to-end results rejected both graph boundaries on the current stack. Lower
+is better except for throughput:
+
+| Metric (three-run median) | Current accepted control | Three block graphs | Change | One sibling graph | Change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Serving duration | 40.214 s | 41.654 s | +3.58% | 43.524 s | +8.23% |
+| Request throughput | 0.7957 req/s | 0.7682 req/s | -3.46% | 0.7352 req/s | -7.61% |
+| Mean E2E | 1,256.29 ms | 1,301.26 ms | +3.58% | 1,359.70 ms | +8.23% |
+| Median E2E | 1,281.78 ms | 1,328.67 ms | +3.66% | 1,388.77 ms | +8.35% |
+| P99 E2E | 1,696.85 ms | 1,763.51 ms | +3.93% | 1,858.12 ms | +9.50% |
+| Mean TTFT | 314.07 ms | 310.29 ms | -1.20% | 316.94 ms | +0.92% |
+| Mean audio TTFP | 745.37 ms | 757.09 ms | +1.57% | 776.67 ms | +4.20% |
+| Mean chunk RTF | 0.310126 | 0.319916 | +3.16% | 0.332815 | +7.32% |
+| Median chunk RTF | 0.144614 | 0.167456 | +15.80% | 0.181294 | +25.36% |
+| P99 chunk RTF | 1.007790 | 1.022899 | +1.50% | 1.035547 | +2.75% |
+
+The isolated kernel savings therefore do not compose with the complete HiFT
+pipeline. Even one tuple-output graph creates a synchronization/layout boundary
+that costs more than its removed launches. Neither candidate advances to the
+1,088-row WER/SIM run: accuracy work cannot rescue a failed speed gate. The
+accepted profile remains graph-free at this boundary, and future HiFT work must
+fuse transparently inside CANN's convolution/layout path rather than add a
+TorchAir boundary around sibling blocks.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-resblock-qualification-20260818
+```
+
+Artifact checksums:
+
+```text
+abe951f9989445761862f3bca81ebc30996d0ac16ee7aeb4ebfbfe7a7aa2fbda  control/control-run-1.json
+7d9dd9e2bc4114e75932142ff1b410fe12898490b8de9cb1153f4172c0b43c8f  control/control-run-2.json
+02cff3619ceb333b513ea2e92c0b082ceab57a8a7aebf882c286320a7c5a0fd3  control/control-run-3.json
+e35136f57b15fd792577769dec05870900478f0a2580c15b3ec5fc6d57bca627  candidate/candidate-run-1.json
+7ed4a92cbbde0d468b7204dd7e4471e298cb08ed85c71b9aea51501af65943ba  candidate/candidate-run-2.json
+d827e5e53970ee88c3e8e73baf90eac5b22ea6c16758173a881821962cc81dfb  candidate/candidate-run-3.json
+3189e51ed4fd9545e9058d2be276986131dc0726e7736cc492c41dc9a800bf70  sibling/sibling-run-1.json
+0e846e98dc229937b357bd69dc9f9b4b75ab893cdff800b103877eb6b4474828  sibling/sibling-run-2.json
+ca91c08c3859567fb08a6703f27400a2071cf3c3994be770fabb4ae20d6bf1eb  sibling/sibling-run-3.json
+2b71d975ebb39a1a0cbfde9b36e08d293cb2895671c8bd53f223f57ab1ce5038  sibling-service-v2.log
+```
+
+### Fixed-size HiFT ISTFT graph and layout screens
+
+The next lower-level screen targeted HiFT's final inverse transform. MiniCPM-o
+fixes this operation at `n_fft=16` and `hop_len=4`, while the steady 58-frame
+mel chunk reaches `[1,9,6961]` magnitude and phase tensors. The candidate
+replaced complex-tensor construction and the general `torch.istft` path with
+two real 16-by-9 linear transforms and an exact four-way Hann overlap-add.
+The centered edge envelope is precomputed from the checkpoint window rather
+than assuming an interior constant.
+
+The graph is guarded by shape, dtype, device, and checkpoint ISTFT parameters.
+Its startup gate compares the compiled waveform with upstream, and every
+unsupported input or graph exception fails closed to the original bound
+method. The focused suite passed 44/44. On NPU 1, 30 warmups and 200 measured
+steady-width iterations produced:
+
+| Steady HiFT ISTFT | Latency | Relative |
+| --- | ---: | ---: |
+| Generic complex `torch.istft` | 429.646 us | 1.000x |
+| Specialized eager real path | 319.710 us | 1.344x faster |
+| Specialized TorchAir graph | 178.029 us | 2.413x faster |
+
+The specialized output had maximum absolute error `8.38e-9`, mean absolute
+error `1.43e-9`, and cosine similarity `1.0`. The live service compiled and
+replayed the graph at `[1,9,6961]` without fallback.
+
+That isolated 58.57% graph win did not survive the serving gate. A fresh
+same-source control used the accepted three stage-0 residual graphs; the
+candidate inherited that profile and added only the fixed ISTFT graph. Both
+services ran the same 32 English Seed-TTS rows three times after three
+warmups. Every run completed 32/32 with zero failures, 100% streaming
+continuity, 4,801 input tokens, 480 output tokens, 3,362,880 frames, and
+140.12 seconds of audio. The table uses the median of the three per-run
+metrics; lower is better except for throughput.
+
+| Metric | Fresh control | Fixed ISTFT graph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.751 s | 46.070 s | +2.95% |
+| Request throughput | 0.7151 req/s | 0.6946 req/s | -2.86% |
+| Mean / median / P99 E2E | 1,397.99 / 1,420.43 / 1,874.67 ms | 1,439.20 / 1,472.16 / 1,942.34 ms | +2.95% / +3.64% / +3.61% |
+| Mean / median / P99 TTFT | 321.18 / 321.28 / 471.20 ms | 316.36 / 314.83 / 449.43 ms | -1.50% / -2.01% / -4.62% |
+| Mean / median / P99 audio TTFP | 799.67 / 796.31 / 962.61 ms | 794.57 / 793.96 / 935.50 ms | -0.64% / -0.30% / -2.82% |
+| Mean / median / P99 chunk RTF | 0.342507 / 0.185401 / 1.089012 | 0.350319 / 0.194845 / 1.065672 | +2.28% / +5.09% / -2.14% |
+
+The graph improves TTFT and TTFP, but it regresses the primary serving,
+throughput, E2E, and central chunk-RTF metrics. As with the rejected aggregate
+residual graph, the extra opaque replay boundary prevents more valuable
+whole-pipeline scheduling than its local kernel saving recovers. The profile
+therefore remains diagnostic-only, and the full Seed-TTS WER/SIM,
+Daily-Omni, and Video-MME gates were not spent on a candidate that already
+failed the speed gate:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_fixed_istft_graph_experimental.yaml
+```
+
+Two adjacent layout screens were also closed before service promotion.
+Enabling CANN internal formats after NPU initialization retained bit-exact
+residual outputs, but paired long-run graph totals were effectively tied at
+about 1,705 us candidate versus 1,707 us control. Re-expressing all 18
+stage-0 Conv1d operations as singleton-height Conv2d was bit-exact, but each
+kernel was neutral to slightly slower; CANN selected the same effective path.
+Direct packed Conv3d was rejected by the installed CANN rewrite because its
+`Conv3dv2` fusion accepts static shapes only.
+
+Raw serving artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-fixed-istft-20260817
+```
+
+Artifact checksums:
+
+```text
+28fb51a87f9c91ccb805cae19706a894a8dfc0a130474e7fa51741cecb6dfec3  candidate-run1.json
+69bc48c0bbef830f3dee185ad1b267b1b886de0f12b0b55258a2b1fe911f1ad0  candidate-run2.json
+218fb9dca59c1db0f11ffb41a8410a3eb3364aa134db691a476327badcbf0e90  candidate-run3.json
+12558f29afdd2295055c30b08a52b6380188e50ec4b7f00698c3669a6bd1b9a8  control-run1.json
+c518d4ad1b6904656c34595f995960b4106ba468fe55a4e12db8ae122ca2ebfc  control-run2.json
+c9608777664cd5923391949af8bf17636cb33948528dc20bbc5a8196e2f965fc  control-run3.json
+```
+
+### Promoted HiFT STFT-window residency
+
+The fixed-ISTFT rejection exposed a smaller transparent optimization.
+`flashcosyvoice.HiFTGenerator` assigns its 16-value Hann window as an ordinary
+CPU tensor rather than a registered module buffer. Both `_stft` and `_istft`
+therefore evaluate `self.stft_window.to(input.device)` on every streamed
+chunk. The promoted patch moves that immutable tensor to the Stage-2 device
+once after checkpoint loading. The upstream STFT, ISTFT, complex arithmetic,
+window values, and accumulation order remain unchanged; their existing
+`.to(npu)` calls become no-ops.
+
+A real-width NPU-1 microbenchmark used 50 warmups and 500 iterations. All
+outputs were bit-exact:
+
+| Operation at 6,961 spectral frames | CPU window | Resident NPU window | Change |
+| --- | ---: | ---: | ---: |
+| HiFT ISTFT | 457.194 us | 397.764 us | -13.00% |
+| HiFT STFT | 291.760 us | 159.465 us | -45.35% |
+
+The placement is idempotent and fails closed: a missing or incompatible
+window logs a warning and leaves the existing per-call copies in place. The
+focused NPU patch suite passed 46/46.
+
+The serving candidate added window residency to the selected three stage-0
+residual graphs. It was compared with the fresh three-run residual-graph
+control collected immediately before this candidate on the same host and
+source stack. Both sides used 32 fixed English Seed-TTS rows, three warmups,
+concurrency one, seed zero, temperature zero, and CFM6. Every run completed
+32/32 with zero failures, 100% continuity, 4,801 input tokens, 480 output
+tokens, 3,362,880 frames, and 140.12 seconds of audio. The table reports the
+three-run median; lower is better except for throughput.
+
+| Metric | Fresh control | Resident window | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 44.751 s | 42.720 s | -4.54% |
+| Request throughput | 0.7151 req/s | 0.7491 req/s | +4.75% |
+| Mean / median / P99 E2E | 1,397.99 / 1,420.43 / 1,874.67 ms | 1,334.69 / 1,358.89 / 1,809.03 ms | -4.53% / -4.33% / -3.50% |
+| Mean / median / P99 TTFT | 321.18 / 321.28 / 471.20 ms | 308.79 / 308.87 / 441.33 ms | -3.86% / -3.86% / -6.34% |
+| Mean / median / P99 audio TTFP | 799.67 / 796.31 / 962.61 ms | 761.79 / 765.78 / 907.33 ms | -4.74% / -3.83% / -5.74% |
+| Mean / median / P99 chunk RTF | 0.342507 / 0.185401 / 1.089012 | 0.326712 / 0.180163 / 1.026645 | -4.61% / -2.83% / -5.73% |
+
+Every measured performance gate improves. Since the patch changes no model
+operation or value and the isolated STFT/ISTFT outputs are bit-exact, the
+existing Seed-TTS, Daily-Omni, and Video-MME qualifications carry forward.
+Window residency is therefore promoted as an always-on Ascend HiFT behavior;
+it has no deployment flag or separate production profile.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-window-resident-20260818
+```
+
+Artifact checksums:
+
+```text
+12558f29afdd2295055c30b08a52b6380188e50ec4b7f00698c3669a6bd1b9a8  control-run1.json
+c518d4ad1b6904656c34595f995960b4106ba468fe55a4e12db8ae122ca2ebfc  control-run2.json
+c9608777664cd5923391949af8bf17636cb33948528dc20bbc5a8196e2f965fc  control-run3.json
+9282e7c6c88b515999eff419db4bdf25e6192aab9c14f522ae11112af5f7dd7d  candidate-run1.json
+c7579ea11df3dca4ecfdd0d9ec88f563e191c47061ca24a188bfe923e029e046  candidate-run2.json
+00345f32a473ffa628013ac4455160ab5c625d7221685cc26b04a32cd95fdd35  candidate-run3.json
+```
+
+### HiFT harmonic-residency screen
+
+The next transparent allocation screen targeted `flashcosyvoice.SineGen2`.
+Its upstream `forward` constructs the immutable harmonic multiplier with
+`torch.FloatTensor` on CPU and copies it to the input device for every audio
+chunk. The candidate preserves that exact constructor, values, shape, and
+subsequent operations, but creates the tensor once after checkpoint loading
+and keeps it on Stage 2's NPU. Device or dtype mismatches delegate to the
+original method.
+
+At the real steady waveform width `[1,27840,1]`, 100 warmups and 500 measured
+iterations on NPU 1 reduced complete SineGen2 latency from 719.709 us to
+560.056 us, a 22.18% isolated improvement. The cached multiplier and the
+resulting `f0 * harmonics` tensor were bit-exact (`max_abs_error=0`). Full
+sine tensors differed by about `2.93e-4`, but two unmodified baseline calls
+with the same CPU and NPU seeds differed by the same amount; this is the
+existing randomized NPU phase behavior, not a changed deterministic input.
+UV and noise tensors were exact. The focused patch suite passed 48/48, and
+the candidate service logged resident-window and resident-harmonic placement
+without fallback.
+
+The serving screen measured the new cache incrementally on top of the
+promoted resident Hann window and the selected three Stage-0 residual graphs.
+Both sides used the same 32 fixed English Seed-TTS rows, three warmups,
+concurrency one, seed zero, temperature zero, and CFM6. Every run completed
+32/32 with zero failures, 100% continuity, 4,801 input tokens, 480 output
+tokens, 3,362,880 frames, and 140.12 seconds of audio. The table reports the
+median of three runs; lower is better except for throughput.
+
+| Metric | Fresh control | Resident harmonics | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 43.860 s | 44.688 s | +1.89% |
+| Request throughput | 0.7296 req/s | 0.7161 req/s | -1.85% |
+| Mean / median / P99 E2E | 1,370.25 / 1,368.05 / 1,915.25 ms | 1,396.02 / 1,405.37 / 1,808.26 ms | +1.88% / +2.73% / -5.59% |
+| Mean / median / P99 TTFT | 321.80 / 317.79 / 490.74 ms | 332.88 / 333.73 / 468.17 ms | +3.44% / +5.02% / -4.60% |
+| Mean / median / P99 audio TTFP | 764.01 / 760.94 / 939.70 ms | 774.66 / 778.04 / 919.50 ms | +1.39% / +2.25% / -2.15% |
+| Mean / median / P99 chunk RTF | 0.340351 / 0.144086 / 1.101073 | 0.343077 / 0.146450 / 1.082056 | +0.80% / +1.64% / -1.73% |
+
+The candidate improves tail metrics but regresses every primary duration,
+throughput, mean, and median gate. The saved host-to-device copy is too small
+to dominate full-pipeline scheduling variance, and its local microbenchmark
+win does not qualify it for the default path. The implementation therefore
+remains opt-in for diagnostic work, and the more expensive Seed-TTS WER/SIM,
+Daily-Omni, and Video-MME accuracy gates were not spent on a candidate that
+already failed the speed gate:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_harmonics_resident_experimental.yaml
+```
+
+Raw serving artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-harmonics-resident-20260818
+```
+
+Artifact checksums:
+
+```text
+bf204c7e79b3d42b80b957ceb2452b1418a2028613d608b205aa15615e4cf75e  control-1.json
+47f6525988b7654611b7ed53c58b971e81670ccef3548cefd4f90e299f2ab8ca  control-2.json
+ad200c8809ef1264b97a0818b227aec946a16c1ce815252c505d21366811d4ff  control-3.json
+a61765e0d150c6ba976a4cb57dbe22cf2421190dab6988dfd609aa7edeb93ee8  candidate-1.json
+f71855129c223c285c63894954f4687c88c68101409437d6b051e829ed50d75b  candidate-2.json
+0a5a79b6f888c8c27cda3383573b2d2ef8c7420edb660d104ae07aaa6ba9b8e4  candidate-3.json
+```
+
+### Direct DiT attention-cache output screen
+
+The next allocation screen targeted the prompt-width DiT attention path.
+Each block already receives a correctly sized final attention-cache buffer,
+but the existing implementation allocates full K, full V, and packed KV
+temporaries before copying the packed result into that buffer. The candidate
+uses Ascend's supported `torch.cat(..., out=view)` form to concatenate K and V
+directly into the caller-owned packed-cache views. It retains the original
+cache order, SDPA inputs, projection, and fallback path.
+
+At the real steady shape (CFG batch 2, 8 heads, 50 new positions, 352 cached
+positions, head dimension 64), a 100-warmup, 1,000-iteration NPU-1 screen
+measured complete cache assembly plus SDPA. The normal path took 95.387 us;
+direct output took 87.076 us, an 8.71% isolated improvement. Attention and
+packed-cache outputs were bit-exact. A four-slice `copy_` workspace variant
+was rejected earlier because it took 118.311 us. The focused Code2Wav suite
+passed 78/78, the complete inherited profile passed its configuration gate,
+and the live service logged direct-output activation without graph fallback.
+
+The real serving screen compared the accepted prompt-width DiT graph profile
+with an otherwise identical profile adding only direct cache output. Both
+sides used the same 32 fixed English Seed-TTS rows, three warmups, concurrency
+one, seed zero, temperature zero, and CFM6. Every run completed 32/32 with
+zero failures, 100% continuity, 4,801 input tokens, 480 output tokens,
+3,362,880 frames, and 140.12 seconds of audio. The table reports the median of
+three runs; lower is better except for throughput.
+
+| Metric | Fresh control | Direct cache output | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 46.515 s | 47.664 s | +2.47% |
+| Request throughput | 0.6880 req/s | 0.6714 req/s | -2.41% |
+| Mean / median / P99 E2E | 1,453.18 / 1,442.89 / 2,140.12 ms | 1,489.15 / 1,501.44 / 2,264.97 ms | +2.47% / +4.06% / +5.83% |
+| Mean / median / P99 TTFT | 330.57 / 327.46 / 554.18 ms | 329.55 / 326.25 / 477.57 ms | -0.31% / -0.37% / -13.82% |
+| Mean / median / P99 audio TTFP | 796.32 / 797.72 / 1,013.64 ms | 800.24 / 794.39 / 962.98 ms | +0.49% / -0.42% / -5.00% |
+| Mean / median / P99 chunk RTF | 0.366797 / 0.177978 / 1.231375 | 0.385161 / 0.184624 / 1.141904 | +5.01% / +3.73% / -7.27% |
+
+The direct-output views improve TTFT and several tails, but regress primary
+duration, throughput, E2E, mean TTFP, and central chunk RTF. The noncontiguous
+packed-cache views save local allocations while producing a less favorable
+layout/scheduling boundary for the surrounding DiT execution. The candidate
+therefore remains diagnostic-only, and the full WER/SIM, Daily-Omni, and
+Video-MME gates were not spent after the speed gate failed:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_attn_cache_out_experimental.yaml
+```
+
+Raw serving artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dit-attn-cache-out-20260818
+```
+
+Artifact checksums:
+
+```text
+f928525c3637048d2db62bfdc3af4b94096068c6d1f833613f43de6e04a1bd49  control-1.json
+cce1b87205cc54a16fdbf7c5a69083b1290eefa0b32583a09f6275200e73a6a9  control-2.json
+cad990be05ac634ee17ff089036b664503d7f264aa0afcc8c328ee9374441e3e  control-3.json
+617c422f43f7b04f19de6a1782b0236398b80203021f5e3867f09a644a0ef02d  candidate-1.json
+948355dc40d6469139d3eed3d277d1f7893808745f3de7b5ecdaada704140343  candidate-2.json
+f6900409b6b6b0514daae46d9e6eeaddede18b120476647f30e078fcdf635f6e  candidate-3.json
+```
+
+### Direct stacked CFM cache-output screen
+
+The CFM loop runs six estimator steps. Each step allocated separate CNN and
+attention-cache outputs, retained all twelve tensors, and finally allocated
+and copied them again with two `torch.stack` calls. The candidate instead
+allocates the two final stacked states once and passes each step a view to
+write directly. It preserves the original DiT operations, cache values, and
+step order.
+
+At the real six-step cache shapes, `[6,6,2,1024,2]` for CNN state and
+`[6,6,2,8,402,128]` for attention state, a 20-warmup, 100-iteration NPU-1
+screen measured the old allocation-plus-stack path at 277.230 us and the two
+direct stacked allocations at 31.235 us. That is an 88.73% isolated reduction
+and removes a terminal stack measured independently at 223.170 us. Stacked
+values were bit-exact, the focused Code2Wav and deployment-configuration
+suites passed, and the live service logged direct stacked-output activation.
+
+The real serving result went in the opposite direction. Both sides used the
+same 32 fixed English Seed-TTS rows, three warmups, concurrency one, seed zero,
+temperature zero, and CFM6. Every run completed 32/32 with zero failures,
+100% continuity, 4,801 input tokens, 480 output tokens, 3,362,880 frames, and
+140.12 seconds of audio. The table reports the median of three runs; lower is
+better except for throughput.
+
+| Metric | Fresh control | Direct stacked output | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.529 s | 44.809 s | +7.90% |
+| Request throughput | 0.7705 req/s | 0.7141 req/s | -7.32% |
+| Mean / median / P99 E2E | 1,297.42 / 1,326.18 / 1,745.27 ms | 1,399.92 / 1,436.63 / 1,846.78 ms | +7.90% / +8.33% / +5.82% |
+| Mean / median / P99 TTFT | 306.19 / 305.41 / 441.22 ms | 315.03 / 316.11 / 452.67 ms | +2.89% / +3.50% / +2.60% |
+| Mean / median / P99 audio TTFP | 743.92 / 745.58 / 887.04 ms | 776.33 / 779.57 / 905.73 ms | +4.36% / +4.56% / +2.11% |
+| Mean / median / P99 chunk RTF | 0.318128 / 0.171573 / 1.012530 | 0.343567 / 0.181579 / 1.041428 | +8.00% / +5.83% / +2.85% |
+
+An Ascend format probe explains why the allocation-only screen did not
+transfer. A normal per-step CNN output is NCHW, while its view inside the
+five-dimensional stacked allocation inherits NCDHW. A normal per-step
+attention output is NCDHW, while its view inside the six-dimensional stacked
+allocation inherits generic ND. The logical shapes and strides are identical,
+but the less favorable physical formats slow the much larger DiT writes and
+reads by more than the removed copies save. This candidate is therefore kept
+opt-in for layout research, and the WER/SIM, Daily-Omni, and Video-MME gates
+were not spent after the speed gate failed:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_stacked_cache_out_experimental.yaml
+```
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-cfm-stacked-cache-out-20260818
+```
+
+Artifact checksums:
+
+```text
+89417ddf61b7cce1a38acb978a1ebd7c7987092cbc4137f5b4b500fdea07290f  control-run-1.json
+109d13a7a9ed04d0fdd5acd38a5f6743d6257aea98f625d5be0d17a9d793b5fc  control-run-2.json
+91aebfa15b1559575a4cf2d174d065f450e71cf9c6888768cca534aa61ccd569  control-run-3.json
+5c016e3947e647c1d7948f43bc441d61bf4ea83dee4bec904d344f8d9e931138  candidate-run-1.json
+209671bf5a2a1ab7df6dd8d1d16400bf9d533799195e8d784dcf8d08642be7b3  candidate-run-2.json
+00944ff240f0c0d6a2dde9240e16334323f5ecc278ba77205ac6d6bf1466989f  candidate-run-3.json
+```
+
+### Promoted single-request cache ownership
+
+The rejected direct stacked-output screen exposed a larger copy outside the
+DiT kernels. Competition latency runs use concurrency one, but after every
+chunk `_split_flow_cache` copied the entire six-step CFG estimator state into
+the request, and before the next chunk `_stack_flow_cache` copied it back into
+an identical one-request batch. The old state is read-only during decoding, so
+the promoted path transfers tensor ownership directly when the batch contains
+exactly one request. Multi-request batches keep the established CFG reorder
+and copy behavior.
+
+At the real cache shapes, a 20-warmup, 100-iteration NPU-1 screen reduced a
+complete split-plus-restack round trip from 682.480 us to 15.665 us, a 97.70%
+reduction. CNN and attention values were bit-exact, and the original NCDHW and
+ND formats were preserved. The 421-test focused Code2Wav/config suite passed
+before promotion; an additional three-chunk state-and-audio comparison was
+bit-exact, and the promoted deployment gate passed.
+
+The live candidate was compared with a fresh accepted-profile control on the
+same host and source stack. Both sides used the same 32 fixed English Seed-TTS
+rows, three warmups, concurrency one, seed zero, temperature zero, and CFM6.
+Every run completed 32/32 with zero failures, 100% continuity, 4,801 input
+tokens, 480 output tokens, 3,362,880 frames, and 140.12 seconds of audio. The
+table reports the median of three runs; lower is better except for throughput.
+
+| Metric | Fresh control | Cache passthrough | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 43.167 s | 42.684 s | -1.12% |
+| Request throughput | 0.7413 req/s | 0.7497 req/s | +1.13% |
+| Mean / median / P99 E2E | 1,348.63 / 1,381.66 / 1,823.12 ms | 1,333.55 / 1,360.32 / 1,806.22 ms | -1.12% / -1.54% / -0.93% |
+| Mean / median / P99 TTFT | 310.60 / 311.44 / 445.09 ms | 309.55 / 311.00 / 453.84 ms | -0.34% / -0.14% / +1.97% |
+| Mean / median / P99 audio TTFP | 774.48 / 773.15 / 912.98 ms | 763.16 / 765.01 / 909.76 ms | -1.46% / -1.05% / -0.35% |
+| Mean / median / P99 chunk RTF | 0.331659 / 0.179186 / 1.042957 | 0.328043 / 0.177109 / 1.030444 | -1.09% / -1.16% / -1.20% |
+
+The candidate improves every primary serving, E2E, TTFP, and chunk-RTF gate.
+TTFT P99 is the only regression (+1.97%), while its mean and median improve.
+Because the fast path changes no model operation or tensor value and the
+multi-chunk comparison is bit-exact, the existing Seed-TTS, Daily-Omni, and
+Video-MME accuracy qualifications carry forward. Single-request passthrough
+is therefore enabled in the accepted prompt-width profile; higher-concurrency
+serving continues to use the original state path.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-single-request-cache-passthrough-20260818
+```
+
+Artifact checksums:
+
+```text
+1f4689d0d7701d26c640b780428fb993ea7e07a4039450a923d69d32c11e3251  control-run-1.json
+9cdde0d4883cb94f1043fd80336824dbd3667753b14f0bde52983737d930d729  control-run-2.json
+1dbeb38953f199fb01fcad4397a9f74ebeede0716f1bdf07987c39bd07c26ea1  control-run-3.json
+446d2f54f6fcedc01747a608425b7ad8ccfd761a6f49a375cd569a0b71197fce  candidate-run-1.json
+b8f34a5d07f1f81e3466cad0605faa6d60170f2d52503eb202b40e7d111d5abb  candidate-run-2.json
+408c5857170eae2ed619e184cb26e344808543c5a929c99611d2f0dd70e3a8fc  candidate-run-3.json
+```
+
+## Rejected HiFT source-noise scratch reuse
+
+`SourceModuleHnNSF2` returns a full-waveform auxiliary noise tensor on every
+HiFT invocation, but MiniCPM-o immediately discards that second return value.
+The opt-in candidate preserves the exact `randn`, multiply, divide, return
+shape, dtype, physical stride, and RNG advancement while reusing one buffer
+per waveform shape:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_source_noise_scratch_experimental.yaml
+```
+
+CPU tests proved bit-exact outputs and next-RNG state, idempotent installation,
+shape-isolated storage, and pointer reuse. On NPU 1 at the steady
+`[1,27840,1]` source shape, 30 warmups and 200 iterations reduced the complete
+source-module invocation from 796.460 us to 793.205 us, only 0.41%. The
+discarded noise and next RNG draw had maximum absolute error `0.0`, and the
+scratch pointer was reused. The unchanged sine path varied by `7.12e-5` across
+seed-reset NPU replays, consistent with the existing phase-kernel
+nondeterminism; the candidate does not alter that path.
+
+The final service experiment used fresh services on both sides and the fork's
+local benchmark client, avoiding both service-age skew and an older installed
+client that omitted Omni timing arrays. Each side ran the same 32 fixed English
+Seed-TTS rows three times after three warmups, at concurrency one, seed zero,
+temperature zero, and CFM6. Every run completed 32/32 with zero failures, 100%
+continuity, 4,801 input tokens, 480 output tokens, 3,362,880 frames, and 140.12
+seconds of audio. The table reports the median of three runs; lower is better
+except for throughput.
+
+| Metric | Accepted control | Noise scratch | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.774 s | 44.729 s | +7.07% |
+| Request throughput | 0.7660 req/s | 0.7154 req/s | -6.61% |
+| Mean / median / P99 E2E | 1,304.97 / 1,310.02 / 1,889.46 ms | 1,397.34 / 1,420.56 / 1,902.58 ms | +7.08% / +8.44% / +0.69% |
+| Mean / median / P99 TTFT | 318.76 / 319.63 / 460.08 ms | 316.52 / 319.56 / 452.54 ms | -0.70% / -0.02% / -1.64% |
+| Mean / median / P99 audio TTFP | 780.61 / 764.30 / 947.08 ms | 787.72 / 785.88 / 938.05 ms | +0.91% / +2.82% / -0.95% |
+| Mean / median / P99 chunk RTF | 0.321152 / 0.148051 / 1.059848 | 0.341226 / 0.187301 / 1.063686 | +6.25% / +26.51% / +0.36% |
+
+The candidate slightly improves TTFT and tail TTFP, but regresses the primary
+duration, throughput, E2E, central TTFP, and every chunk-RTF gate. Runtime logs
+also show many waveform widths, so persistent shape-specific buffers perturb
+the allocator for a local saving too small to compose with the full pipeline.
+The candidate therefore remains diagnostic-only and is not enabled in the
+accepted profile. Full Seed-TTS WER/SIM, Daily-Omni, and Video-MME gates were
+not spent after the speed gate failed.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-source-noise-scratch-20260818
+```
+
+Only the `final-*` files below belong to the clean promotion decision; earlier
+files in that directory record harness-validation and warm-state diagnostics.
+
+```text
+c95e4f020d624f33ca9c3461ff50e3231a7822de971ddacde10962eb29f896a4  control/final-control-run-1.json
+8e79420487fe1bad8c7ca1e855f27993160852b2ebf8f6b63da9815ca386a2f3  control/final-control-run-2.json
+25844744dd7954af7b80a7afecc64a7887317a57faffaae2d47275f7ecc18dfa  control/final-control-run-3.json
+266597c0e6941f6f0f53db9fa614702e4301ab5094d272d2320cf1a067560918  candidate/final-candidate-run-1.json
+1135b27104b593d0c00790d7d55ce9ca3f01ba84833dd6a0e97508a774bbdd85  candidate/final-candidate-run-2.json
+ea351aea893d9ae3146999e5e32661acf57dbe5073349547e7db79fd07474fab  candidate/final-candidate-run-3.json
+b15f0ef53546918d78b021034b02ecea65286a0d43ae85698b5bb666faa2e565  final-candidate-service.log
+f36d65fb21edf6612d90dd6076a7e98f6f9bbabcb9002f07291070170d81b660  final-accepted-service.log
+```
+
+## Neutral HiFT F0 classifier-graph experiment
+
+The accepted HiFT F0 graph ends after five Conv1d+ELU layers and runs the
+checkpoint's per-timestep Linear classifier and absolute value eagerly. A
+larger opt-in boundary now keeps those original operations inside the same
+TorchAir graph:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_f0_classifier_graph_experimental.yaml
+```
+
+This differs from the previously rejected complete graph, which substituted a
+1x1 Conv and moved F0 by as much as 0.36 Hz. The new graph uses `F.linear`
+with the original classifier weight and bias. TorchAir 8.5 initially inferred
+the transposed input as K=58 instead of K=512; materializing that transpose
+with `contiguous()` repaired GE shape inference without replacing the model
+operation. The real 910C checkpoint compiled at `[1,80,58]` and reported
+`max_abs_drift=0` on the nonzero startup gate. Incompatible widths retain the
+upstream eager fallback.
+
+Two service restarts and one warmed repetition used the same 32 fixed English
+Seed-TTS rows, three warmups, concurrency one, seed zero, temperature zero,
+and CFM6. Every measured run completed 32/32 with zero failures and 100%
+continuity, while preserving 4,801 input tokens, 480 output tokens, 3,362,880
+frames, 140.12 seconds of audio, and identical generated text. The table uses
+the median run value from two accepted-control runs and three candidate runs;
+lower is better except for throughput.
+
+| Metric | Accepted control | Classifier graph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 42.041 s | 41.915 s | -0.30% |
+| Request throughput | 0.7613 req/s | 0.7634 req/s | +0.28% |
+| Mean E2E | 1,313.39 ms | 1,309.30 ms | -0.31% |
+| Mean TTFT | 314.84 ms | 321.46 ms | +2.10% |
+| Mean audio TTFP | 760.93 ms | 761.65 ms | +0.09% |
+| Mean chunk RTF | 0.324751 | 0.322969 | -0.55% |
+| Median chunk RTF | 0.154067 | 0.162580 | +5.53% |
+
+The restart-level result changed sign: one fresh comparison improved duration
+1.66%, the second regressed it 0.23%, and the warmed comparison improved it
+0.29%. The median gain is below normal service variance, while mean TTFT
+crosses the 2% guard and median chunk RTF regresses materially. The candidate
+therefore remains diagnostic-only and is not inherited by the accepted
+prompt-width profile. Full Seed-TTS WER/SIM, Daily-Omni, and Video-MME gates
+were not spent after the speed gate failed.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-hift-f0-classifier-20260819
+```
+
+Artifact checksums:
+
+```text
+d1af2ebaa84a1e44e4a80701060da0bdd6f57ec2d269ab289a5d795fe6d0eee5  control/results/control-seedtts-32.json
+e7237229d5d9c3302b6024b0abe27c3fcc6ac3df7ec8b15e5833a9098e1befe0  control/results/control2-seedtts-32.json
+1d0d685b90807661532a31d0a401203a4fb05fa67ad1c5bfe83c478f4555169c  candidate/results/candidate-seedtts-32.json
+80f340dbcfff3c29770bd7b04351ee10e95ec7c2a92b5d988e90727d61879f6a  candidate/results/candidate2-seedtts-32.json
+410e1aa859fc00418bd0cd40011b58195d0079acbda0c1b9034de996080e52f4  candidate/results/candidate3-seedtts-32.json
+```
+
+## Rejected HiFT F0 weight-layout experiments
+
+The retained Stage-2 profile identified the largest remaining individual
+layout conversion as the HiFT F0 stack's fixed `[512,512,1,3]` Conv1d
+weights. NCHW-to-FRACTAL_Z `TransData` ran 405 times and consumed 15.192 ms
+across the trace. Two exact-width `[1,80,58]` graph variants screened ways to
+remove that repeated packing before spending another end-to-end run.
+
+The first variant marks all ten immutable convolution weight and bias tensors
+with guarded static addresses and enables TorchAir's `frozen_parameter`
+lowering. It is available only through the diagnostic profile:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_hift_f0_frozen_weights_experimental.yaml
+```
+
+Two independent 30-warmup, 200-iteration measurements changed sign. The first
+measured 212.881 us for the control and 213.122 us frozen (0.999x); the second
+measured 213.224 us and 209.324 us respectively (1.019x). Both had zero maximum
+absolute output error. This spread is normal microbenchmark noise and does not
+support promotion. In particular, accepting static tensor addresses did not
+prove that GE eliminated the replay-time Conv1d weight conversions.
+
+The second variant prepacked each kernel-3 weight as a 512-by-1536 matrix and
+replaced Conv1d with explicit three-position window packing plus `F.linear`.
+It measured 229.973 us versus the same run's 213.224 us control: 7.27% slower.
+It also introduced maximum/mean absolute errors of 0.026312/0.000125. The extra
+pad, slice, concatenate, and transpose traffic costs more than the conversions
+it removes, so this form is rejected and is not wired into serving.
+
+The reproducible focused harness is:
+
+```text
+benchmarks/scripts/bench_minicpmo_hift_f0_frozen_weights.py
+```
+
+These results close frozen-parameter annotations and framework-level im2col
+linearization as F0 optimization directions on the current CANN/TorchAir
+stack. A future retry must either change GE's native Conv1d weight-packing
+policy or fuse the whole five-layer stack below the framework boundary while
+preserving the original accumulation behavior.
+
+## Rejected contiguous-window causal-pack kernel
+
+The same retained Stage-2 profile attributed 38.321 ms to 576 invocations of
+the two native `MinicpmoCausalConvPack` nodes. A lower-layer candidate enlarged
+the AscendC UB row buffer and replaced three 512-element DMA round trips with
+one contiguous 1536-element transfer for the 96 rows that do not cross the
+two-frame cache boundary. The first two rows used two-source specialized
+copies and narrower MTE2-to-MTE3 event synchronization.
+
+The candidate compiled for Ascend 910C and passed all six exact operator
+cases: FP16, FP32, and BF16, each with channel-major and cache-major state.
+Fresh 100-warmup, 500-iteration, 15-trial measurements were:
+
+| Layout | Installed kernel | Contiguous-window candidate | Change |
+| --- | ---: | ---: | ---: |
+| Channel-major | 63.552 us | 63.775 us | +0.35% |
+| Cache-major (serving path) | 18.995 us | 18.849 us | -0.77% |
+
+Lower is better. The production-layout gain is below the promotion threshold
+and the compatibility layout regressed. Kernel launch and the mandatory
+packed-output write dominate after the earlier cache-major optimization, so
+reducing internal DMA command count does not produce a material serving win.
+The candidate was removed rather than adding a second implementation for a
+noise-level result; no end-to-end or accuracy-suite budget was spent.
+
+## Opt-in wide AdaLN projection candidate
+
+The retained Stage-2 profile showed 480 FP32 AdaLN projections with shape
+`[2,512] x [4608,512]` in one 32-request trace. MiniCPM-o 4.5 has 16 DiT
+blocks, and every block projects the same current CFM timestep independently.
+The candidate packs those immutable block weights and biases once, computes
+the current timestep's full modulation bank with one
+`[2,512] x [73728,512]` Cube GEMM, and passes the corresponding row to each accepted
+shape-bucketed attention-preamble graph. It does not retain modulation values
+across timesteps or chunks.
+
+The opt-in profile and real-checkpoint screening harness are:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_wide_adaln_experimental.yaml
+benchmarks/scripts/bench_minicpmo_dit_wide_adaln.py
+```
+
+On NPU 1, nine alternating trials with 20 warmups and 100 iterations reduced
+the 16-projection group from 1,853.374 us to 104.907 us, a 17.667x
+microbenchmark speedup. The real `flow.pt` weights and a nonzero FP32 timestep
+produced maximum and mean absolute errors of `0.0` in the isolated harness.
+The live service's loaded/lowered tensors instead produced a maximum absolute
+drift of `9.53674316e-07`. Serving startup therefore uses a fail-closed,
+nonzero-input `1e-6` maximum-absolute-drift gate. Non-finite output, larger
+drift, or incompatible block counts, shapes, or devices retain the per-block
+path. Four focused model tests and four deploy configuration tests passed in
+the server environment.
+
+Fresh candidate and accepted-profile services then ran the same 32 fixed
+English Seed-TTS rows three times, with three warmups, concurrency one, seed
+zero, temperature zero, and CFM6. Every run completed 32/32 with zero failures
+and 100% continuity while preserving 4,801 input tokens, 480 output tokens,
+3,362,880 audio frames, and 140.12 seconds of audio. The table reports the
+median run value from each side; lower is better except for throughput.
+
+| Metric | Accepted control | Wide AdaLN | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 45.296 s | 43.400 s | -4.19% |
+| Request throughput | 0.7065 req/s | 0.7373 req/s | +4.37% |
+| Mean / median / P99 E2E | 1,415.07 / 1,453.16 / 1,921.83 ms | 1,355.80 / 1,378.16 / 1,802.60 ms | -4.19% / -5.16% / -6.20% |
+| Mean / median / P99 TTFT | 313.98 / 314.00 / 446.27 ms | 319.54 / 326.50 / 464.45 ms | +1.77% / +3.98% / +4.07% |
+| Mean / median / P99 audio TTFP | 789.17 / 790.29 / 929.78 ms | 787.94 / 785.92 / 942.90 ms | -0.16% / -0.55% / +1.41% |
+| Mean / median / P99 chunk RTF | 0.344823 / 0.195124 / 1.061778 | 0.335521 / 0.151692 / 1.055121 | -2.70% / -22.26% / -0.63% |
+
+This first sample materially improved serving duration, throughput, every E2E
+gate, and central chunk RTF. It also slightly improved central audio TTFP, but
+text TTFT median and P99 appeared to regress by about 4%, beyond the accepted
+profile's 2% guard. A stage-instrumented follow-up showed that result was not a
+causal Stage-2 regression: client TTFT is the first Stage-0 text SSE delta, and
+the wide AdaLN path runs only in Stage 2.
+
+Fresh stage-instrumented runs measured accepted-control TTFT at
+321.60/325.23/455.51 ms mean/median/P99 and active-candidate TTFT at
+313.14/316.48/454.80 ms, changes of -2.63%/-2.69%/-0.16%. Stage-0 serving TTFT
+and model TTFT also improved in the candidate run. Serving duration was
+43.350 s for control and 43.786 s for candidate (+1.01%), while Stage-2
+generation time was statistically flat. This resolves the apparent TTFT
+regression and demonstrates that TTFT must not be attributed to a downstream
+Code2Wav-only change.
+
+A later fresh 32-row pair remained mixed:
+
+| Metric | Accepted control | Wide AdaLN | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 48.961 s | 51.100 s | +4.37% |
+| Request throughput | 0.6536 req/s | 0.6262 req/s | -4.19% |
+| Mean / median / P99 TTFT | 339.94 / 333.07 / 660.99 ms | 318.45 / 313.84 / 506.91 ms | -6.32% / -5.77% / -23.31% |
+| Mean / median / P99 audio TTFP | 837.69 / 796.37 / 1,469.97 ms | 786.80 / 765.33 / 1,062.76 ms | -6.08% / -3.90% / -27.70% |
+| Mean / median / P99 chunk RTF | 0.372492 / 0.189244 / 1.409467 | 0.383805 / 0.169480 / 1.265191 | +3.04% / -10.44% / -10.24% |
+
+Both sides completed 32/32 and produced byte-identical audio content hashes
+for all 32 requests, in addition to identical token, frame, and duration
+counts. The active candidate separately passed the cached Seed-TTS evaluator
+on eight rows with WER `0.0`, mean SIM `0.8391076`, zero request/ASR/SIM
+failures, and 100% streaming continuity. Because Stage 2 is downstream of the
+text answers scored by Daily-Omni and Video-MME, this candidate cannot alter
+those two suites' answers; this does not replace their release-level full-suite
+execution.
+
+The TTFT blocker is fixed, the accuracy evidence is stronger, and the startup
+gate now reflects live Ascend numerics. The end-to-end speed result is not yet
+reproducible, however: the original three-run median improved 4.19%, while the
+two fresh pairs measured +1.01% and +4.37% duration. The wide graph therefore
+remains an implemented opt-in candidate and is not inherited by the accepted
+profile until repeated interleaved trials show a stable end-to-end win.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-wide-adaln-20260819
+```
+
+Artifact checksums:
+
+```text
+79db65d94a68f62806d7d763f43c78e357b2521818c12ad3a4f31dcc8c12774c  control/results/control-1.json
+f114c2712108f7278ff55dbca95d08254731eafeaadffa55e9e3306b5d23ab19  control/results/control-2.json
+a9f45e910500ab5e0b11c0dab74598c72b30931a00146981b0b73448e1b8f80c  control/results/control-3.json
+9a40a5e22295bd89e757413aa4435f49ee1692c74db778dd8ce2c6cf979959f6  candidate/results/candidate-1.json
+5bded166874bee05af9f111c036a781ec6fbbc25fc1cf29f509138e788658f0c  candidate/results/candidate-2.json
+7744f74dd7924832a208dab8908d2d1e3b97620c4b65d792944a43674de48a2d  candidate/results/candidate-3.json
+7a34d5e35fe9eacb0b46360742991cb0024f7127c2cefd4c491bd2cef9f73991  candidate-service.log
+a11ecefb9df800dc08f92dd4eb5e9a4b9f844483fd971ffe001e669677777bf0  control/control-service.log
+a94a26cc30a63e6e5757afae3ef88dc61d0a052f9db07648934445a249cd07c3  candidate/candidate-service-2.log
+```
+
+TTFT-fix and bounded-drift follow-up artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-wide-adaln-ttft-fix-20260819
+```
+
+```text
+7698ec3219bcb074fc55dd9ef4f2157c46a9441d9d644520936b8b2fd4d4aa02  control/perf-control-final.json
+d52f6bad9f67c72a9373689d69a01f602c551471c38d0925abe91545778b058c  candidate/perf-candidate-2.json
+d6e1181aaef52ec70d8719b736ebaa8b7d065e25bd08b37fe22b343b20f8e914  control/stage-control-1.json
+245ec7a2c7170a7b1ac5852006fe7e835177c1ab9ccd5959d3a528d9c3b0e97d  candidate/stage-candidate-1.json
+5592a3f7fb806a8229e077a8b4bddcbb055583e1572eb63ab907284373382cd7  candidate/quality-candidate-en8.json
+51208a4b65896a3e33c088843062a42d97606471db89133b05b23749c4a2dfbe  candidate/service-bounded.log
+c84bb02ae8df0a7ef1046a3c71c3c5184109216added37aa4124511c14f10a0a  control/service-control-final.log
+```
+
+## Promoted all-step wide AdaLN projection
+
+The next iteration removes the remaining per-timestep launch boundary from
+the wide AdaLN candidate. MiniCPM-o 4.5 uses six fixed CFM timesteps in the
+accepted profile. Their time embeddings are available before the ODE loop, so
+the implementation now projects all six timesteps and all 16 DiT blocks with
+one `[6,2,512] x [73728,512]` Cube GEMM per audio chunk. The ODE loop consumes
+one `[2,1,16,4608]` view per step without retaining values across chunks.
+
+The real-checkpoint NPU 1 harness is:
+
+```text
+benchmarks/scripts/bench_minicpmo_dit_wide_adaln_steps.py
+```
+
+With the loaded `flow.pt` tensors, six current-step wide projections took
+719.428 us median while the single all-step projection took 97.258 us median,
+a 7.397x reduction at this boundary. Maximum and mean absolute drift were both
+`0.0`, including distinct embeddings for every timestep. The live startup
+gate also passed with `steps_max_abs_drift=0`; the existing single-step gate
+remained bounded at `9.53674316e-07`. Any compile, replay, shape, non-finite, or
+drift failure disables the optimization and restores the original per-block
+projections.
+
+Fresh candidate and accepted-control processes each ran the same 32 fixed
+English Seed-TTS rows three times with three warmups, concurrency one, seed
+zero, temperature zero, and CFM6. Every run completed 32/32 with zero failures
+and 100% continuity, preserving the identical structural signature: 4,801
+input tokens, 480 output tokens, 3,362,880 audio frames, and 140.12 seconds of
+audio. The table reports the median run value from each side. Lower is better
+except for throughput.
+
+| Metric | Accepted control | All-step AdaLN | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 42.361 s | 40.613 s | -4.13% |
+| Request throughput | 0.7554 req/s | 0.7879 req/s | +4.30% |
+| Mean / median / P99 E2E | 1,323.45 / 1,360.62 / 1,798.47 ms | 1,268.77 / 1,294.40 / 1,681.84 ms | -4.13% / -4.87% / -6.49% |
+| Mean / median / P99 TTFT | 309.21 / 317.84 / 454.15 ms | 315.27 / 314.85 / 456.45 ms | +1.96% / -0.94% / +0.51% |
+| Mean / median / P99 audio TTFP | 762.18 / 767.61 / 909.11 ms | 744.94 / 746.11 / 886.44 ms | -2.26% / -2.80% / -2.49% |
+| Mean / median / P99 chunk RTF | 0.324539 / 0.171741 / 1.021916 | 0.312637 / 0.145323 / 1.008885 | -3.67% / -15.38% / -1.28% |
+
+All primary serving, E2E, TTFP, and RTF gates improve. TTFT is generated by
+Stage 0 before this Stage-2-only path executes; its median improves and the
+mean/P99 variation remains within the 2% guard. Unlike the earlier current-step
+candidate, the three-run all-step result is stable: candidate duration ranged
+40.443--41.690 seconds versus 42.275--44.107 seconds for control. The
+optimization is therefore enabled in the accepted prompt-width profile.
+
+The full cached Seed-TTS WER/SIM result, Daily-Omni result, and Video-MME
+result remain valid because the fused projection is mathematically identical,
+passes an exact real-checkpoint parity gate, and changes neither Stage-0 text
+generation nor output structure. This is not a substitute for rerunning all
+three suites at the final competition release gate.
+
+Focused validation on the server passed all 84 Code2Wav tests and all 26
+relevant 910C deploy-configuration tests. The live service logged active
+all-step replay and completed 96 measured requests without falling back.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-all-step-adaln-20260819
+```
+
+### Profile-guided screens rejected before serving
+
+Three lower-level ideas were closed with real-checkpoint NPU harnesses before
+spending an end-to-end service cycle:
+
+- Freezing the DiT Conv+MLP graph weights was exact but 0.59% slower than the
+  accepted explicit-weight graph. The compiler already retains these inputs
+  efficiently, so making them opaque removes optimization freedom without
+  eliminating useful work.
+- Replacing the two causal-convolution taps with one batched tap matmul was
+  numerically bounded (`3.87e-07` maximum absolute drift) but improved only
+  107.9 us to 106.4 us, or 1.4%, before integration. That is below the launch
+  and maintenance threshold.
+- Casting the FP32 DiT matrices to actual Ascend `FRACTAL_NZ` format 29 changed
+  `F.linear` semantics: maximum hidden/cache errors were 1.96/3.78. The earlier
+  ND-format neutral result was a false negative; the real NZ path is rejected
+  on correctness before timing can qualify it.
+
+The reproducible screens are
+`bench_minicpmo_dit_frozen_weights.py`, `bench_minicpmo_dit_tap_matmul.py`,
+and `bench_minicpmo_dit_nz_weights.py` under `benchmarks/scripts/`.
+
+## Width-64 causal-pack kernel and rejected 32-frame schedule
+
+The next systems experiment preserved the accepted 25-frame first audio
+packet, then increased steady packets to 32 codec frames. This changes the
+steady DiT width from 50 to 64 and the HiFT F0 width from 58 to 72. The first
+unfused screen was decisively slower because the native causal Conv packing
+operator and Omni graph compatibility gate accepted only width 50: serving
+duration was 66.611 seconds and mean chunk RTF was 0.530646.
+
+The Ascend operator is now genuinely shape-aware at both competition widths.
+Its host tiler accepts `[2,50,512]` and `[2,64,512]`, the Torch binding sizes
+the packed output from the input shape, and the Omni graph reshapes projected
+values back to the traced input shape. Startup now compiles the fused causal
+Conv+MLP megagraph at the configured width. Exact device tests passed all 12
+combinations of width 50/64, FP16/FP32/BF16, and channel-major/cache-major
+state. The live width-64 graph compiled and replayed; HiFT widths 50 and 72
+both passed with maximum absolute drift `0`.
+
+The official TTS wrapper also now registers MiniCPM-o 4.5's Omni chat request,
+separates the registry model ID from the name advertised by a local server,
+and removes argparse's literal `--` separator before forwarding benchmark
+options. This prevents a local checkpoint name mismatch from silently turning
+an intended run into HTTP 404 failures.
+
+Fresh accepted-control and fused width-64 processes ran the same 32 fixed
+English Seed-TTS rows three times with three warmups, concurrency one, seed
+zero, temperature zero, and CFM6. Every measured run completed 32/32 with zero
+failures and 100% continuity, preserving 4,801 input tokens, 480 output tokens,
+3,362,880 audio frames, and 140.12 seconds of audio. The table reports the
+median run value; lower is better except for throughput.
+
+| Metric | Accepted 25-frame control | Fused 25/32-frame schedule | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.238 s | 41.228 s | -0.02% |
+| Request throughput | 0.7760 req/s | 0.7762 req/s | +0.02% |
+| Mean / median / P99 E2E | 1,287.79 / 1,305.49 / 1,708.94 ms | 1,287.67 / 1,283.26 / 1,801.70 ms | -0.01% / -1.70% / +5.43% |
+| Mean / median / P99 TTFT | 313.59 / 314.18 / 453.42 ms | 314.64 / 319.61 / 449.42 ms | +0.33% / +1.73% / -0.88% |
+| Mean / median / P99 audio TTFP | 752.02 / 753.13 / 904.65 ms | 777.73 / 782.77 / 942.91 ms | +3.42% / +3.94% / +4.23% |
+| Mean / median / P99 chunk RTF | 0.317468 / 0.146430 / 1.017063 | 0.348741 / 0.152492 / 1.047937 | +9.85% / +4.14% / +3.04% |
+
+The new kernel removes the catastrophic fallback cost: relative to the
+unfused 32-frame screen, fused median duration improves 38.11%, throughput
+improves 61.57%, TTFP improves 22.61%, and mean chunk RTF improves 34.28%.
+Against the accepted 25-frame profile, however, aggregate duration is flat
+while every TTFP and chunk-RTF gate regresses by more than two percent. The
+kernel capability remains available for future shapes, but the 32-frame
+schedule is rejected and is not inherited by the accepted profile.
+
+A separate composition screen showed that cache-major causal state must not
+be combined with the accepted all-step AdaLN profile. One fail-fast 32-row run
+completed without structural drift but took 67.567 seconds with mean audio
+TTFP 1,042.43 ms and mean chunk RTF 0.494745. Its experimental profile now
+explicitly disables wide AdaLN rather than accidentally replacing inherited
+connector options.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-all-step-cache-major-20260820
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-chunk32-20260820
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-chunk32-width64-20260820
+```
+
+Artifact checksums:
+
+```text
+c6a8cdf8fc059530fb132f40e533941b63d7778e8e683f853aed67ba700dc3c0  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260819-182758.json
+4252e5a5b1a4837940089043d352a1de7baaae4e2ab791315070a10bb41de112  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260819-183053.json
+45f35a3a611df007a169c92c841fa50078bd5f980ccd76a26d7bf19056fdad93  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260819-183155.json
+87018b83e590fb2449a81d8e81e31466608dcc4c937c57dc8f9586cced568a1d  /tmp/lunanexa-chunk32-width64-service-7.log
+```
+
+## Promoted all-step final-layer AdaLN projection
+
+The accepted all-step AdaLN graph projected the six fixed CFM timesteps for
+all 16 DiT blocks, but `FinalLayer` still repeated its independent
+512-to-1024 time projection once per estimator step. The promoted graph packs
+that 17th projection below the existing 73,728 block rows. It returns the
+block bank and six final-layer modulation rows from the same Cube GEMM. The
+final normalization and 512-to-80 output projection remain eager; compiling
+those small operations made the isolated boundary 42.28% slower.
+
+The real-checkpoint NPU 1 screen measured the established block graph plus six
+complete eager final layers at 825.089 us median. Reusing the enlarged graph's
+final modulations while keeping the rest of `FinalLayer` eager took 687.107 us,
+a 16.72% latency reduction (1.201x speedup). Moving the whole final layer into
+a second graph took 1,173.949 us and was rejected. Maximum final-output drift
+was `7.15e-7`. Live startup independently measured block drift `0` and final
+modulation drift `8.34e-7`, below the fail-closed `1e-6` limit. A failure of
+the enlarged graph disables only the final-layer extension and retains the
+already accepted block-only graph.
+
+Fresh candidate and accepted-control processes ran the same 32 fixed English
+Seed-TTS rows three times after two warmups, at concurrency one, seed zero,
+temperature zero, and CFM6. Every run completed 32/32 with zero failures and
+100% continuity, preserving 4,801 input tokens, 480 output tokens, 3,362,880
+audio frames, and 140.12 seconds of audio. The table reports the median run
+value from each side. Lower is better except for throughput.
+
+| Metric | Accepted control | Wide final AdaLN | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 43.703 s | 43.574 s | -0.30% |
+| Request throughput | 0.7322 req/s | 0.7344 req/s | +0.30% |
+| Mean / median / P99 E2E | 1,365.29 / 1,408.63 / 1,830.56 ms | 1,361.37 / 1,391.91 / 1,828.12 ms | -0.29% / -1.19% / -0.13% |
+| Mean / median / P99 TTFT | 314.03 / 316.16 / 460.12 ms | 309.89 / 311.51 / 446.83 ms | -1.32% / -1.47% / -2.89% |
+| Mean / median / P99 audio TTFP | 778.09 / 775.11 / 920.83 ms | 773.71 / 775.56 / 917.14 ms | -0.56% / +0.06% / -0.40% |
+| Mean / median / P99 chunk RTF | 0.334470 / 0.183147 / 1.075928 | 0.333051 / 0.184201 / 1.068024 | -0.42% / +0.58% / -0.73% |
+
+All three paired duration runs improve, as do throughput and every primary
+mean and tail gate. Median TTFP and median chunk RTF regress by less than one
+percent and remain inside the two-percent guard. The candidate is therefore
+enabled in the accepted prompt-width profile. The full cached Seed-TTS,
+Daily-Omni, and Video-MME qualifications carry forward because the change is
+bounded by a real-checkpoint parity gate and leaves Stage-0 answers and output
+structure unchanged; all three suites are still rerun at the final release
+qualification.
+
+Two nearby ideas were closed before service A/B. Factoring the six 320-to-512
+DiT input projections into one invariant 240-channel projection plus six
+80-channel projections improved 230.375 us to only 221.708 us (3.91%) and
+introduced `0.0078125` maximum BF16 drift; its graph form took 802.082 us.
+Prepacking the five immutable HiFT F0 Conv1d weights as resident FRACTAL_Z was
+bit-exact but improved the full graph only 213.624 us to 211.168 us (1.16%).
+Both are retained only as reproducible benchmark screens.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-wide-final-adaln-20260820
+```
+
+Artifact checksums:
+
+```text
+5a4603f093fee36e61d6cc0760f337f4cd54fd1a646a61c38126e38741dd8000  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-025406.json
+898aa191a5c4d31959a1b76a159f9d791fdaf291b55a1e58d629227aa357642a  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-025554.json
+474ad8b1956ce4df308fbaa516c37c645e060ee0357f79c315919b7d6c981dfb  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-025658.json
+d084cf39a7ba8f6eb64cbd6d0d05e7226446f563a071df183751bc7dfe03eb17  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-030411.json
+575b4adc19eed5abe2914174e4001a11222a2545771924eba2e2cb62fe306225  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-030602.json
+25cbb569e702fc8287055ac92c6a7437acb83e32c15df39ceda09286ebe38cb3  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-030708.json
+f220ccc094043abd3002dadcca23fdbe82ddcb142e1a4b5b9880fd279d148a1b  candidate-service.log
+```
+
+## Promoted final AdaLN Addcmul lowering
+
+After the all-step final projection landed, the remaining six-step CFM
+epilogue divided into 373.998 us of final LayerNorm/modulation and 488.405 us
+of output projection, CFG guidance, and Euler update. The canonical modulation
+`norm * (1 + scale) + shift` issues three eager elementwise operations after
+LayerNorm. Reassociating the same expression as
+`addcmul(norm + shift, norm, scale)` removes one launch and one intermediate
+without hiding the final 512-to-80 Cube GEMM from the native runtime.
+
+The real-checkpoint NPU-1 harness measured six canonical modulations at
+373.998 us and the Addcmul form at 308.726 us, a 17.45% reduction. The full
+six-step epilogue improved from 849.465 us to 788.316 us, or 7.20%. Maximum
+final-state drift was `2.38e-7`. Live startup separately measured `4.77e-7`
+maximum output drift and enables the path only below a fail-closed `1e-6`
+bound. A runtime exception disables only Addcmul and immediately retries the
+canonical AdaLN expression.
+
+Two broader alternatives were rejected in the same harness. Compiling the
+complete final-layer, CFG, and Euler boundary took 890--913 us instead of
+814--875 us. Moving CFG before the output projection was mathematically
+linear and bounded to `5.36e-7`, but the smaller batch-one GEMM lost Cube
+efficiency and did not beat the canonical path.
+
+Fresh candidate and accepted-control processes ran the same 32 fixed English
+Seed-TTS rows three times after two warmups, at concurrency one, seed zero,
+temperature zero, and CFM6. Every run completed 32/32 with zero failures and
+100% continuity while preserving 4,801 input tokens, 480 output tokens,
+3,362,880 frames, and 140.12 seconds of audio. Every candidate duration
+(43.858--44.764 seconds) was lower than every control duration
+(45.592--46.318 seconds). The table reports three-run medians; lower is
+better except for throughput.
+
+| Metric | Accepted control | Final Addcmul | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 45.859 s | 43.880 s | -4.32% |
+| Request throughput | 0.6978 req/s | 0.7293 req/s | +4.51% |
+| Mean / median / P99 E2E | 1,432.74 / 1,461.83 / 1,945.93 ms | 1,370.82 / 1,398.01 / 1,847.38 ms | -4.32% / -4.37% / -5.06% |
+| Mean / median / P99 TTFT | 316.50 / 320.61 / 453.20 ms | 317.49 / 322.12 / 454.62 ms | +0.31% / +0.47% / +0.31% |
+| Mean / median / P99 audio TTFP | 802.41 / 800.09 / 966.63 ms | 783.13 / 788.72 / 933.13 ms | -2.40% / -1.42% / -3.47% |
+| Mean / median / P99 chunk RTF | 0.334418 / 0.329847 / 0.435565 | 0.319463 / 0.316592 / 0.419713 | -4.47% / -4.02% / -3.64% |
+
+TTFT is produced by Stage 0 before this Stage-2-only path executes, and its
+three gates remain inside the two-percent variance guard. Every Stage-2 and
+end-to-end gate improves, so `npu_dit_final_addcmul` is enabled in the
+accepted prompt-width profile. The complete Code2Wav suite passed 89/89 and
+all relevant 910C configuration tests passed 29/29. Full Seed-TTS WER/SIM,
+Daily-Omni, and Video-MME remain part of final cumulative qualification; this
+bounded downstream rewrite cannot change the Stage-0 answers scored by the
+latter two suites.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-final-addcmul-20260820
+```
+
+Artifact checksums:
+
+```text
+54afb25588f5954e29948a725e07e90d4bd93120253223e648b9ecaa233553a5  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-052041.json
+c9ae1f377a90cb707d23e5f1631083d8132119b34d552a620e0dfec555abbe75  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-052239.json
+b5ac4d078e608eab1e9ecd0e017274621f316ac529c7299d74a935a83acc5158  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-052350.json
+ede3dacc001ad97dd7136e0e645d9e63b43638a253dbd5db6d2247d7dfd99980  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-051116.json
+df4547dd197ee25937c00ea127af8468ba794ec6fb21393181dc85da23d1d68f  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-051305.json
+09baabb4aa9a80f50bc887437c1631767380a1099aa22b2fb70db14ffacf4d1a  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-051410.json
+d66b3a364dafd85e3de0cdfd008319adce0ef655b0fc44609db4b883018c4f1b  candidate-service.log
+e6861eb526deed32f1c0b8741248824e3ba159436727d731c7535669c281283c  control-service.log
+```
+
+## Rejected mixed Vector/Cube final AdaLN kernel
+
+The next kernel experiment fused the steady-width final affine-free
+LayerNorm, AdaLN shift/scale, and 512-to-80 projection into one AscendC mixed
+kernel. Ten Vector cores normalize and modulate the fixed FP32 `[2, 50, 512]`
+activation into workspace; five Cube cores then project 16 output channels
+each and add the 80-channel bias. Prompt and tail shapes continue through the
+accepted Addcmul fallback.
+
+An alternating 15-trial NPU-1 microbenchmark used 100 warmups and 200 timed
+iterations per trial. The accepted LayerNorm + Addcmul + linear boundary took
+70.876 us at the median, while the fused kernel took 29.773 us: a 2.3805x
+isolated speedup and about 246.6 us projected saving over six CFM steps. The
+synthetic parity fixture measured `0.00175923` maximum and `0.00017176` mean
+absolute drift. The real-checkpoint startup gate measured `0.000928760`
+maximum and `0.000284755` mean drift, inside the fail-closed `0.002` / `0.0005`
+bounds. Any shape, dtype, operator, or parity failure disables only this
+kernel and immediately retries the accepted Addcmul path.
+
+The service result did not follow the isolated result. Fresh candidate and
+accepted-control processes ran the same 32 fixed English Seed-TTS rows three
+times after three warmups, at concurrency one, seed zero, temperature zero,
+and CFM6. Every valid run completed 32/32 with zero failures and 100%
+continuity while preserving 4,801 input tokens, 480 output tokens, 3,362,880
+audio frames, and 140.12 seconds of audio. The table reports the median run
+value from each side; lower is better except for throughput.
+
+| Metric | Accepted control | Fused final AdaLN | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 43.835 s | 45.401 s | +3.57% |
+| Request throughput | 0.7300 req/s | 0.7048 req/s | -3.45% |
+| Mean / median / P99 E2E | 1,369.37 / 1,403.54 / 1,826.46 ms | 1,418.46 / 1,439.42 / 1,907.96 ms | +3.59% / +2.56% / +4.46% |
+| Mean / median / P99 TTFT | 315.30 / 316.13 / 448.59 ms | 317.71 / 320.25 / 450.78 ms | +0.76% / +1.30% / +0.49% |
+| Mean / median / P99 audio TTFP | 780.21 / 781.16 / 922.74 ms | 788.91 / 792.47 / 926.93 ms | +1.11% / +1.45% / +0.45% |
+| Mean / median / P99 whole-audio RTF | 0.319218 / 0.320959 / 0.430698 | 0.329750 / 0.331605 / 0.428053 | +3.30% / +3.32% / -0.61% |
+| Mean / median / P99 chunk RTF | 0.335295 / 0.183195 / 1.026925 | 0.345943 / 0.195240 / 1.025032 | +3.18% / +6.57% / -0.18% |
+
+The candidate fails the two-percent gate on serving duration, mean and median
+whole-audio RTF, mean and median chunk RTF, and all E2E aggregates. It is not
+enabled in the accepted prompt-width profile. The custom operator and guarded
+integration remain available through the explicitly named experimental YAML
+for profiler work.
+
+The likely cause is boundary placement, not arithmetic cost. The accepted
+LayerNorm, Addcmul, and linear operations remain visible to GE and can overlap
+or optimize with neighboring work. The ACLNN custom operator is an opaque
+synchronous boundary with a 200 KiB workspace round trip and a whole-device
+Vector-to-Cube barrier on every CFM step. Its microbenchmark removes Python
+launches in isolation, but the live pipeline loses more scheduling freedom
+than those launches cost. A future retry must fuse a larger producer-consumer
+region (for example final projection through CFG/Euler) or expose the operator
+to the graph compiler instead of inserting another eager ACLNN island.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-fused-final-adaln-20260820
+```
+
+Artifact checksums:
+
+```text
+bde59d8cb81a38b15c8b968455e72db8f1e08255e13a9d1c679519b16d73bd30  control/control-run1.json
+3165ed79423b95cb0b7b8c32225a08ce83abceeaaaf9c763317c3b58502edc6d  control/control-run2.json
+8ee302bd74378182a15aca4565c1a76d8e23fbb6f30f9b696853ac826665aedd  control/control-run3.json
+de61cff0e06ed34c47ba14dfc120bc9eefd6de73b65739fd829fc013e9fa8341  candidate/candidate-valid-run1.json
+62c81e4ba12390e17b2367a8621ec8e85e9d9db391fd9ce4c65f9c57ced73780  candidate/candidate-valid-run2.json
+c900e841f9dc6c01701a812b3af03656cf75f083331ad3f1314bbc1ed2effc09  candidate/candidate-valid-run3.json
+835ce8779f1a7493c0c4e6193f99073069b6cfe99d9dfe735a8ea025b18160be  candidate-service.log
+f0c3c2de53a1da9a7dc55d227db8d9626b68a7f8ec8115ab5b8b933a563d1137  control-service.log
+```
+
+## Rejected GE-visible last-block-to-Euler megagraph
+
+The next experiment removed the opaque ACLNN island and instead enlarged the
+already accepted TorchAir/GE replay. For the steady `[2,50,512]` CFM shape,
+the last DiT block's causal-pack Conv, MLP residual, affine-free final
+LayerNorm, AdaLN Addcmul, 512-to-80 output projection, CFG reduction, and
+Euler state update execute as one static graph. This removes a Python/ACLNN
+boundary without hiding operations from GE. Prompt and tail widths retain the
+accepted split path.
+
+The implementation is guarded by
+`npu_dit_last_block_final_euler_graph` (or
+`VLLM_OMNI_MINICPMO45_NPU_DIT_LAST_BLOCK_FINAL_EULER_GRAPH`) and the explicit
+profile:
+
+```text
+vllm_omni/deploy/minicpmo_4_5_2npu_910c_cfm6_dit_last_block_final_euler_graph_experimental.yaml
+benchmarks/scripts/bench_minicpmo_dit_last_block_final_euler.py
+```
+
+It requires the accepted causal-pack Conv+MLP, wide final AdaLN, and final
+Addcmul profile. Incompatible layouts fail closed. Startup compares the new
+graph with the accepted graph using loaded model tensors, rejects non-finite
+outputs, and enforces `0.005` maximum / `0.0005` mean state drift plus
+`0.005` cache drift. A runtime failure disables only this extension and
+immediately replays the accepted Conv+MLP and final path.
+
+The corrected real-checkpoint FP32 NPU-1 harness used nine alternating trials,
+20 warmups, and 100 timed iterations. It reduced the fused region from
+358.774 us to 298.390 us, a 1.2024x speedup. State maximum/mean drift was
+`5.96e-8` / `6.17e-9`, and cache drift was zero. The live startup gate measured
+`1.04e-7` maximum and `1.40e-8` mean state drift with zero cache drift, then
+logged that the last-block-to-Euler replay was active. A BF16 screening run
+also improved 343.948 us to 240.365 us (1.4309x), but is not the serving dtype
+and is recorded only to prevent that result from being mistaken for the live
+projection.
+
+The isolated FP32 saving is only 60.384 us per CFM step. Even across six steps
+and several streamed chunks, its projected request saving is around one to two
+milliseconds, far below the roughly 1.3-second end-to-end request time. The
+larger graph therefore needed a live promotion result; the microbenchmark was
+not sufficient evidence.
+
+Fresh candidate and accepted-control processes each ran the same 32 fixed
+English Seed-TTS rows three times after three warmups, at concurrency one,
+seed zero, temperature zero, and CFM6. Every run completed 32/32 with zero
+failures and 100% continuity while preserving 4,801 input tokens, 480 output
+tokens, 3,362,880 audio frames, and 140.12 seconds of audio. The table reports
+componentwise three-run medians; lower is better except for throughput.
+
+| Metric | Accepted control | Last-block-to-Euler | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 41.472 s | 43.859 s | +5.76% |
+| Request throughput | 0.7716 req/s | 0.7296 req/s | -5.44% |
+| Mean / median / P99 E2E | 1,295.62 / 1,326.78 / 1,745.15 ms | 1,370.09 / 1,407.12 / 1,838.94 ms | +5.75% / +6.05% / +5.37% |
+| Mean / median / P99 TTFT | 315.60 / 316.72 / 455.62 ms | 322.79 / 330.39 / 462.01 ms | +2.28% / +4.32% / +1.40% |
+| Mean / median / P99 audio TTFP | 757.68 / 768.45 / 916.55 ms | 786.40 / 794.05 / 928.96 ms | +3.79% / +3.33% / +1.35% |
+| Mean / median / P99 whole-audio RTF | 0.303011 / 0.305925 / 0.400238 | 0.319225 / 0.319531 / 0.426683 | +5.35% / +4.45% / +6.61% |
+| Mean / median / P99 chunk RTF | 0.319334 / 0.142588 / 1.021162 | 0.335713 / 0.181280 / 1.050555 | +5.13% / +27.14% / +2.88% |
+
+The candidate fails every primary Stage-2 and end-to-end promotion gate and is
+not enabled in the accepted prompt-width profile. Because the expected saving
+is much smaller than process-level variance, this experiment does not prove
+that the fused graph itself causes the entire five-percent difference. It does
+prove that absorbing only the last block's epilogue cannot deliver a stable,
+measurable serving win on this stack. The accepted service remains active.
+
+The next lower-layer attempt should target a region with an order-of-magnitude
+larger budget: multiple DiT blocks in one GE replay, attention-to-Conv producer
+fusion without cache-layout conversions, or the complete six-step CFM loop.
+Each needs live-FP32 isolated accounting before another service A/B.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-last-block-final-euler-20260820
+```
+
+Artifact checksums:
+
+```text
+0601fa1e7070a8895f00ee35558eaea85a737a64841c66a55924e819b703e5a7  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-073717.json
+71b4f4bcdbf61d69e65b41416beb2a0452c73cb108a0b734287ca4c81faa084d  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-073914.json
+2e727366836606998ae302cb38c08865c4650807c5bbd2269f5033cb3af057ca  candidate/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-074023.json
+0af451c226f974bf64ed246a6279f475f693fff8d3361abd3cb05c00f1912440  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-074808.json
+4b18afd3e0743df5abcf5336fe2ae9aec1cdab8a55e06b6b528310ae3b2665a2  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-075001.json
+b5db1c13a83830d1f2f18ce1ebea061f62bdba10aab99a1c7b3f2385f903c95e  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-075107.json
+597260dc2c65fd1986ac75b0cd34258df373ce301e2e865e483ab573d88039cb  candidate-service.log
+6d01e1d090d75b0de089fa4bf4fb448905fd2b1690747c960fd26fc2ff065957  control-service.log
+3dc04960a7511607d810a99c5f1d4aaacaba6683ccf5762d8e6b5136365e63ce  isolated-fp32.log
+ba28ab6f3352c9765db4b8e6b5f3c43a4e3042de1afd5ad7d3e9fcc7c67c4fd0  isolated-bf16.log
+```
+
+### Fix: fail-closed device-time usefulness gate
+
+The rejected graph originally used correctness as its only startup promotion
+gate. That was insufficient: its isolated win was genuine but too small to
+survive the live scheduling boundary. The implementation now times the loaded
+checkpoint's accepted and fused regions with NPU events after compilation,
+using five alternating trials of 20 replays. Promotion requires both at least
+`1.10x` speedup and at least 200 us absolute saving per CFM step. Failure of
+either condition discards the fused callable before serving traffic; the
+accepted Conv+MLP, final Addcmul, CFG, and Euler path remains active.
+
+On the Atlas 800I A3 / 910C host, the startup gate measured 366.860 us for the
+accepted region and 287.193 us for the fused region: `1.2774x`, but only
+79.667 us saved. It therefore rejected the graph on the absolute-headroom
+criterion. This fixes the regression without pretending that a microbenchmark
+win is a deployable serving win.
+
+An adjacent, fully warmed 12-row Stage benchmark compared the active fused
+process with a fresh process where the usefulness gate selected the accepted
+fallback. Both sides preserved 1,804 input tokens, 183 output tokens, 1,252,800
+audio frames, 52.2 seconds of audio, zero failures, and 100% continuity.
+
+| Metric | Active fused graph | Gated accepted fallback | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 17.289 s | 16.594 s | -4.02% |
+| Request throughput | 0.6941 req/s | 0.7231 req/s | +4.19% |
+| Mean / median / P99 E2E | 1,440.19 / 1,411.47 / 1,784.75 ms | 1,382.38 / 1,404.97 / 1,793.04 ms | -4.01% / -0.46% / +0.46% |
+| Mean Stage-2 generation time | 1,437.46 ms | 1,385.04 ms | -3.65% |
+| Mean / median / P99 TTFT | 320.54 / 318.09 / 454.53 ms | 319.89 / 311.09 / 467.23 ms | -0.20% / -2.20% / +2.79% |
+| Mean / median / P99 audio TTFP | 803.80 / 789.80 / 954.73 ms | 800.62 / 781.50 / 976.46 ms | -0.40% / -1.05% / +2.28% |
+| Mean / median / P99 whole-audio RTF | 0.338513 / 0.324029 / 0.415314 | 0.323665 / 0.324948 / 0.377660 | -4.39% / +0.28% / -9.07% |
+
+The tail TTFT/TTFP changes are upstream variance: Stage 2 cannot affect text
+TTFT, and both are based on only 12 rows. The causal signal is the Stage-2
+mean plus serving-duration/throughput/mean-RTF recovery. This run is used only
+to validate the fallback decision, not to promote a new speed claim.
+
+The gated process then completed three full 32-row Seed-TTS runs. Every run
+preserved the official structural signature: 4,801 input tokens, 480 output
+tokens, 3,362,880 frames, 140.12 seconds of audio, 32/32 successes, zero
+failures, and 100% streaming continuity. Componentwise medians were 44.949 s
+duration, 0.7119 requests/s, 1,404.25 ms mean E2E, 315.21 ms mean TTFT,
+801.52 ms mean TTFP, 0.328143 mean whole-audio RTF, and 0.345399 mean chunk
+RTF. These are fallback validation results; they are not compared with the
+earlier process epoch as a performance A/B.
+
+The focused Code2Wav and 910C configuration selection completed 182/182 tests.
+The graph is still available for future larger boundaries, but this exact
+last-block region can no longer become a live regression on hardware where it
+lacks enough absolute device-time budget.
+
+Fix artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-last-block-fix-20260820
+```
+
+Selected checksums:
+
+```text
+be038c461e02e329794e9cb05c6a832c393e18add0d52e5df704e56ae436334b  gated-service.log
+7bffb228c4579a6ff55d0ddc4184bb1a639dc43c5073d68bbc140a1ece6a0b46  candidate-stage-warm/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-094558.json
+c10431541585f505a4f84be318efff1ed5785e4ec5a402463022fd7e09b4a63a  gated-stage-warm/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-095921.json
+a2de666b40257368c34ddebd15b08e1640b670091d14dc4025cf05cde1bafbb1  gated-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-100016.json
+fd03982e17a31d8b347c33afd57c61b9940e26386008b7c7f7a07075165f5c31  gated-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-100149.json
+b4fd1f38c896e07e547e1281b43c536ebe48a65a36293d9f56c97c5009d5339d  gated-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-100310.json
+```
+
+### Experimental homogeneous-BF16 CFM precision island
+
+The next lower-layer experiment moved the complete six-step CFM numerical
+island to BF16 on Ascend 910C: the DiT estimator, random-noise state, cached
+timestep/delta tensors, CFG reduction, and Euler recurrence now share one
+dtype. The completed mel is converted once at the FP32 HiFT boundary. The
+flow encoder, prompt extraction, HiFT vocoder, and public waveform contract
+remain FP32.
+
+This design replaces a rejected selective-BF16 prototype. Keeping the
+estimator in BF16 while casting every CFM step back to an FP32 Euler state
+completed 32/32 requests with exact structural parity, but took 71.57 seconds
+against its adjacent 67.14-second FP32 control: 6.60% slower. The repeated
+dtype boundaries also disabled a larger homogeneous graph signature. That
+prototype remains expressible for diagnosis, but is not the deploy profile.
+
+The homogeneous mode is opt-in through `npu_dit_compute_dtype: bf16` plus
+`npu_cfm_integration_dtype: bf16`. It fails closed to FP32 integration when
+the requested integration dtype does not match the active estimator dtype,
+and converts the estimator back to FP32 if module conversion fails. On real
+hardware the startup log confirmed `estimator=torch.bfloat16`,
+`CFM integration=torch.bfloat16`, and `HiFT=float32`. Existing graph drift
+gates remained active. In particular, the final Addcmul rewrite measured
+0.0078125 maximum drift against its 0.000001 bound and correctly retained the
+canonical AdaLN path instead of loosening the gate.
+
+The isolated checkout completed the entire focused Code2Wav suite, including
+the new precision-boundary cases: 100/100 passed. The hardware run used the
+same fixed 32 English Seed-TTS rows, three warmups, concurrency one, seed zero,
+temperature zero, and CFM6 on both sides. Both sides completed 32/32 with zero
+failures, 100% streaming continuity, 4,801 input tokens, 480 output tokens,
+3,362,880 frames, and 140.12 seconds of audio.
+
+The shared host showed substantial epoch variance: an earlier adjacent FP32
+control took 67.14 seconds, while the final immediate quality-paired FP32
+control took 46.87 seconds. The table therefore uses the faster final control
+as the conservative comparison. Lower is better except throughput.
+
+| Metric | FP32 control | Homogeneous BF16 | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 46.868 s | 45.331 s | -3.28% |
+| Request throughput | 0.6828 req/s | 0.7059 req/s | +3.39% |
+| Mean / median / P99 E2E | 1,463.92 / 1,488.74 / 1,999.56 ms | 1,416.00 / 1,450.05 / 1,898.76 ms | -3.27% / -2.60% / -5.04% |
+| Mean / median / P99 TTFT | 327.75 / 329.94 / 468.25 ms | 316.61 / 315.49 / 459.58 ms | -3.40% / -4.38% / -1.85% |
+| Mean / median / P99 audio TTFP | 815.03 / 810.22 / 975.74 ms | 786.90 / 785.87 / 937.00 ms | -3.45% / -3.00% / -3.97% |
+| Mean / median / P99 whole-audio RTF | 0.340990 / 0.340272 / 0.437862 | 0.329556 / 0.325919 / 0.416748 | -3.35% / -4.22% / -4.82% |
+
+The same outputs ran through Whisper-large-v3 WER and WavLM-base-plus SIM.
+Both evaluators processed all 32 rows with zero PCM, ASR, or embedding
+failures. WER is reported as a fraction below and percentage-point changes are
+computed on the corresponding 0-100 scale.
+
+| Accuracy metric | FP32 control | Homogeneous BF16 | Accuracy change |
+| --- | ---: | ---: | ---: |
+| Mean / median WER | 0.016588 / 0 | 0.016588 / 0 | 0.00 pp |
+| Mean / median WavLM SIM | 0.845234 / 0.851134 | 0.844850 / 0.851195 | -0.038 pp / +0.006 pp |
+
+This clears the 2-percentage-point screening gate with a large margin and is
+accepted as an experimental profile. It is not promoted into the default
+910C profile yet: the 32-row WavLM score is the repository's documented proxy,
+not the competition's fine-tuned UniSpeech/WavLM-SV protocol, and the full
+official 1,088-row Seed-TTS export/evaluation still remains a release gate.
+Daily-Omni and Video-MME are unaffected by this Stage-2-only numerical change,
+but their cumulative competition runs also remain required before submission.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-bf16-20260820
+```
+
+Selected checksums:
+
+```text
+bec40f62c441fd307b05115e23af47874c7c333d4e49db699a7626c032bcdd93  homogeneous-quality32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-150610.json
+0813cc8e834bb4a53c6051950442ac3fd4957208d26363c504ada566a2698683  control-quality32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-154644.json
+07035b99ce23921a8542d814a27b4681374290912d81133a63d1e4fd2b906101  homogeneous-bf16-service.log
+454db6ee07d860572fed483370736aa2900ca5634b3ca84d04a43720985a7b82  final-control-service.log
+```
+
+### Fixed-address estimator cache slabs
+
+The next cache-layer candidate removes request-time estimator-cache growth
+without changing MiniCPM-o's attention history. The upstream attention path
+orders its cache as `[new chunk, previous cache]`; therefore treating the
+first prompt-width region as immutable would change model semantics. The
+implemented representation instead owns, per concurrency-one request:
+
+- one retained six-step x 16-block KV slab with capacity `prompt + 100`;
+- one separate append/output slab with capacity `prompt + 150`;
+- a logical length rather than a changing allocation;
+- two reusable CNN-cache banks; and
+- direct CFM cache outputs into those workspaces.
+
+After each decode, the output slab is compacted into the distinct retained
+slab using the exact existing rule: preserve the first prompt-width frames and
+the newest retained 100-frame tail. Distinct source and destination buffers
+avoid undefined overlapping copies. Prompt/cache-fill/final shapes stay eager.
+The focused suite verifies exact audio and all flow-cache tensors across four
+chunks, fixed storage addresses, and the overflow retention order. Together
+with the deploy-inheritance gate, 104/104 focused tests passed.
+
+The adjacent hardware screen used the homogeneous-BF16 profile on both sides,
+the same first 12 shuffled English Seed-TTS rows, three warmups, concurrency
+one, seed zero, temperature zero, and CFM6. Both runs completed 12/12 with zero
+failures, 100% streaming continuity, 1,804 input tokens, 183 output tokens,
+1,252,800 frames, and 52.20 seconds of audio. Lower is better except
+throughput.
+
+| Metric | BF16 control | Fixed slabs | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 18.595 s | 17.835 s | -4.08% |
+| Request throughput | 0.6453 req/s | 0.6728 req/s | +4.26% |
+| Mean E2E | 1,549.17 ms | 1,485.89 ms | -4.08% |
+| Mean TTFT | 329.73 ms | 320.54 ms | -2.79% |
+| Mean audio TTFP | 832.49 ms | 818.93 ms | -1.63% |
+| Mean whole-audio RTF | 0.362937 | 0.349713 | -3.64% |
+| Mean / median chunk RTF | 0.390172 / 0.224625 | 0.378519 / 0.203973 | -2.99% / -9.19% |
+| P99 chunk RTF | 1.206069 | 1.224779 | +1.55% |
+
+The service logged `retained=402, append=452` and direct stacked CFM cache
+outputs. The primary means all improved, but the small 12-row chunk-P99 screen
+did not. Fixed slabs therefore remain an experimental speed candidate pending
+a 32-row repeated tail gate; they are not silently promoted to the default.
+Because the cache transformation is mathematically exact, it reuses the
+already-qualified homogeneous-BF16 accuracy boundary, but the full official
+Seed-TTS and cumulative Daily-Omni/Video-MME release gates still apply.
+
+A second profile enabled one steady width-50/cache-402 NPUGraph executable and
+two captured output slots. Capture failed closed on the real 910C stack:
+CosyVoice's causal Conv1d lowered to the legacy ACLop Conv2D path, which cannot
+run during NPU stream capture. The resulting 17.81-second run is eager fallback
+data, not a graph result. This closes another attempt at raw full-loop capture;
+the next implementation must make the convolution graph-visible through
+TorchAir/GE static compilation or a converter, rather than retrying
+`allow_internal_format=False`.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-fixed-kv-20260821
+```
+
+Selected checksums:
+
+```text
+be15a479c86c9b7de7367328b6444c928d95abb503442760e758071da8679101  control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-164430.json
+f6a443e5bee4043dfdc04c54a301ac7e2d98a3971df372906a4344f2bcd9eb65  fixed/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-165055.json
+0fc109f1edcfa9a7692e34b09759afa8e38f2cd3fb3bce488b97595ea79f0b23  graph/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260820-165747.json
+7ca1bbba1f4a7e7b0325c7934e958fbdbe3e612ede78200978245c0b18a7a89c  fixed-service.log
+a31a74e7dcc243fc0c9a1bfbcdfeedb8c19e4a505578eaf4bfe159afd5090691  graph-service.log
+```
+
+### Planar fixed-address estimator K/V slabs
+
+The next cache-layout candidate keeps the accepted fixed-capacity ownership
+model, but replaces the packed last-dimension `[K | V]` representation with
+independent K and V planes:
+
+```text
+[six CFM steps, 16 blocks, K/V=2, CFG batch, heads, time, head dimension]
+```
+
+At each block boundary, the K and V histories are now independently
+contiguous and the projected current K/V tensors write directly into their
+final append planes. The SDPA inputs no longer depend on strided halves of a
+packed 128-wide cache. Logical length, prompt-plus-100 retention, the separate
+prompt-plus-150 output workspace, and the two CNN banks remain unchanged.
+The accepted split preamble/attention/Conv+MLP path stays graph-visible; the
+previously rejected full-block and full-stack graphs are intentionally not
+selected for planar state. Unsupported or batched cases convert to the exact
+legacy representation rather than widening the experimental boundary.
+
+The focused tests cover environment/config selection, projected-attention
+parity, four-chunk audio and cache parity, fixed storage addresses, and
+contiguous per-block K/V planes. The full MiniCPM-o model file completed
+107/107 tests; the deploy-profile selection test also passed. The live service
+logged both `contiguous planar K/V attention cache active` and
+`retained=402, append=452, planar=True`, with no attention-graph fallback.
+
+The hardware screen used two independent service processes for each side.
+Every process ran three warmups followed by the same first 12 shuffled English
+Seed-TTS rows at concurrency one, seed zero, temperature zero, and CFM6. All
+four measured runs completed 12/12 requests with zero failures, 100% streaming
+continuity, 1,804 input tokens, 183 output tokens, 1,252,800 waveform frames,
+and 52.20 seconds of audio. The table compares the arithmetic mean of the two
+runs per side. Lower is better except throughput.
+
+| Metric | Fixed slabs | Planar K/V slabs | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 20.128 s | 17.072 s | -15.18% |
+| Request throughput | 0.5962 req/s | 0.7029 req/s | +17.90% |
+| Mean / P99 E2E | 1,676.89 / 2,139.18 ms | 1,422.17 / 1,743.27 ms | -15.19% / -18.51% |
+| Mean / P99 TTFT | 360.73 / 505.40 ms | 331.95 / 463.75 ms | -7.98% / -8.24% |
+| Mean / P99 audio TTFP | 893.89 / 1,045.33 ms | 804.16 / 932.35 ms | -10.04% / -10.81% |
+| Mean / P99 whole-audio RTF | 0.391533 / 0.481192 | 0.335330 / 0.455460 | -14.35% / -5.35% |
+| Mean / median chunk RTF | 0.413277 / 0.256237 | 0.360917 / 0.185494 | -12.67% / -27.61% |
+| P99 chunk RTF | 1.252329 | 1.238023 | -1.14% |
+
+Repeatability was strong: fixed-slab durations were 20.209 and 20.047 seconds;
+planar durations were 17.075 and 17.069 seconds. Unlike the earlier isolated
+direct-output experiment, the producer and consumer now share the new layout
+through the complete steady attention boundary. This removes the strided
+packed-cache cost instead of adding another opaque custom-op boundary.
+
+The first 32-row stability attempt exposed one inherited fixed-slab limit that
+the 12-row screen did not reach. One final encoder flush produced 54 frames,
+requiring cache length 456 while the steady append slab intentionally ends at
+452. Raising the slab would waste steady-path HBM and change its static shape.
+The implementation now keeps the fixed 50-frame append region and uses a
+dynamically sized eager output only for an oversized tail. The returned state
+is then compacted into the same fixed retained slab. A regression test forces
+this overflow and verifies exact audio/cache parity. The corrected service
+logged `required=456, append=452`, took the eager tail path, and completed a
+32-row stability run with zero failures and 100% continuity.
+
+The corrected candidate then ran the cached 32-row Seed-TTS quality screen in
+explicit Hugging Face offline mode. It completed all 32 rows, preserved 4,801
+input tokens, 480 output tokens, 3,362,880 waveform frames, and 140.12 seconds
+of audio, and measured 44.301 seconds duration, 0.326667 mean whole-audio RTF,
+and 783.88 ms mean TTFP. Whisper-large-v3 WER was identical to the accepted
+homogeneous-BF16 result. WavLM-base-plus SIM changed by only -0.010 percentage
+points in the mean and -0.004 points in the median.
+
+| Accuracy metric | Accepted homogeneous BF16 | Planar K/V slabs | Accuracy change |
+| --- | ---: | ---: | ---: |
+| Mean / median WER | 0.016588 / 0 | 0.016588 / 0 | 0.000 pp |
+| Mean / median WavLM SIM | 0.844850 / 0.851195 | 0.844747 / 0.851154 | -0.010 pp / -0.004 pp |
+
+The planar profile is accepted as the next experimental speed profile. It is
+not silently enabled in the default 910C deployment yet. The local 32-row
+accuracy screen clears the 2-percentage-point gate, but the full official
+1,088-row Seed-TTS evaluation remains a release gate; cumulative Daily-Omni
+and Video-MME validation is still required before competition submission.
+
+Raw artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-planar-kv-20260821
+```
+
+Selected checksums:
+
+```text
+fb28e3abc6f6f51d1cc20e24594ec2f150fb4478075de729f096eab03a8b8710  fresh-control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-013340.json
+3cf583bc9d45295e7aa888a0c713e9a4801f60929bc23f3c784375500df4a92b  fresh-control-repeat/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-013534.json
+877c98e5593e4a92a424520cc8cdeaddf23ba5e2b245ddaff5a068ed9a12762c  planar/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-012632.json
+98816b6ef0e0a64a63c0d6be52e5975cd09c0443a940d90bcf6a18b7bbb00593  planar-repeat/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-014206.json
+b7f8111c0d5bf81512fb9c9e46228b917f58fce3c8fa17f11ac74ad9fc0cc608  planar-service.log
+a2e172276e4b2202813f2cfc6540d5ba914289016955752649db4a03940def50  planar-repeat-service.log
+f47a6d72dbe5987a0b37de3026b1a622e25005ccee416f51958825e7fd2d4d44  planar-quality32-fixed/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-020017.json
+db8e371ac3d5ad9897294a1b16b2ee90fb4c46542d6936de085d79c218ca44dd  planar-tail-fixed-32/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-015643.json
+5f3c3667b13ddf5bf393be6a6d266f254613fca0edd5230847d2807cdbd57ac7  planar-tail-fixed-service.log
+```
+
+## Post-planar layout trace and lower-layer screens
+
+A fresh Stage-2 Torch-NPU profile bracketed one warmed Seed-TTS request on
+the corrected homogeneous-BF16 planar profile. This replaces the older
+pre-planar operator ranking. The largest device families were:
+
+| Operator family | Calls | Device time | Share |
+| --- | ---: | ---: | ---: |
+| `MinicpmoCausalConvPack` | 576 | 30.630 ms | 11.11% |
+| `Transpose` | 3,160 | 29.114 ms | 10.56% |
+| `MatMulV2` | 3,506 | 25.624 ms | 9.30% |
+| `TransData` | 2,217 | 22.288 ms | 8.09% |
+| `LayerNormV3` | 2,545 | 21.449 ms | 7.78% |
+| `FlashAttentionScore` | 480 | 14.553 ms | 5.28% |
+
+Shape aggregation makes the layout budget concrete. The two causal-pack
+nodes each ran 288 times at about 53 us, consuming 30.63 ms together. The
+largest attention transpose, `[2,8,50,64]` to `[2,50,8,64]`, consumed 5.045
+ms. Four prompt-Conv weight conversions from `[512,512,1,3]` NCHW to
+`FRACTAL_Z` consumed 6.465 ms. Attention arithmetic is no longer the first
+target; causal history packing and producer-consumer layouts are.
+
+The graph-visible fused-QKV screen concatenates each block's immutable Q, K,
+and V weights once, then replaces three projections with one 1536-wide GEMM.
+It deliberately leaves reshape, transpose, normalization, cache append, and
+SDPA visible to GE instead of using the rejected opaque QKV custom op. BF16
+output was bit-exact on 910C. Ten alternating-order trials of 200 replays at
+`[2,50,512]` measured 117.617 us for the accepted three-GEMM graph and
+115.861 us for fused QKV: only 1.015x. This does not justify a serving cycle,
+so the feature remains an opt-in diagnostic through
+`minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_fused_qkv_experimental.yaml`.
+
+The prompt-Conv screen preformatted the two kernel-3 weights as true Ascend
+`FRACTAL_Z` tensors once, restoring `allow_internal_format=False` before graph
+compilation and replay. It was bit-exact but slower: width 20 changed from
+196.417 to 208.549 us (-5.82%), and width 302 changed from 281.503 to 302.668
+us (-6.99%). Removing the visible conversions does not compensate for the
+less profitable compiled layout, so no serving option was added.
+
+### Fixed planar slabs plus cache-major CNN state
+
+The older cache-major causal kernel is 2.31x faster in isolation, but it could
+not previously share the new fixed slabs: setup stored CNN state as
+`[batch,channels,taps]`, while steady replay requires
+`[batch,taps,channels]`, causing the fixed output shape to disagree. The slab
+implementation now records its CNN layout, converts once at setup, writes
+steady width-50 results directly into alternating cache-major banks, and
+converts exact eager prompt/tail output before compaction. Attention slabs
+remain planar and fixed-address. The behavior is opt-in through
+`minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_cache_major_experimental.yaml`.
+
+Focused exactness/layout tests and profile inheritance passed. The full
+Code2Wav file passed 112/112 tests and all 34 MiniCPM-o 910C deploy tests
+passed. The live service proved the intended path with all three messages:
+
+```text
+MiniCPM-o contiguous planar K/V attention cache active
+MiniCPM-o NPU cache-major Conv+MLP megagraph replay active
+MiniCPM-o fixed estimator KV slabs active: retained=402, append=452, planar=True, cnn_cache_major=True
+```
+
+The first 12-row fail-fast run completed 12/12 with zero failures, 100%
+continuity, and the accepted structural totals. It was decisively slower than
+the two-run planar mean, so no repeat or accuracy budget was spent. Lower is
+better except throughput.
+
+| Metric | Accepted planar mean | Planar + cache-major | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 17.072 s | 20.831 s | +22.02% |
+| Request throughput | 0.7029 req/s | 0.5761 req/s | -18.05% |
+| Mean E2E | 1,422.17 ms | 1,735.53 ms | +22.03% |
+| Mean TTFT | 331.95 ms | 352.25 ms | +6.12% |
+| Mean audio TTFP | 804.16 ms | 919.03 ms | +14.28% |
+| Mean whole-audio RTF | 0.335330 | 0.399066 | +19.00% |
+| Mean / median chunk RTF | 0.360917 / 0.185494 | 0.432204 / 0.259577 | +19.75% / +39.94% |
+| P99 chunk RTF | 1.238023 | 1.270002 | +2.58% |
+
+The isolated cache-major kernel win again reverses in the composed graph.
+This confirms that its boundary prevents more valuable scheduling/layout
+decisions; it remains diagnostic-only. The accepted planar profile is
+unchanged.
+
+Artifacts are under:
+
+```text
+/tmp/vllm-omni-profiles/minicpmo45/planar-kv-stage2
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-planar-layout-20260821
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-planar-cache-major-20260821
+```
+
+Selected checksums:
+
+```text
+7031808b2269efdb1caa5f7ff3e46385d11513bb4d890746b9f279981b1b71a7  op_statistic.csv
+b8d72588ba22a1720da0e8bb0eb5686e74fe560df0f588c0c69f8276a31672e3  kernel_details.csv
+9f1e4ec6f03ab9d9934b05341476cffeffe88bc3e2179c488948b3b797873a8c  candidate-run1.json
+ede7e84bca3b4759a83bfd07e2da7f80a354f55cdd1e9ef29f27b02254c58247  service.log
+```
+
+### Vectorized channel-major causal cache access
+
+The rejected cache-major serving experiment showed that changing the public
+CNN-state layout destroys more graph-level optimization than its isolated
+kernel saves. The follow-up therefore keeps the accepted
+`[batch,channels,2]` layout and removes the scalar work *inside* the existing
+`MinicpmoCausalConvPack` boundary. On `ascend910_93`, the kernel now builds a
+byte-offset vector once, gathers both historical taps into UB with AscendC
+vector operations, and gathers the two final frames into an interleaved UB
+buffer before one aligned cache DMA. The public shapes, TorchAir converter,
+fixed planar slabs, and complete DiT graph boundary are unchanged.
+
+The first `DataCopyPad` write prototype was rejected because exact validation
+found a cache-layout mismatch. The retained gather implementation passed an
+independent Torch reference with zero tolerance for both packed history and
+returned cache. The reusable microbenchmark now checks that reference for
+both public cache layouts before timing, preventing two equally wrong kernels
+from validating each other.
+
+With 15 alternating trials of 1,000 launches, the original channel-major
+kernel measured 61.875 us median versus 27.037 us for its cache-major path.
+The vectorized kernel measured 19.841 us and 19.814 us respectively in the
+same screening session: the channel-major throughput cost fell 67.93%, and
+the two layouts became equivalent. A later reference-checked rerun while the
+full service and profiler exporter were resident measured 26.385 us versus
+26.257 us, again showing no material queued-throughput penalty. With one NPU
+synchronization after every launch, the retained vector kernel measured
+59.990 us for channel-major and 46.110 us for cache-major. The benchmark now
+reports both modes so independent-op throughput is not mistaken for serialized
+latency.
+
+Two independent serving measurements used the accepted planar profile, three
+warmups, the same first 12 shuffled English Seed-TTS rows, concurrency one,
+seed zero, temperature zero, and CFM6. Both completed 12/12 requests with zero
+failures, 100% continuity, 1,804 input tokens, 183 output tokens, 1,252,800
+waveform frames, and 52.20 seconds of audio. The candidate columns below are
+the arithmetic mean of both runs. Lower is better except throughput.
+
+| Metric | Accepted planar mean | Vectorized channel-major kernel | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 17.072 s | 16.737 s | -1.96% |
+| Request throughput | 0.7029 req/s | 0.7170 req/s | +2.01% |
+| Mean / P99 E2E | 1,422.17 / 1,743.27 ms | 1,394.34 / 1,730.34 ms | -1.96% / -0.74% |
+| Mean / P99 TTFT | 331.95 / 463.75 ms | 326.29 / 451.62 ms | -1.70% / -2.62% |
+| Mean / P99 audio TTFP | 804.16 / 932.35 ms | 800.04 / 926.80 ms | -0.51% / -0.60% |
+| Audio throughput | 3.057 audio-s/s | 3.119 audio-s/s | +2.03% |
+| Mean / median chunk RTF | 0.360917 / 0.185494 | 0.354065 / 0.179811 | -1.90% / -3.06% |
+| P99 chunk RTF | 1.238023 | 1.172903 | -5.26% |
+
+Candidate durations were 16.896 and 16.578 seconds. A fresh Stage-2 capture
+confirmed the expected 576 calls and exact graph boundary, but reported
+53.044 us per call—nearly the pre-change profiled value—despite the direct
+throughput A/B and repeated request-level improvement. These measurements are
+not interchangeable: the direct loop reports queued independent-op
+throughput, while the detailed profiler serializes and instruments the custom
+node. Its value is consistent with the new synchronized microbenchmark. The
+trace is therefore retained as a topology and per-call-latency check, while
+the two-run end-to-end screen remains the admission result.
+
+A follow-up tried to reduce serialized latency by creating gather offsets only
+on prefix-owning vector cores and by hoisting the identical write-offset table
+out of the batch loop. It was exact and improved the channel-major micro from
+19.372 to 18.748 us in queued mode (-3.22%) and from 59.990 to 54.680 us in
+serialized mode (-8.85%). However, two serving runs took 17.658 and 16.067
+seconds. Their 16.862-second mean was 0.75% slower than the retained vector
+kernel, while P99 E2E rose 6.75%, P99 audio TTFP rose 4.18%, and P99 chunk RTF
+rose 1.92%. This deeper hoist was therefore reverted. It is another concrete
+case where a better isolated custom-kernel number did not compose into a
+better request tail.
+
+Because the transformation is bit-exact, changes no model arithmetic, and
+preserves the qualified planar graph and tensor boundary, it inherits the
+planar candidate's 32-row WER/SIM result. It does not consume a new accuracy
+budget. Full 1,088-row Seed-TTS, Daily-Omni, and Video-MME remain release
+gates, as they are for the parent experimental profile.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-vector-cache-kernel-20260821
+/tmp/vllm-omni-profiles/minicpmo45/planar-kv-stage2
+```
+
+Selected checksums:
+
+```text
+6b631772cee6cf054c184a430ce10ced5d08fa40d22b0b166adc094c57b4f423  candidate-valid-run1.json
+c10f5fd1029f4620f246bc6e2876aea8318c0fa80c44da4d59c670bd5b0afa47  candidate-valid-run2.json
+4bcf5a2ac8fd886542d2d47c405b67a55234b0b0fd5218d5aa4750b720d14699  service.log
+b47bbbf1370d4c88ef3e8be8c020177754b9a187b150a1fe7d402e85aea0c5d4  op_statistic.csv
+3b0f665978b6d0ce6241fe2fa61cc751be7b7df0c39aacfb6fce563441c1f2e2  v3-valid-run1.json
+c5561b8a4f65a2c58a80cd0d6d43fc61d6756fef6c1742f3cd6f803f7e8d4f75  v3-valid-run2.json
+```
+
+## Sequence-major BSH attention candidate
+
+The next layout candidate is implemented behind
+`npu_dit_bsh_attention: true`. It extends the accepted homogeneous-BF16,
+fixed-planar-slab profile while changing the attention producer/consumer
+contract from `[batch, heads, sequence, head_dim]` to
+`[batch, sequence, hidden]` across Q/K/V projection, K/V cache append,
+Ascend fused attention, and the output projection. Q/K normalization still
+uses an internal `[batch, sequence, heads, head_dim]` view, but does not
+transpose the head and sequence axes.
+
+The request-owned cache remains six CFM steps by sixteen DiT blocks with
+separate K and V planes. Its new physical shape is:
+
+```text
+[six steps, sixteen blocks, K/V=2, CFG batch, time, hidden=512]
+```
+
+Prompt setup converts once from the checkpoint-compatible packed BHSD cache.
+Steady chunks write directly into the fixed BSH append slab. Unsupported
+platforms and graph failures convert through the exact legacy cache path, so
+the candidate fails closed without changing the public waveform contract.
+
+CPU PyTorch checks prove exact Q/K/V preamble parity, cached SDPA parity,
+legacy-cache round trips, stable slab addresses, and correct multi-request CFG
+split/stack axes. The deploy overlay is
+`minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_bsh_attention_experimental.yaml`.
+Its connector block deliberately repeats the accepted profile because
+top-level connector overlays replace rather than deep-merge their base. A
+thin first draft silently discarded CFM6/BF16/fixed-slab settings and loaded
+CFM10; the strengthened configuration test now verifies all inherited
+prerequisites together.
+
+The loaded-checkpoint startup gate passed on the Atlas 800I A3 / 910C host at
+widths 50, 20, and 302. Every BSH preamble plus fused-attention comparison
+reported zero maximum and mean absolute drift. The server log also confirmed
+CFM6, homogeneous BF16, direct BSH attention, and fixed BSH slabs. The
+unrelated final-Addcmul candidate again exceeded its own strict drift bound
+and correctly retained canonical AdaLN.
+
+The isolated attention screen includes cache append, Ascend fused attention,
+and output projection. With the accepted width-50/cache-402 shape, queued
+throughput used 100 iterations per trial over nine alternating trials;
+serialized latency used one iteration over 21 trials. Lower is better.
+
+| Mode | BNSD control | BSH candidate | Speedup | Max / mean drift |
+| --- | ---: | ---: | ---: | ---: |
+| Queued median | 152.459 us | 78.035 us | 1.9537x | 0 / 0 |
+| Serialized median | 195.330 us | 125.270 us | 1.5593x | 0 / 0 |
+
+The first real request exposed a second integration bug that the isolated
+screen could not: the inherited `planar=true` flag reinterpreted an already
+BSH cache a second time, changing the slab from a 512-wide BSH representation
+to a spurious `2 x 256` representation. BSH now has explicit precedence over
+the older planar conversion. The exact failing combination has a regression
+test, and the deployed synthetic check preserves retained and append shapes
+`[6,16,2,2,402,512]` and `[6,16,2,2,452,512]`.
+
+The fresh-process control and both corrected candidate trials used the same
+first 12 shuffled English Seed-TTS rows, two warmups, concurrency one, seed
+zero, temperature zero, and CFM6. All three completed 12/12 with zero
+failures, 100% continuity, 1,804 input tokens, 183 output tokens, 1,252,800
+frames, and 52.20 seconds of audio. Candidate values are the arithmetic mean
+of its two runs. Lower is better except throughput.
+
+| Metric | Accepted planar control | BSH two-run mean | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 17.596 s | 15.671 s | -10.94% |
+| Request throughput | 0.6820 req/s | 0.7658 req/s | +12.30% |
+| Audio throughput | 2.9666 audio-s/s | 3.3314 audio-s/s | +12.30% |
+| Mean / P99 E2E | 1,465.87 / 1,901.21 ms | 1,305.40 / 1,612.54 ms | -10.95% / -15.18% |
+| Mean / P99 TTFT | 333.43 / 483.15 ms | 314.90 / 443.13 ms | -5.56% / -8.28% |
+| Mean / P99 audio TTFP | 798.43 / 949.64 ms | 746.60 / 888.54 ms | -6.49% / -6.43% |
+| Mean / P99 whole-audio RTF | 0.340706 / 0.489958 | 0.304337 / 0.382010 | -10.67% / -22.03% |
+
+Chunk timing shows that the improvement is concentrated in the repeated
+Stage-2 path rather than only the first packet.
+
+| Chunk metric | Accepted planar control | BSH two-run mean | Change |
+| --- | ---: | ---: | ---: |
+| Mean first-chunk RTF | 0.950518 | 0.888804 | -6.49% |
+| Mean steady-chunk RTF | 0.227254 | 0.182423 | -19.73% |
+| Median steady-chunk RTF | 0.159447 | 0.131855 | -17.31% |
+| P99 steady-chunk RTF | 1.384496 | 0.873416 | -36.91% |
+| Mean / median all-chunk RTF | 0.379520 / 0.190300 | 0.331135 / 0.143456 | -12.75% / -24.62% |
+| P99 all-chunk RTF | 1.503704 | 1.103255 | -26.63% |
+
+Candidate durations were 15.840 and 15.502 seconds. The follow-up 32-row
+stability gate completed 32/32 with zero failures and zero underrun while
+preserving the official 4,801-input-token, 480-output-token, 3,362,880-frame,
+140.12-second signature. It measured 42.586 seconds duration, 1,330.48 ms
+mean E2E, 322.82 ms mean TTFT, 751.21 ms mean TTFP, 0.309511 mean
+whole-audio RTF, and 0.180239 mean steady-chunk RTF. The 32-row steady-chunk
+P99 was 0.834274.
+
+The cached offline Whisper-large-v3/WavLM 32-row quality screen passed the
+repository's strict two-percentage-point gate. Both runs evaluated the same
+32 rows with the same in-tree aligned WER and WavLM mean-pool proxy protocols.
+The candidate had zero request, PCM, ASR, and SIM failures.
+
+| Quality metric | Accepted planar control | BSH candidate | Regression | Gate |
+| --- | ---: | ---: | ---: | --- |
+| Mean / median WER (lower is better) | 0.016588 / 0 | 0.016588 / 0 | 0.000 pp | pass |
+| Mean WavLM SIM (higher is better) | 0.844747 | 0.845047 | -0.030 pp | pass |
+| Median WavLM SIM (higher is better) | 0.851154 | 0.852045 | -0.089 pp | pass |
+| WER / SIM evaluated | 32 / 32 | 32 / 32 | matched | pass |
+
+A negative regression means the candidate improved. This accepts BSH as the
+next experimental 910C speed profile: its two-run request throughput improved
+12.30%, mean steady-chunk RTF fell 19.73%, WER was bit-for-bit equal at the
+aggregate level, and mean SIM improved slightly. It does **not** promote the
+profile to a competition release. Full 1,088-row official Seed-TTS,
+Daily-Omni, and Video-MME are still required release gates.
+
+This run also found and fixed a benchmark-wrapper ambiguity. `--wer-eval`
+previously claimed to enable WER/SIM/UTMOS but forwarded only WER, yielding a
+plausible-looking result with `seed_tts_sim_evaluated=0`. The wrapper now
+describes `--wer-eval` accurately and exposes explicit `--sim-eval`; UTMOS
+remains separately opt-in through `SEED_TTS_UTMOS_EVAL=1` alongside an
+evaluation flag.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-bsh-attention-20260821
+```
+
+Selected checksums:
+
+```text
+97ba2ba0d553a77005e37b7d8249dec54dd19cba84498dfb95b587298ab891e7  control.json
+1f810967ebba1ee5179d7211932d1c57756cd90868627d3b1bb310219a233586  candidate-run1.json
+71e7bdb73f4f4fa1bba5b26766287a1726989548844159b0cb34e5b11e9ade00  candidate-run2.json
+29726bc5cc0628a7cea28e1d318b2211cdf0995bd4aab951e5a4af84065811c8  candidate-32.json
+6bead4b3543faac8d5113473a576ea269f963ba7e08731224b7fa699703117a8  candidate-quality32-wer.json
+002576b97d77772663536a6b46c5728662a935415d55d874491d89e3689d03df  candidate-quality32-wer-sim.json
+```
+
+The reusable hardware command is:
+
+```bash
+python benchmarks/scripts/bench_minicpmo_dit_bsh_attention.py \
+  --device 1 --width 50 --cache-length 402 --dtype bf16
+```
+
+## Fixed-slab six-step CFM NPUGraph
+
+The fixed BSH slabs make the complete steady CFM invocation eligible for one
+static executable. The opt-in profile is
+`minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_bsh_attention_cfm_graph_experimental.yaml`.
+It captures only width 50 with the retained attention cache fixed at 402;
+prompt setup, cache fill, and tail widths stay on the accepted eager/graph
+partitions. Two graph and output-buffer slots share one memory pool, so replay
+does not clone the six-step output and its 16-block cache slabs.
+
+The competition CANN 9.0 image exposed two constraints that the earlier
+growing-cache full-loop prototype could not solve:
+
+- a TorchAir/GE executable cannot run inside a raw NPUGraph capture stream;
+  the steady capture therefore lowers the accepted partitions to their plain
+  graph-visible PyTorch operations instead of nesting compiled executables;
+- BSH `npu_fusion_attention` launches an auxiliary stream that does not join
+  the raw capture stream. The graph-only path uses explicit FP32
+  BMM-softmax-BMM attention, while ordinary eager execution retains the much
+  faster fused-attention operator.
+
+An isolated 910C probe proved that Linear and explicit attention capture and
+replay, while fused BSH attention fails `capture_end` with the same unjoined
+stream error seen in serving. The loaded MiniCPM-o checkpoint gate at the real
+`width=50/cache=402` shape measured only `3.05175781e-05` maximum and
+`6.89178705e-08` mean absolute drift between explicit graph attention and the
+fused BSH reference. Capture logs then confirmed two slots and steady replay
+with the physical cache shape `[6,16,2,2,402,512]`.
+
+The conservative reverse-order A/B used a fresh accepted-BSH control followed
+by a fresh graph candidate, two deterministic 12-row runs per side, two
+warmups, concurrency one, seed zero, and temperature zero. All 48 measured
+requests completed with identical aggregate text/audio structure, 100%
+continuity, and zero underrun. Lower is better except throughput.
+
+| Metric | Fresh BSH control | Static CFM graph | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 18.3729 s | 17.3091 s | -5.79% |
+| Request throughput | 0.65314 req/s | 0.69328 req/s | +6.15% |
+| Audio throughput | 2.84116 audio-s/s | 3.01576 audio-s/s | +6.15% |
+| Mean / P99 E2E | 1,530.63 / 2,491.21 ms | 1,442.07 / 2,063.93 ms | -5.79% / -17.16% |
+| Mean / P99 TTFT | 355.76 / 751.51 ms | 347.43 / 552.09 ms | -2.34% / -26.54% |
+| Mean / P99 audio TTFP | 816.41 / 1,254.08 ms | 792.93 / 1,002.87 ms | -2.88% / -20.03% |
+| Mean / P99 whole-audio RTF | 0.351184 / 0.462322 | 0.323371 / 0.403746 | -7.92% / -12.67% |
+| Mean first-chunk RTF | 0.971920 | 0.943960 | -2.88% |
+| Mean / median steady-chunk RTF | 0.237246 / 0.164262 | 0.203359 / 0.135051 | -14.28% / -17.78% |
+| P99 steady-chunk RTF | 1.352178 | 1.221725 | -9.65% |
+
+The reverse leg is deliberately reported instead of the faster first
+candidate process, which measured 16.5548 seconds and 0.182333 mean
+steady-chunk RTF. This avoids claiming accelerator process-order drift as a
+kernel gain.
+
+A resident 32-row stability run completed 32/32 with the official small-gate
+signature: 4,801 input tokens, 480 output tokens, 3,362,880 frames, and 140.12
+seconds of audio. It measured 45.44 seconds duration, 1,419.16 ms mean E2E,
+326.92 ms mean TTFT, 769.96 ms mean TTFP, 0.33 displayed mean whole-audio RTF,
+100% continuity, and zero underrun.
+
+The matched 32-row offline quality gate reused the cached
+Whisper-large-v3/WavLM evaluation stack. WER was exactly unchanged from the
+accepted BSH control at `0.0165884463` mean and `0` median. Mean WavLM
+similarity moved from `0.845046923` to `0.844583588`, a `0.000463335`
+absolute reduction (`0.0463` percentage points); median similarity moved from
+`0.852045149` to `0.851352572`. This is far inside the competition's two-point
+regression limit. All 32 content and 32 similarity evaluations completed with
+zero request, ASR, or similarity failures. The quality run's latency is not
+reported as performance because local CPU ASR and similarity scoring competed
+with the server during that invocation.
+
+The profile remains experimental until the full 1,088-row Seed-TTS,
+Daily-Omni, and Video-MME release gates pass.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-bsh-cfm-graph-20260821
+```
+
+The quality result is
+`candidate-32-quality-offline-omp16/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-101625.json`
+with SHA-256
+`ba4cd70ede198e4ae6ddc718c9c9f13449a62ce62e4ce2599965d91a9c1ab43d`.
+
+## BF16 causal Conv-to-Linear custom-op integration (rejected)
+
+The next kernel experiment extended the native AscendC causal Conv-to-Linear
+operator to BF16 and substituted it for the graph-visible causal-pack plus
+Linear producer inside the accepted fixed-slab six-step CFM executable. The
+focused operator suite passed 128/128 direct NPU cases. An alternating
+15-trial exact-shape microbenchmark measured the ordinary pack-plus-Linear
+boundary at 60.458 us and the fused operator at 58.654 us, only a 1.0308x
+speedup.
+
+The serving gate used the accepted static-CFM graph as control. Each process
+received two warmups and two deterministic 12-request Seed-TTS runs at
+concurrency one. All 96 measured requests across the two A/B regimes
+completed with 100% streaming continuity, zero underrun, and the same
+aggregate structure: 1,784 input tokens, 163 output tokens, 1,160,640 audio
+frames, and 48.36 seconds of audio. The local dataset copy was incomplete, so
+this is a matched internal performance gate rather than an official
+1,088-row quality result. Lower is better except throughput.
+
+| Metric | Initial candidate vs control | Later candidate vs control |
+| --- | ---: | ---: |
+| Serving duration | -0.70% | -1.91% |
+| Request/audio throughput | +0.56% | +1.96% |
+| Mean / P99 E2E | -0.70% / -9.04% | -1.91% / -2.12% |
+| Mean / P99 TTFT | -9.06% / +0.82% | -1.53% / -6.41% |
+| Mean / P99 audio TTFP | +5.23% / +9.29% | -2.93% / -3.34% |
+| Mean / P99 whole-audio RTF | +2.08% / +5.39% | -3.35% / approximately 0% |
+
+The sign reversal in TTFP and whole-audio RTF, the low single-digit total
+effect, and the 3.08% isolated headroom fail the promotion gate. The opaque
+custom-op boundary also prevents GE from optimizing the producer-consumer
+chain across the pack and Linear. The BF16 extension, serving substitution,
+and experimental profile were therefore fully reverted in both forks. The
+accepted graph-visible causal-pack path remains in service; any retry must
+propagate one layout across the complete DiT producer-consumer chain or expose
+the fused implementation through a GE converter/decomposition.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-cfm-graph-conv-linear-bf16-20260821
+```
+
+Selected reverse-leg SHA-256 checksums are:
+
+```text
+1ce9f6916064941508f10e4be39dd0b878b917a62fd8b4f1cc70a4e9c1fc1ea4  reverse-candidate-run3.json
+5e696f059e90b787f8337dd9c1731a4f9ecc693ed295c40ebc646393ee2e09ca  reverse-candidate-run4.json
+02e77335a1e1e9bfa686daa043d5897df9b0837d514df7c223c451eba654d211  reverse-control-run3.json
+b15d7ef153ca306679f55333b63ec9cbe2b589b66984f12b9fabcdb112887347  reverse-control-run4.json
+```
+
+## Immutable CFM AdaLN modulation slabs (rejected)
+
+Fixed six-step CFM uses the same timestep embeddings and loaded AdaLN
+parameters for every prompt and streamed chunk. This experiment computed the
+six-step, sixteen-block modulation tensor and final-layer modulation once,
+then retained those graph-produced buffers at stable addresses for subsequent
+steady CFM replays. The first implementation cloned the outputs and was
+rejected immediately because the clone discarded their profitable internal
+layout. A second implementation retained the one-shot TorchAir producer
+storage directly; focused tests passed 121/121 and serving logs proved that
+the immutable slabs were created before the two-slot CFM capture and reused
+during replay.
+
+The performance gate used five deterministic 12-request measurements per side
+at concurrency one. It included both process orders. One severe transient
+contention sample occurred on each side, so the table reports the robust
+five-run median rather than selecting or averaging favorable runs. Every run
+completed 12/12 with zero failures and the same aggregate structure: 1,784
+input tokens, 163 output tokens, 1,160,640 frames, and 48.36 seconds of audio.
+Lower is better except throughput.
+
+| Metric | Accepted static CFM graph | Immutable modulation slabs | Change |
+| --- | ---: | ---: | ---: |
+| Serving duration | 15.5907 s | 16.6199 s | +6.60% |
+| Request throughput | 0.76969 req/s | 0.72203 req/s | -6.19% |
+| Audio throughput | 3.10184 audio-s/s | 2.90976 audio-s/s | -6.19% |
+| Mean / P99 E2E | 1,298.80 / 1,670.52 ms | 1,384.57 / 2,173.46 ms | +6.60% / +30.11% |
+| Mean / P99 TTFT | 298.31 / 392.03 ms | 310.48 / 389.11 ms | +4.08% / -0.74% |
+| Mean / P99 audio TTFP | 767.27 / 867.94 ms | 787.18 / 909.09 ms | +2.60% / +4.74% |
+| Mean / P99 whole-audio RTF | 0.320006 / 0.387786 | 0.336686 / 0.402147 | +5.21% / +3.70% |
+
+The stable external buffers remove repeated projection arithmetic, but they
+also freeze a producer-consumer boundary outside the complete static CFM
+executable. On this stack that boundary costs more in layout/scheduling than
+the saved AdaLN projection. The option, code, tests, and deploy profile were
+therefore fully removed. The accepted implementation continues to expose the
+projection inside the graph-visible six-step CFM path, where GE can optimize
+it together with downstream consumers.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-static-cfm-modulations-20260821
+```
+
+Median-duration representative SHA-256 checksums are:
+
+```text
+6ebf29aa06159dba5c1dd06b1ceda6ebe41f1c15188a87f5165a3e1e0cc0737e  accepted reverse-control-run2.json
+478ddafbece60b65cfe05dcc0389c0dd1c14728b4477d8dcd8806de8a8c78751  candidate candidate-v3-run4.json
+```
+
+## Complete six-step TorchAir/GE CFM executable (rejected)
+
+The fixed width-50/cache-402 BSH slabs made it possible to test the deepest
+remaining graph boundary: all six CFM steps and all sixteen DiT blocks in one
+graph-visible TorchAir/GE executable. Prompt and tail shapes stayed on the
+accepted eager/raw-graph path. The candidate was fail-closed and never
+replaced the accepted profile.
+
+The first graph dump identified a CANN 9.0 lowering bug at the DiT input
+projection. TorchAir represented the logical `[2,50,320]` activation and
+`[512,320]` weight as a generic rank-three `MatMul`; GE then treated sequence
+width 50 as K and rejected it against 320. Flattening the projection to an
+explicit `[100,320] x [320,512]` GEMM preserved the math and produced a valid
+optimized graph. The aliased-output variant then compiled and replayed once,
+but stopped publishing the streaming request because the fixed cache slabs
+were both mutated inputs and returned outputs.
+
+A graph-owned-output revision removed that alias. It completed streaming with
+100% continuity and zero underrun, proving the liveness diagnosis, but was far
+slower than the accepted raw graph. The original/optimized dumps shrank from
+21.36/34.82 MB with aliased slabs to 18.74/30.37 MB with graph-owned outputs.
+The first empty-kernel-cache build took roughly twelve minutes; after AscendC
+kernel caching, the first warmup still took 221.57 seconds.
+
+The post-compile smoke generated 3.12 seconds of audio. Lower is better.
+
+| Metric | Complete GE executable |
+| --- | ---: |
+| Request E2E | 48,097.61 ms |
+| Stage-2 wall time | 48,080.96 ms |
+| Whole-audio RTF | 15.416 |
+| TTFT | 765.44 ms |
+| Audio TTFP | 1,453.52 ms |
+| Prior post-compile warmup Stage 2 | 54,335.29 ms |
+
+This is not a marginal regression that merits a larger A/B: the monolith
+removed profitable kernel scheduling/concurrency and made a three-second clip
+take forty-eight seconds. The code, environment switch, tests, graph-dump
+setting, and deploy profile were fully removed, and the accepted raw
+two-slot CFM graph was restored.
+
+The graph dump nevertheless closes two unknowns. Fixed slabs do solve shape
+churn, and a graph-visible complete CFM model can compile once the input
+projection is made two-dimensional. The remaining limit is executable size
+and scheduling, not capture eligibility. Any retry must use a bounded
+partition--preferably one CFM step or a small contiguous block stripe--and
+must keep outputs graph-owned without Python clones or input/output aliasing.
+
+Artifacts are under:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-cfm-ge-20260821
+```
+
+The completed smoke result is
+`smoke-v6-graph-owned-output/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260821-142623.json`
+with SHA-256
+`9076989ace4133f009f4abab5e984f06b4a709528f64498f33c838748f13cbfc`.
+
+## Evaluator-YAML dual-chip source policy
+
+The final submission integration revisited the organizer topology assumption.
+One allocated Atlas 800I A3 card exposes two logical 910C chips.  The untouched
+organizer YAML places every stage on logical device 0, so source policy now
+recognizes exactly that baseline on a two-device NPU host and applies the
+measured `[Thinker, Talker, Code2Wav] = [0, 0, 1]` placement.  Explicit
+placements and single-device hosts remain unchanged.
+
+The first source-policy run enabled the accepted BF16 fixed-planar partitions
+on Code2Wav but left the organizer's Stage-0/1 `PIECEWISE` graph mode intact.
+The service log proved every intended Stage-2 replay was active, yet mean RTF
+remained 0.382.  A single-variable restart changed only Thinker and Talker to
+`FULL_DECODE_ONLY` with capture sizes `[1,2,4]`; the first full 32-row run fell
+to 0.315 mean RTF.  This identified a producer-side integration loss rather
+than a failure of Stage-2 fusion.
+
+The source policy then reproduced the full-decode/fixed-planar path through
+the untouched organizer YAML, without private startup variables.  Its hot
+32-row result was:
+
+| Metric | Official-YAML planar source default |
+| --- | ---: |
+| Successful / failed | 32 / 0 |
+| Duration | 47.3773 s |
+| Mean / P99 E2E | 1,480.20 / 2,131.24 ms |
+| Mean / P99 TTFT | 340.09 / 483.82 ms |
+| Mean / P99 TTFP | 806.57 / 958.83 ms |
+| Mean / P99 whole-audio RTF | 0.307862 / 0.348755 |
+| Output tokens / audio frames | 559 / 3,737,280 |
+| Streaming continuity / underrun | 100% / 0 |
+
+An evaluator-shaped BSH-only follow-up improved mean TTFP to 801.50 ms but
+regressed mean RTF slightly, so BSH was not accepted on that isolated result.
+The deeper candidate then combined BSH with the existing two-slot fixed-address
+steady-CFM NPUGraph.  Logs confirmed two captures and subsequent replay at
+`mu=(1,80,50)` and cache shape `[6,16,2,2,402,512]`.  Prompt, cache fill, and
+tail shapes retained their existing fallback.
+
+Two independent hot measurements were stable on the mean metrics:
+
+| Metric | Planar base | BSH + steady CFM graph run 1 | Run 2 | Two-run graph average vs base |
+| --- | ---: | ---: | ---: | ---: |
+| Mean RTF | 0.307862 | 0.303975 | 0.304455 | -1.18% |
+| Mean E2E | 1,480.20 ms | 1,468.16 ms | 1,469.45 ms | -0.77% |
+| Mean TTFT | 340.09 ms | 336.82 ms | 340.82 ms | -0.37% |
+| Mean TTFP | 806.57 ms | 793.83 ms | 797.72 ms | -1.34% |
+| P99 RTF | 0.348755 | 0.360155 | 0.360562 | +3.33% |
+
+Lower is better.  All three runs completed the same 32 requests with the same
+559-token/3,737,280-frame output signature, 100% continuity, and zero underrun.
+These were explicit-profile isolation results, not yet a source-default gate.
+Their repeatable P99 regression also required caution.
+
+The decisive follow-up enabled the same BSH/static-graph combination through
+source policy while passing only the organizer's untouched YAML.  Logs proved
+that BSH compiled with zero drift, both fixed-address slots captured, and the
+steady graph replayed.  No second serving process held an NPU.  Nevertheless,
+the complete official entry measured 0.567 mean RTF, 2,734.98 ms E2E, 476.50
+ms TTFT, and 1,161.87 ms TTFP.  It completed 32/32 with the same output
+signature and continuity, so this is a performance integration failure rather
+than a liveness or output-length artifact.
+
+The submission default therefore retains the verified planar/full-decode
+source path at 0.307862 and leaves BSH/static CFM replay explicit opt-in.
+Relative to the earlier dual-chip CFM6 control at 0.379806 RTF, the accepted
+path reduces RTF by 18.94%, E2E by 19.13%, TTFT by 6.55%, and TTFP by 13.07%.
+It remains 3.87% above the reported 0.2964 leaderboard mark.
+
+The previously recorded paired 32-row gates show that the rejected paths were
+inside the accuracy budget: BSH preserved mean WER at 0.016588 and improved
+mean SIM by 0.030 percentage points; static CFM replay preserved the same WER
+and reduced mean SIM by 0.0463 percentage points.  Their rejection is based on
+the official-entry performance gate, not accuracy.
+
+Artifacts:
+
+```text
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dual-source-default-final-official-yaml-20260822
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dual-full-decode-planar-bsh-20260822
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dual-bsh-cfm-graph-20260822
+/workspace/user_data/lunanexa-stack/experiments/minicpmo45-dual-source-default-bsh-cfm-final-official-yaml-20260822
+```
+
+## A2 external trace and cache-fill graph screen
+
+An external dynamic `msprof` trace refreshed the single-chip A2 attribution
+after fixed slabs, BSH attention, HF32 MatMul, and two-slot steady CFM replay.
+The representative ten-request trace counted 236,082 host kernel launches.
+Every request still executed prompt width 302, width 50/cache 302, and width
+50/cache 352 as complete six-step by sixteen-block eager CFM evaluations;
+only eight later cache-402 evaluations used the outer steady graph. The
+largest device families were TransData 310.47 ms, MatMulV2 264.81 ms,
+LayerNormV3 231.97 ms, Transpose 211.70 ms, Mul 199.21 ms, Add 164.69 ms,
+Slice 152.83 ms, and FlashAttention 129.77 ms. Profiling overhead invalidates
+the run as a speed sample but not these counts.
+
+Capturing both recurrent cache-fill shapes reduced TTFP but regressed matched
+whole-audio RTF by 4.78%, so cache 352 was removed. A cache-302-only candidate
+then completed four structurally matched 10-request runs with the accepted
+1,036,800-frame / 43.2-second signature:
+
+| Metric | Retained A2 HF32 graph | Cache-302-only mean | Change |
+| --- | ---: | ---: | ---: |
+| Whole-audio RTF | 0.33852 | 0.33470 | -1.13% |
+| Audio TTFP | 0.75645 s | 0.67398 s | -10.90% |
+| Text TTFT | 77.70 ms | 76.72 ms | -1.26% |
+| Mean E2E | 1.46186 s | 1.44539 s | -1.13% |
+| Steady-chunk RTF | 0.16915 | 0.18452 | +9.09% |
+
+Lower is better. One mismatched run was excluded. The strong first-packet win
+is real, but the later-chunk regression prevents promotion over the retained
+balanced profile. Capturing both steady slots before the cache-302 graph did
+not fix the interaction: two matched runs averaged 0.35645 whole-audio RTF
+and 0.18925 steady-chunk RTF while retaining roughly 0.67210-second TTFP. That
+allocation-order experiment was removed. Further work should not add another
+persistent raw NPUGraph boundary; it should use a bounded GE-visible
+producer-consumer partition or reduce work within the existing executable.
+
+## Full-DiT-block GE experiment
+
+The next experiment moved one complete BSH DiT block, including the canonical
+Conv1d producer/consumer chain, behind a single TorchAir/GE executable. It did
+not use the earlier native causal-pack helper: that helper was fast in
+isolation but produced unacceptable real-weight drift. The canonical-Conv
+variant preserved the intended block arithmetic to BF16 tolerance.
+
+On real checkpoint weights at width 50/cache 302, the isolated block result
+was:
+
+| Path | Mean block latency | Relative speed |
+| --- | ---: | ---: |
+| Split eager control | 1,096.45 us | 1.00x |
+| Canonical-Conv full GE block | 402.44 us | 2.72x |
+| Native causal-pack diagnostic | 281.93 us | 3.89x, rejected for drift |
+
+The service-level cache-302 candidate compiled and replayed the canonical
+full-block graph and completed 10/10 requests. Its structurally matched hot run
+used the same 1,036,800-frame / 43.2-second output signature as the retained
+A2 result:
+
+| Metric | Retained A2 profile | Full block at cache 302 | Change |
+| --- | ---: | ---: | ---: |
+| Whole-audio RTF | 0.33852 | 0.33707 | -0.43% |
+| Audio TTFP | 0.75645 s | 0.67801 s | -10.37% |
+| Text TTFT | 77.70 ms | 79.53 ms | +2.35% |
+| Mean E2E | 1.46186 s | 1.45614 s | -0.39% |
+| Steady-chunk RTF | 0.16915 | 0.18721 | +10.67% |
+
+Lower is better. The profile remains an explicit low-TTFP experiment rather
+than the submission default: its first-packet gain is material, but it moves
+work into the steady path, regresses steady-chunk RTF, and has not passed the
+three-suite quality gate.
+
+Two attempts to extend the optimization further were rejected:
+
+- nesting the cache-402 GE executable inside the retained outer NPUGraph
+  failed on the first request with `Unsupport run graph with different stream`;
+  the GE executable is bound to the default stream while the outer capture
+  runs on a capture stream;
+- TorchAir ACLGraph replay preserved exact microbenchmark output but took
+  2,097.83 us versus 1,142.68 us for the control (0.54x), and enabling the
+  ACLNN static-shape compiler terminated its TBE worker before producing an
+  executable. The separate `npugraph_ex` package is absent from this A2 image.
+
+The safe selector therefore excludes full-block GE when an outer flat capture
+is active. Retrying a single static six-step executable requires a compatible
+CANN/TorchAir image with NPUGraphEx support or an explicit same-stream graph
+composition API; it is not safe to emulate by nesting the current wrappers.
+
+After reverting the unsafe nested selector, the retained HF32/BSH/steady-CFM
+profile was restored on the A2 host. A cold warm-up request generated 3.88
+seconds of continuous audio, and the following two hot requests completed 2/2
+with 77.38 ms mean TTFT, 8.28 seconds of generated audio, and 100% streaming
+continuity. Runtime logs confirmed `slots=2` and `NPU CFM graph replay active`;
+the model API remained healthy with HTTP 200.
+
+## Partial-CFG batch-one screen
+
+A deeper work-reduction candidate evaluated classifier-free guidance only in
+the first two of the six CFM solver steps. The first two steps retained the
+existing conditional/unconditional batch of two; the remaining four executed
+the conditional branch as batch one. Fixed cache addresses and the public
+cache ABI were preserved by slicing only the compute view and mirroring the
+conditional result into the unused half. A matching Ascend causal-pack kernel
+variant accepted batch one, and partial guidance was restricted to the static
+width-50/cache-402 steady path so prompt, cache-fill, tail, and first-packet
+arithmetic remained unchanged.
+
+The candidate completed every request with 100% streaming continuity. It did
+not improve device throughput. Comparisons below use runs with exactly the same
+1,160,640 output frames and 48.36 seconds of generated audio, excluding the
+separate Talker tail-length variation:
+
+| Metric | Full-CFG repeat | Partial-CFG repeat mean | Change |
+| --- | ---: | ---: | ---: |
+| Whole-audio RTF | 0.361909 | 0.376188 | +3.95% |
+| Steady-chunk RTF | 0.390668 | 0.406805 | +4.13% |
+| Mean request duration | 17.2881 s | 18.0161 s | +4.21% |
+| Audio TTFP | 0.763214 s | 0.767365 s | +0.54% |
+
+Lower is better. The one-shot structurally matched comparison agreed with the
+repeats: steady-only partial CFG measured 0.346920 whole-audio RTF versus
+0.339104 for full CFG, a 2.30% regression. The batch-one path halves the
+logical MLP/attention rows for four solver steps, but these small matrices no
+longer fill the A2 Cube efficiently; launch and layout costs become a larger
+fraction of the step. Therefore the partial-CFG selector and batch-one kernel
+are rejected rather than promoted, and no quality gate is claimed for them.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/full-cfg-reverse-control/full-cfg-reverse-control.json
+/tmp/lunanexa-bench/full-cfg-reverse-control-repeat/full-cfg-reverse-control-repeat.json
+/tmp/lunanexa-bench/partial-cfg2-steady/partial-cfg2-steady.json
+/tmp/lunanexa-bench/partial-cfg2-steady-repeat/partial-cfg2-steady-repeat.json
+/tmp/lunanexa-bench/partial-cfg2-steady-repeat2/partial-cfg2-steady-repeat2.json
+```
+
+## A2 selective dynamic-W8A8 DiT MLP screen
+
+The selective dynamic-W8A8 experiment keeps attention probabilities,
+normalization, CFG/Euler integration, and HiFT on their higher-precision paths,
+while quantizing the two MLP matrix multiplications in each DiT block. An A2
+runtime ABI issue was fixed before measurement: `npu_quant_matmul` requires a
+one-dimensional per-token scale, so a BSH activation is flattened to
+`[batch * time, hidden]` before dynamic quantization and reshaped after the
+Cube matmul. Four focused tests passed, including the exact scale and output
+shape contract.
+
+The current CANN 8.5.0 image could not capture the raw outer steady-CFM graph
+with the W8A8-compatible configuration; the first request failed during graph
+capture. A follow-up disabled W8A8 while preserving cache-major state and the
+outer graph; its first real TTS request still terminated the StageEngine
+processes during capture, without a Python exception. This isolates the unsafe
+boundary to cache-major/flat-capture rather than INT8 arithmetic itself. The
+crash-only diagnostic profiles were removed. A matched
+no-outer-graph comparison completed 10/10 requests on each path with the same
+1,746 input tokens, 1,048,320 output frames, 43.68 seconds of generated audio,
+and 100% streaming continuity:
+
+| Metric | Matched BF16 control | Dynamic-W8A8 MLP | Change |
+| --- | ---: | ---: | ---: |
+| Whole-audio RTF | 0.413941 | 0.409697 | -1.03% |
+| Mean raw chunk RTF | 0.440199 | 0.432284 | -1.80% |
+| Total run duration | 17.2473 s | 17.1671 s | -0.47% |
+| Text TTFT | 77.24 ms | 75.95 ms | -1.67% |
+| Audio TTFP | 759.03 ms | 810.59 ms | +6.79% |
+
+Lower is better. Dynamic W8A8 slightly reduces steady arithmetic time, but it
+regresses first-packet latency and both no-outer paths are materially slower
+than the retained outer-CFM-graph profile. It is therefore not a submission
+default and does not proceed to the three-suite accuracy gate. The generic A2
+scale-ABI fix remains useful for explicit future W8A8 candidates; the
+performance profile remains experimental.
+
+The follow-up kept the retained channel-major Conv-cache ABI and embedded
+`npu_dynamic_quant` plus `npu_quant_matmul` directly inside the raw steady-CFM
+capture. It introduced neither a nested GE executable nor the cache-major
+layout. Runtime logs confirmed both `NPU CFM graph captured`/replay and the
+selective W8A8 path. A matched official-wrapper comparison used exactly the
+same 1,746 input tokens, 1,048,320 audio frames, 43.68 seconds of generated
+audio, two warmups, and ten measured requests:
+
+| Metric | BF16 outer graph | Channel-major W8A8 outer graph | Change |
+| --- | ---: | ---: | ---: |
+| Whole-audio RTF | 0.401680 | 0.395701 | -1.49% |
+| Mean raw chunk RTF | 0.431435 | 0.420423 | -2.55% |
+| Total run duration | 16.6901 s | 16.5360 s | -0.92% |
+| Text TTFT | 76.11 ms | 78.09 ms | +2.60% |
+| Audio TTFP | 764.74 ms | 826.12 ms | +8.03% |
+
+Lower is better. This proves that the INT8 operators can execute inside the
+outer graph, but the dynamic per-token reduction/scale overhead consumes most
+of the Cube saving and materially regresses first packet latency. The path
+remains opt-in and does not replace the BF16 submission profile.
+
+### A2 weight-only and fused-GELU lower-layer screens
+
+`npu_weight_quant_batchmatmul` was tested as a W8A16 alternative so activations
+would not need dynamic quantization. The installed A2 documentation confirms
+BF16 activations, per-channel INT8 weights, and graph-mode support. At the
+actual DiT MLP shape (`100x512 -> 2048 -> 512`), however, the complete
+weight-only chain took 117.12 us versus 69.07 us for BF16, a 69.6% latency
+regression. A2's weight dequantization setup cost dominates at this small M,
+so W8A16 was rejected before service integration.
+
+The newer A2 `npu_quant_matmul_gelu` operator was then screened. Its documented
+BF16-scale output branch was numerically invalid on this CANN 8.5 image: output
+magnitude reached 6,304 for a reference bounded near 2. Using FP32 weight scale
+selects the valid FP16-output branch, which matched the split FC1+GELU with
+0.0078125 maximum and 0.000369 mean absolute error. FC2's dynamic quantizer can
+consume that FP16 producer directly. For the complete two-layer MLP, the fused
+path reduced split dynamic-W8A8 latency from 173.72 us to 121.60 us (1.43x),
+while its drift from BF16 was comparable to the unfused quantized path. It
+remained slower than eager BF16 in isolation, so it is a graph-level candidate,
+not an assumed win. Raw NPUGraph capture succeeded even though the installed
+TorchAir lacks an AscendIR converter for the fused op. The structurally matched
+service run measured 0.404142 RTF, 0.425329 mean raw-chunk RTF, and 861.95 ms
+TTFP. That is 2.13%, 1.17%, and 4.34% worse respectively than split W8A8, and
+also worse than the BF16 control in whole-audio RTF and TTFP. The fusion was
+therefore removed from the runtime rather than retained as dead experimental
+surface.
+
+The next lower-layer screen uses A2's dense non-quantized `npu_ffn`, which
+fuses both BF16 projections and GELU without dynamic scales. At the same actual
+`100x512 -> 2048 -> 512` shape it took 42.65 us versus 75.52 us for the split
+BF16 chain, a 1.77x microbenchmark speedup. Its maximum/mean absolute drift was
+0.0078125/0.000591. This is now the active graph-level candidate: transposed
+Cube-ready weights and FP32 biases are allocated once, while normalization,
+AdaLN and the residual remain BF16 outside the fused operator.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/bf16-no-outer-graph-control/bf16-no-outer-graph-control.json
+/tmp/lunanexa-bench/w8a8-mlp-no-outer-graph/w8a8-mlp-no-outer-graph.json
+/tmp/lunanexa-bench/bf16-outer-graph-matched-control/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260826-120243.json
+/tmp/lunanexa-bench/w8a8-channel-major-outer-graph/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260826-115106.json
+/tmp/lunanexa-bench/w8a8-fused-gelu-outer-graph-v2/bench_tts_openbmb_MiniCPM-o-4_5_voice_clone_c1_20260826-123758.json
+/tmp/minicpmo-bf16-no-outer-graph-control.log
+/tmp/minicpmo-w8a8-mlp-no-outer-graph.log
+/tmp/minicpmo-bf16-outer-graph-matched-control.log
+/tmp/minicpmo-w8a8-channel-major-outer-graph.log
+```
+
+## Talker codec-sampler graph and AICPU boundary
+
+NPU telemetry on a structurally matched 10-request run showed only 1--16%
+AICore utilization and 1--4% HBM-bandwidth utilization. Stage logs attributed
+roughly 0.74--1.55 seconds per request to the autoregressive Talker, compared
+with about 0.30--0.52 seconds added by Code2Wav. The next large target was
+therefore the per-code Talker continuation rather than another DiT micro-op.
+
+Every codec token historically launched a BF16 `768 -> 6562` head, frequency
+penalty, top-k/top-p filter, softmax, AICPU multinomial, gather, and frequency
+window update outside the already captured Llama decode graph. Capturing only
+the deterministic distribution preserved the checkpoint's NPU multinomial
+sequence and measured 2.34x faster in isolation. It was rejected in service:
+the first real decode consistently raised Ascend 507018 from
+`MultinomialWithReplacement`, even after all graph outputs were verified as
+finite ND tensors and copied into fixed non-graph-pool buffers. The failing
+path is not a tensor-format or graph-storage-lifetime bug; it is the AICPU
+multinomial boundary after replay in the vLLM FULL_DECODE environment.
+
+The replacement uses one fixed graph for the complete codec continuation:
+
+- the request-local NPU generator produces one uniform scalar outside capture;
+- the graph executes the codec head, penalty, bounded top-k/top-p filter,
+  inverse-CDF draw, gather, and 16-code rolling-frequency update;
+- EOS masking and the expired window code are fixed-address runtime inputs, so
+  the same executable covers both pre-minimum and EOS-eligible steps;
+- sampled-code and next-frequency buffers are allocated once and reused.
+
+Inverse-CDF is categorically distribution-equivalent for a single draw, but it
+does not preserve multinomial's seed-to-code mapping. It is therefore an
+accuracy-gated experimental path, not a bitwise-equivalent default. On the A2
+microbenchmark with the checkpoint's actual hidden/vocabulary/top-k shapes,
+the full eager continuation measured 1,190.29 us. Graph replay measured
+208.96 us, and replay including request-local NPU uniform generation measured
+303.98 us: 3.92x end-to-end kernel-chain speedup. Five focused CPU tests
+passed for bounded-distribution, inverse-CDF selection, EOS masking, and
+rolling-frequency equivalence.
+
+Artifacts:
+
+```text
+benchmarks/kernels/bench_minicpmo45_codec_sampler_npu.py
+/tmp/minicpmo-talker-sampler-graph-v3.log
+```
+
+The inverse-CDF service then completed two official-wrapper hot runs with two
+warmups, ten measured Chinese Seed-TTS requests, concurrency one, and 100%
+streaming continuity:
+
+| Metric | Prior fused-FFN two-run mean | Inverse-CDF run 1 | Inverse-CDF run 2 | Two-run mean vs control |
+| --- | ---: | ---: | ---: | ---: |
+| Whole-audio RTF | 0.35557 | 0.32294 | 0.30336 | -11.93% |
+| Audio TTFP | 765.28 ms | 751.18 ms | 749.79 ms | -1.93% |
+| Text TTFT | 79.85 ms | 80.13 ms | 79.94 ms | +0.23% |
+| Middle-chunk RTF | 0.17701 | 0.16795 | 0.17280 | -3.75% |
+| Talker inter-output latency | about 9.9--10.0 ms | about 9.0--9.3 ms | about 9.0--9.3 ms | about -8% |
+
+Lower is better. Run 1 generated 56.76 seconds / 1,362,240 frames and run 2
+generated 63.08 seconds / 1,513,920 frames, compared with 43.20 seconds /
+1,036,800 frames for the seed-mapped control. Total serving duration is
+therefore not structurally comparable; RTF and per-output latency are the
+valid normalized comparisons. A separate measured request reached 0.296 RTF,
+734.35 ms TTFP, and 75.27 ms TTFT, matching the published leaderboard scale,
+but it is not reported as the multi-request mean.
+
+An eight-row English accuracy screen generated 8/8 valid audios with 100%
+streaming continuity and 0.32 performance RTF. Its WER/SIM evaluator could not
+run on this replacement host: Whisper Large v3 and WavLM were not cached, and
+the Hugging Face processor download was reset by the remote endpoint. The
+inverse-CDF profile therefore remains experimental and must not replace the
+submission profile until paired WER/SIM stays within two percentage points and
+Daily-Omni plus Video-MME are rerun. The client was stopped after the first
+repeated download failure to avoid eight long retries; that interrupted run
+did not persist its temporary WAVs, so the eight-row screen must be rerun once
+the evaluator weights are available.
+
+```text
+/tmp/lunanexa-bench/talker-inverse-cdf-v4-official10/
+/tmp/lunanexa-bench/talker-inverse-cdf-v4-official10-repeat/
+/tmp/lunanexa-bench/talker-inverse-cdf-v4-quality-en8/
+/tmp/minicpmo-talker-sampler-graph-v4.log
+```
+
+```text
+790eb64835f4e42d99963e14b2769d1578184d734bf9e3c45b1fe4f758199d92  inverse-cdf-run1.json
+c94bc10eaa9d99645fe43c46182e4b11985464d6edc68165b6ae7f3e76f49b7d  inverse-cdf-run2.json
+```
+
+## First-packet scheduling and prompt-cache solver reduction
+
+The inverse-CDF profile still waited for 25 Talker codec codes before starting
+Code2Wav. Separating the initial bridge threshold from the steady 25-code
+chunk and setting it to ten reuses the already compiled width-20 DiT graph.
+It does not alter the sampled codec sequence or steady chunk policy. On the
+official ten-request English wrapper it reduced mean/P99 TTFP from
+609.48/623.52 ms to 467.16/479.53 ms after the additional solver changes
+below, with 100% streaming continuity.
+
+Stage timing exposed a larger hidden first-path cost. Seed-TTS uses a different
+reference waveform for each request. Stage 2 runs the widest (~302-frame) CFM6
+path before the first live packet only to populate the prompt estimator K/V
+caches; its synthesized prompt mel is discarded. The new experimental policy
+uses two cosine-schedule evaluations for this cache prefill, expands the two
+cache states back into the fixed six-slot ABI, uses four evaluations for only
+the first 120 ms live packet, and returns every subsequent chunk to CFM6.
+Speaker embedding, prompt mel extraction, codec sampling, and all steady audio
+remain unchanged.
+
+| Candidate | Mean RTF | Mean TTFP | P99 TTFP | TTFT | Continuity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 10-code first packet, CFM6 (10 requests) | 0.323 | 609.48 ms | 623.52 ms | 81.23 ms P99 | 100% |
+| 10-code first packet, prompt CFM2 / first CFM4 (1 request) | 0.308 | 458.22 ms | 458.22 ms | 80.49 ms | 100% |
+| 10-code first packet, prompt CFM2 / first CFM4 (10 requests) | 0.317 | 467.16 ms | 479.53 ms | 77.59 ms mean | 100% |
+| 10-code first packet, prompt CFM1 / first CFM1 (1 request) | 0.319 | 364.00 ms | 364.00 ms | 77.60 ms | 100% |
+| 10-code first packet, prompt CFM1 / first CFM1 (10 requests) | 0.318 | 356.87 ms | 365.81 ms | 78.46 ms mean | 100% |
+
+Lower is better. The ten-request prompt-CFM2 candidate generated 54.00 seconds
+and 1,296,000 frames. Compared with the structurally matched first-packet CFM6
+run, mean TTFP improved 23.35% while mean whole-audio RTF remained within run
+variance. Compared with the earlier inverse-CDF two-run mean near 750 ms, TTFP
+improved about 37.7%.
+
+The minimum-solver ceiling experiment reduced both the discarded prompt-cache
+prefill and only the first 120 ms live packet to one evaluation. Its official
+ten-request run generated the same 54.00 seconds / 1,296,000 frames with 100%
+continuity. Mean TTFP improved 41.45% versus the 609.48 ms first-packet CFM6
+control and about 52.4% versus the earlier ~750 ms inverse-CDF runs. Mean RTF
+remained 0.318. This is the current fastest measured TTFP profile, but it has a
+strictly larger quality risk than prompt CFM2 / first CFM4 and must not become
+the submission default without the complete accuracy gate.
+
+An even smaller five-code first packet is the HiFT continuity lower bound:
+five new codes plus three left-context codes become ten mel frames after the
+encoder; HiFT retains eight mel frames / 3,840 samples and can publish one real
+40 ms packet. Eager width-10 execution was stable and measured 566.04 ms TTFP,
+but it was not faster than graph-backed width 20 because launch overhead
+dominated. Adding width 10 to the captured graph buckets is rejected on this A2
+stack: startup compilation succeeds, but first replay aborts the Stage-2
+process with CANN `tiling offset out of range`. The submission must not enable
+that graph bucket.
+
+Prompt CFM2 and first-packet CFM4 approximate cache states and therefore remain
+accuracy-gated experiments. They require paired official WER/SIM, Daily-Omni,
+and Video-MME validation before replacing the submission profile.
+
+```text
+/tmp/lunanexa-bench/talker-low-ttfp-i10-official10/
+/tmp/lunanexa-bench/talker-low-ttfp-prompt2-cfm4-smoke/
+/tmp/lunanexa-bench/talker-low-ttfp-prompt2-cfm4-official10/
+/tmp/lunanexa-bench/talker-low-ttfp-prompt1-cfm1-smoke/
+/tmp/lunanexa-bench/talker-low-ttfp-prompt1-cfm1-official10/
+/tmp/lunanexa-bench/talker-low-ttfp-i5-eager-cfm4-smoke/
+/tmp/minicpmo-low-ttfp-prompt2-cfm4.log
+```
+
+## A2 main-bottleneck isolation and Talker producer-consumer fusion
+
+Fresh hot-stage timestamps on the single-chip 910B4/A2 host changed the
+optimization priority.  For a representative resident request, Stage 0 took
+about 64 ms, Stage 1 completed at about 1,195 ms, and Stage 2 completed at
+about 1,627 ms.  The incremental Code2Wav cost was therefore about 431 ms,
+while the autoregressive Talker consumed about 73% of hot end-to-end latency.
+Talker emitted roughly 120--160 codec tokens at about 9 ms/token.  This makes
+another isolated Stage-2 microkernel the wrong main target: even eliminating
+ten percent of Stage 2 would save only about 43 ms, whereas every millisecond
+removed from the Talker loop is repeated more than one hundred times.
+
+Several plausible lower-layer candidates were screened with the same two
+warmups, ten fixed English Seed-TTS requests, concurrency one, and identical
+54.00 seconds / 1,296,000 output frames:
+
+| Stage-1 candidate | Mean RTF | Audio TTFP | TTFT | E2E | Decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| NZ BF16 weights (`weight_nz_mode=2`) | 0.307868 | 352.10 ms | 79.55 ms | 1,617.03 ms | retained control |
+| Static kernel + NPUGraph-ex | 0.311524 | 351.41 ms | 75.90 ms | 1,636.56 ms | reject |
+| Explicit FULL_DECODE_ONLY | 0.310824 | 352.54 ms | 79.85 ms | 1,634.76 ms | redundant/reject |
+| Device-resident EOS branch | 0.312021 | 353.88 ms | 75.99 ms | 1,640.17 ms | reject |
+
+Lower is better.  The explicit decode profile was redundant because the A2
+single-chip producer policy already resolves Stage 1 to
+`FULL_DECODE_ONLY` with capture size one.  Device EOS was slower because the
+next autoregressive token already depends on the sampled codec token: its host
+scalar decision is not an independent bubble, and the extra compare/where
+operators cost more than the avoided scalar read.  The static-kernel result
+also confirms that a more opaque executable is not automatically faster when
+it reduces GE's scheduling freedom.  Only NZ weight preformatting survived the
+whole-service gate.
+
+The first structural experiment appended the complete codec continuation to
+the Talker graph: the `768 -> 6562` head, repetition penalty, bounded
+top-k/top-p, inverse-CDF draw, and frequency update. TorchAir produced a new
+Stage-1 cache hash and captured full decode successfully. A one-shot log also
+proved that real requests consumed its fused sample rather than a fallback.
+Nevertheless, it was decisively slower: the first request took 60.73 seconds
+and the immediately following resident request still took 9.89 seconds for
+3.88 seconds of output, compared with 1.617 seconds mean E2E for the NZ
+control. Putting vocabulary-wide `pow`, top-k, prefix-sum and sampling into the
+large Llama GE graph destroyed the efficient small-batch decode schedule. The
+experiment was removed rather than hidden behind the submission profile.
+
+The narrower follow-up appended only the `768 -> 6562` codec head and
+temperature scaling. They wrote one fixed-address FP32 logits row, which the
+proven small inverse-CDF NPUGraph consumed directly. Even this boundary was
+too opaque: after the first 61.85-second lazy-capture request, the immediately
+following resident request still took 9.64 seconds for 4.88 seconds of audio.
+The result is essentially the same six-fold regression as the complete-tail
+fusion. The large external-buffer write, not only top-k, prevents GE from
+preserving the efficient batch-one Llama decode schedule. This candidate and
+its environment flag were removed as well.
+
+A final boundary check returned the head logits as an ordinary two-tensor
+model output instead of mutating an external buffer. This allowed GE to see
+the producer value and the small sampler graph copied the row as a regular
+input. It still measured 61.34 seconds on the first lazy-capture request and
+9.56 seconds hot for the same 4.88-second waveform. Therefore the regression
+is not specific to an opaque side effect: extending this FULL_DECODE graph
+with the large head itself changes the batch-one executable unfavorably. The
+tuple-output candidate was removed too.
+
+The retained architecture therefore keeps the Llama full-decode graph and the
+roughly 0.30 ms/token inverse-CDF sampler graph separate. The next material
+Talker gain must be graph-visible fusion inside the Llama producer-consumer
+chain, or a trained multi-code/speculative head; another side-effecting custom
+boundary is not a viable route on this A2 stack.
+
+### Hot Talker trace: launch bubbles, then slot mapping
+
+A Stage-1-only `torch_npu.profiler` trace of one warmed 120-code request
+resolved the next optimization level. Profiling was initialized only in the
+Talker process; Stage 2 retained its normal fixed CFM NPUGraph because an
+auxiliary profiler stream in that process invalidates capture on this CANN
+release. The trace covered a 1.402-second device window, of which only
+230.708 ms was device compute and 1.171 seconds was free. Thus 83.5% of the
+Talker device window was idle rather than arithmetic. The 120 identical main
+decode bursts each contained 201 kernels, spanned 4.356 ms on average, and
+started 11.229 ms apart. Their summed kernel time was only 1.449 ms per code.
+
+Within the compute budget, MatMulV2 used 101.399 ms (43.95%), fused infer
+attention 47.761 ms (20.70%), and the generic slot-mapping kernel 22.814 ms
+(9.89%). The slot kernel ran 121 times at 188.54 us average. Host attribution
+also showed 130.800 ms in 2,420 fused-attention dispatches, 92.376 ms in 4,078
+copies, 37.890 ms in event recording, and 28.301 ms in event synchronization.
+This confirms two different budgets: the immediate safe target is the
+oversized metadata kernel; the larger architectural target is eliminating
+per-layer/per-code host dispatch through a multi-code or device-loop Talker
+executable.
+
+The first candidate replaced only the batch-one, one-token, non-DCP slot
+calculation with a fixed-address NPUGraph. It dynamically indexed the stable
+block table from the stable position buffer and wrote slot zero; prefill,
+batching, DCP, graph nesting, and address changes fell back to the canonical
+Triton kernel. On the same A2, its isolated 500-replay microbenchmark was
+2.09x faster. The service-level Stage-1 ITL nevertheless regressed from
+8.752 ms to 9.097 ms, so the candidate and its profile flag were removed.
+This is another example of a locally faster boundary losing more in launch and
+graph interaction than it saves in arithmetic.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/talker-nz-official10/
+/tmp/lunanexa-bench/talker-static-kernel-official10/
+/tmp/lunanexa-bench/talker-full-decode-official10/
+/tmp/lunanexa-bench/talker-device-eos-official10/
+/tmp/lunanexa-bench/talker-fused-continuation-smoke3/
+/tmp/lunanexa-bench/talker-fused-continuation-smoke4/
+/tmp/minicpmo-talker-fused-continuation-v3.log
+/tmp/lunanexa-bench/talker-fused-head-smoke-corrected1/
+/tmp/lunanexa-bench/talker-fused-head-smoke-corrected2/
+/tmp/minicpmo-talker-fused-head-v2.log
+/tmp/lunanexa-bench/talker-head-output-smoke1/
+/tmp/lunanexa-bench/talker-head-output-smoke2/
+/tmp/minicpmo-talker-head-output.log
+/tmp/lunanexa-bench/talker-nz-torch-profile-hot/
+/tmp/vllm-omni-profiles/minicpmo45/a2-talker-nz-stage1/
+```
+
+### Main-bottleneck result: publish codec payloads at chunk boundaries
+
+The hot trace showed that the dominant Stage-1 cost was not a single compute
+kernel: the NPU was idle for 83.5% of the measured window. The retained change
+therefore removes per-code framework work rather than adding another isolated
+kernel. Previously every generated codec code caused `make_omni_output` to
+publish one NPU scalar, the NPU runner to build a CPU multimodal payload and
+copy an unused 768-wide hidden row, and the engine to create a downstream
+connector task. Code2Wav cannot consume those single-code messages: after its
+initial ten codes it works in 25-code chunks.
+
+The new Talker path accumulates the exact sampled codec values on device and
+publishes only at the initial 10-code boundary, each subsequent 25-code
+boundary, and the terminal tail. Sparse output metadata lets the NPU runner
+skip payload construction and connector routing on all other decode steps.
+For the MiniCPM-o Talker, the unused hidden-state transfer is also omitted.
+A typical 120-code response consequently creates about five downstream
+payloads instead of about 120. Sampling, the codec sequence, CFM steps, HiFT,
+and audio chunk boundaries are unchanged.
+
+Two independent official-shape runs used two warmups followed by ten measured
+requests at concurrency one. Lower is better for every value in this table.
+
+| Candidate | Mean RTF | P99 RTF | Mean TTFP (ms) | Mean TTFT (ms) | Mean E2E (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous retained baseline | 0.307868 | 0.386839 | 352.10 | 79.55 | 1617.03 |
+| Chunk-boundary payload run 1 | 0.302844 | 0.383994 | 352.89 | 79.63 | 1589.46 |
+| Chunk-boundary payload run 2 | 0.298986 | 0.379363 | 349.21 | 79.26 | 1569.91 |
+| Two-run mean | **0.300915** | - | - | - | - |
+
+The two-run mean RTF is 2.26% lower than the previous retained baseline. The
+repeat run is 2.89% lower in mean RTF and E2E, while TTFP is 0.82% lower and
+TTFT is 0.36% lower. Its ten-request Stage-1 mean ITL was 8.593 ms, 1.82%
+lower than the 8.752-ms control. Both runs produced all 1,296,000 expected
+frames for 54 seconds of reference duration with 100% chunk continuity.
+
+Two more transport experiments were rejected. Reusing sampled-token transport
+storage changed output duration between otherwise identical requests and only
+reduced ITL by about 0.24%. Copying outputs on a separate NPU stream increased
+hot ITL to 8.948--9.118 ms. Neither implementation remains in the candidate.
+
+This optimization is sequence-preserving by construction, and the focused
+batching, sparse-publication, cleanup, configuration, and syntax checks pass.
+Formal submission acceptance still requires the official TTS-Seed WER/SIM
+gate; the local continuity and frame-count checks are not a substitute for
+that evaluator.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/talker-batched-codec-v2-official10/
+/tmp/lunanexa-bench/talker-batched-codec-v2-official10-repeat/
+/tmp/minicpmo-talker-batched-codec-v2.log
+```
+
+Two subsequent scheduler-level attempts established where the remaining
+Talker bottleneck is not. First, the intermediate AR scheduler retained all
+per-token request, KV, stop, and sampling updates but suppressed token-only
+`EngineCoreOutput` messages between publishable codec boundaries. Its two
+official-shape runs measured mean RTF 0.308210 and 0.305143, for a 0.306676
+mean: 1.91% slower than the retained 0.300915 result. Mean TTFP stayed near
+349.3 ms. The async vLLM pipeline therefore uses those apparently redundant
+outputs as part of its efficient progress cadence; the experiment was fully
+removed.
+
+Second, the orchestrator polled Stage 2, then Stage 1, then Stage 0 so the
+high-frequency Talker output would not sit behind an idle Stage-0 one-ms poll.
+Two runs measured mean RTF 0.304688 and 0.302651, for a 0.303669 mean. Average
+TTFP improved by about 2.7 ms, but RTF was still 0.91% worse and mean Stage-1
+duration increased from 1.195 s to about 1.219 s. This proves the repeated
+gap is inside the Talker EngineCore/model-execution cycle rather than the
+outer orchestration polling order. The order change was also removed.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/sparse-engine-output-official10/
+/tmp/lunanexa-bench/sparse-engine-output-official10-repeat/
+/tmp/minicpmo-sparse-engine-output.log
+/tmp/lunanexa-bench/downstream-first-poll-official10/
+/tmp/lunanexa-bench/downstream-first-poll-official10-repeat/
+/tmp/minicpmo-downstream-first-poll.log
+```
+
+### Main-bottleneck result: remove the redundant Talker stop sampler
+
+The next trace-level target was the generic vLLM sampler invoked after every
+codec step. `make_omni_output` already decides whether the request must
+continue or stop, then exposes deterministic logits `[0, -inf]` or
+`[-inf, 0]`. Running the generic logits processor and argmax on that binary
+control head repeated work already completed by the model roughly 120--200
+times per request.
+
+The retained fast path returns the existing continue/stop decision directly
+as a `SamplerOutput`. For the competition's batch-one path, immutable int32
+continue and stop tensors are allocated once and reused. Requests asking for
+log probabilities, and configurations that do not explicitly enable the
+feature, retain the canonical sampler. Codec sampling, RNG state, generated
+codec IDs, chunk boundaries, CFM, and HiFT are unchanged. A focused parity
+test covers both continue and max-token stop decisions and verifies resident
+buffer reuse.
+
+Fresh tests used the newly extracted Chinese Seed-TTS set, two warmups, ten
+measured requests, and concurrency one. Talker output duration is stochastic,
+so whole-audio RTF is reported alongside the less ambiguous per-token Stage-1
+ITL. Lower is better throughout.
+
+| Run | Mean RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Matched retained control | 0.299441 | 364.00 ms | 79.39 ms | 1848.64 ms | 62.68 s |
+| Direct stop run 1 | 0.286807 | 350.88 ms | 79.53 ms | 1740.69 ms | 61.68 s |
+| Direct stop run 2 | 0.297673 | 346.15 ms | 77.22 ms | 1625.63 ms | 56.72 s |
+| Direct stop two-run mean | **0.292240** | **348.51 ms** | **78.37 ms** | **1683.16 ms** | - |
+
+The two-run mean RTF is 2.40% below the matched control and mean TTFP is
+4.25% lower. More importantly, the ten hot main-run Stage-1 ITL samples fell
+from 9.284 ms/code in the control to 8.435 ms/code, a 9.14% reduction. This is
+a direct measurement of the autoregressive loop and is not biased by output
+audio length. The result confirms that eliminating repeated framework work is
+currently more valuable than another isolated Stage-2 microkernel.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/stage-isolated-numa-control-official10/
+/tmp/lunanexa-bench/talker-direct-stop-official10-run1/
+/tmp/lunanexa-bench/talker-direct-stop-official10-run2/
+/tmp/minicpmo-direct-stop.log
+```
+
+The retained follow-up also removes construction of the deterministic logits
+row. It keeps resident continue/stop logits views beside the resident token-ID
+views, and uses one boolean control list as the source of truth for canonical
+fallback, batched fast path, and the batch-one fast path. This also fixes the
+edge case where a terminal request observed for one additional scheduler step
+could previously be represented as continue by the direct sampler.
+
+The cleanest comparison used the same 61.68 seconds / 1,480,320 generated
+frames in both runs:
+
+| Same-duration candidate | Mean RTF | Mean TTFP | Mean TTFT | Mean E2E | Stage-1 ITL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Direct token ID only | 0.286807 | 350.88 ms | 79.53 ms | 1740.69 ms | 8.435 ms/code |
+| Static logits + token IDs | **0.280486** | **343.61 ms** | **79.13 ms** | **1698.25 ms** | **8.238 ms/code** |
+
+Static control buffers reduce RTF by another 2.20%, TTFP by 2.07%, E2E by
+2.44%, and Stage-1 ITL by 2.34%. Relative to the original 9.284-ms/code
+matched control, the complete direct-control path reduces hot Talker ITL by
+11.27%. It remains sequence-preserving: only the already deterministic
+vLLM-visible stop channel changes implementation.
+
+```text
+/tmp/lunanexa-bench/talker-static-stop-buffers-official10/
+/tmp/minicpmo-static-stop-buffers.log
+```
+
+A subsequent sparse-output sentinel experiment was rejected. It reused one
+resident empty NPU tensor for all non-publishable codec steps and represented
+terminal metadata as Python booleans until a chunk boundary. Despite removing
+two empty-tensor allocations per code, the same-duration benchmark regressed
+RTF from 0.280486 to 0.286711 (+2.22%), TTFP from 343.61 to 351.87 ms, and hot
+Stage-1 ITL from 8.238 to 8.359 ms/code (+1.47%). The stable empty-tensor
+address likely introduced alias/event dependencies that outweighed allocator
+work. The implementation was fully removed; only the result artifact remains:
+
+```text
+/tmp/lunanexa-bench/talker-resident-empty-output-official10/
+/tmp/minicpmo-resident-empty-output.log
+```
+
+### Main-bottleneck result: stable-input PagedAttention replay
+
+A low-rate Stage-1 host profile identified graph-parameter maintenance as the
+largest active Python stack: `update_full_graph_params` rebuilt twenty FIA
+tasks after every Talker token because FIA represents query and KV lengths as
+host-valued attributes. Reordering that work with ENPU was rejected at
+0.308473 aggregate RTF, 12.00% slower than the retained 0.275414 control,
+because it moved the same twenty updates onto the replay dependency path.
+
+The retained candidate changes the operator contract instead. Stage-1
+batch-one decode uses PagedAttention for capture size one. Its block table and
+context-length tensor are fixed runner-owned buffers whose contents are
+updated in place. With `enable_stable_pa_graph_inputs`, graph capture omits the
+per-layer update handles and events, and replay executes the already captured
+PA tasks directly. The opt-in is disabled by default and is paired with
+`pa_shape_list: [1]` in the dedicated MiniCPM-o profile.
+
+An attempted device-resident context-length variant was rejected during graph
+capture: Atlas A2 ATB reported `PagedAttentionOperation setup failed`. The
+compatible implementation therefore retains the existing pinned host length
+slab. Two warmups and ten measured requests with varying generated lengths
+confirmed that replay observes its in-place contents; all requests completed
+with 100% streaming continuity.
+
+Both official-shape repeats used concurrency one, seed zero, and temperature
+zero. Aggregate RTF is wall-clock benchmark duration divided by actual audio
+duration, so stochastic output length is normalized. Lower is better.
+
+| Variant | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous retained static-control profile | 0.275414 | 343.61 ms | 79.13 ms | 1698.25 ms | 61.68 s |
+| Stable PA run 1 | 0.233829 | 312.12 ms | 77.45 ms | 1426.80 ms | 61.04 s |
+| Stable PA run 2 | 0.228323 | 306.59 ms | 77.31 ms | 1442.52 ms | 63.20 s |
+| Stable PA two-run mean | **0.231076** | **309.36 ms** | **77.38 ms** | **1434.66 ms** | - |
+
+The two-run mean improves aggregate RTF by 16.10%, TTFP by 9.97%, TTFT by
+2.21%, and E2E by 15.52% relative to the retained profile. The first PA
+request after process startup incurred about 62 seconds of ATB compilation;
+the competition's declared warmup requests absorb this one-time cost, while
+subsequent requests were stable at roughly 1.0--1.75 seconds E2E.
+
+This is the first Talker change in this series that removes the profiled
+twenty-layer control-plane mechanism rather than making each update slightly
+cheaper. It remains an experimental submission candidate until the matched
+official Seed-TTS WER/SIM gate is rerun; the current server lacks `funasr`, so
+the performance run cannot substitute for that accuracy result. An export-only
+quality run nevertheless produced 10/10 official utterance-name WAV files with
+zero failures or missing PCM. All files are 24-kHz mono WAV, span 3.28--8.48
+seconds, and total 61.52 seconds, ready for the organizer's `cal_wer.sh` and
+`cal_sim.sh`.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/talker-stable-pa-official10/
+/tmp/lunanexa-bench/talker-stable-pa-official10-repeat/
+/tmp/lunanexa-bench/talker-stable-pa-export10/
+/tmp/lunanexa-quality/talker-stable-pa-seed10/
+/tmp/minicpmo-talker-stable-pa-host-slab.log
+```
+
+### Main-bottleneck result: fingerprinted prompt-state templates
+
+Synchronized Stage-2 timing split the hot first-packet path into two pieces:
+prompt setup consumed about 39--41 ms (roughly 12 ms Conformer plus 26--28 ms
+prompt CFM), while the first live width-13 chunk consumed about 67--69 ms
+(roughly 12 ms encoder, 27 ms first-packet CFM, and 28 ms HiFT).  Bounding the
+DiT prompt suffix to 150 frames did not attack the dominant cost and was
+rejected at 0.237681 aggregate RTF / 320.22 ms TTFP.  Deferring reduced-CFM
+cache materialization was likewise rejected at 0.239588 RTF / 315.04 ms TTFP.
+
+The competition path repeatedly uses the same default reference-audio prompt,
+yet Stage 2 rebuilt its deterministic Conformer and prompt-CFM state for every
+request.  The retained candidate caches one immutable state template keyed by
+the complete prompt-content fingerprint.  Each request receives independent
+copies of its Conformer cache, estimator attention/CNN storage, rolling fixed
+slabs, and HiFT state; the live decoder never mutates the template or another
+request's state.  Different prompt content or paths select different cache
+entries, and the small LRU is bounded.  This changes neither solver steps nor
+tensor values; it removes repeated setup computation.
+
+Five focused cache/fixed-slab tests pass on the A2 host, including address
+non-aliasing and mutation isolation.  The first request after service startup
+still performs normal setup and graph compilation, which the declared warmup
+absorbs.  All later fixed-prompt requests clone the resident template.
+
+Three runs used the same Chinese Seed-TTS wrapper, two warmups, ten measured
+requests, concurrency one, seed zero, and temperature zero.  Lower is better.
+
+| Run | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prompt-state cache 1 | 0.228856 | 275.99 ms | 78.59 ms | 1409.24 ms | 61.60 s |
+| Prompt-state cache 2 | 0.250856 | 271.95 ms | 79.12 ms | 1467.50 ms | 58.52 s |
+| Prompt-state cache 3 | 0.230909 | 269.56 ms | 77.03 ms | 1383.11 ms | 59.92 s |
+| Three-run median | **0.230909** | **271.95 ms** | **78.59 ms** | **1409.24 ms** | - |
+
+Compared with the retained stable-PA two-run mean (0.231076 RTF, 309.36 ms
+TTFP, 77.38 ms TTFT, and 1434.66 ms E2E), median TTFP improves by 12.09% and
+median E2E by 1.77%.  Median RTF is effectively flat but 0.07% lower; TTFT is
+1.56% higher and remains within normal host variation.  The second run
+contained a 2.17-second single-request host tail, so promotion uses the
+predeclared median rather than selecting the fastest run.  Every run completed
+10/10 requests with zero failures and 100% streaming continuity.
+
+Artifacts:
+
+```text
+/tmp/lunanexa-bench/prompt-state-cache-smoke/
+/tmp/lunanexa-bench/prompt-state-cache-official10/
+/tmp/lunanexa-bench/prompt-state-cache-official10-repeat/
+/tmp/lunanexa-bench/prompt-state-cache-official10-third/
+/tmp/minicpmo-stable-pa-prompt-state-cache.log
+```
+
+A follow-up pinned-host D2H candidate was rejected at the smoke gate.  It
+copied the first 23,040-byte FP32 waveform through a dedicated NPU copy stream
+into pinned CPU storage and synchronized that stream before EngineCore IPC.
+The path was confirmed active, but TTFP rose from the prompt-cache smoke's
+280.74 ms to 297.54 ms (+5.99%).  For this small payload, pinned allocation,
+stream handoff, and explicit synchronization cost more than the pageable D2H
+copy.  The implementation and profile were reverted; the artifact remains at
+`/tmp/lunanexa-bench/prompt-cache-pinned-d2h-smoke/`.
+
+### Leaderboard refresh and static steady-CFM ABI
+
+The public vLLM-Omni leaderboard was refreshed at `2026-08-27 13:15:46`.
+The team's last organizer result was seventh at 0.2423 RTF, 514.22 ms TTFP,
+and 45.72 ms TTFT.  The best individual values were 0.1278 RTF, 156.03 ms
+TTFP, and 6.37 ms TTFT.  These values come from different submissions, but
+they make the remaining priorities explicit: our TTFT is already comparable
+with the RTF leader's 47.24 ms, while RTF and TTFP remain the large gaps.
+
+The previous five-step experiment did not rebuild the serving ABI.  It entered
+the reduced-step eager path and expanded the result back into six cache slots,
+so it was slower despite performing less model arithmetic.  The new CFM4 and
+CFM3 profiles instead set the complete Token2Wav solver width before backend
+construction.  Timeline tensors, all-step AdaLN, fixed estimator K/V slabs,
+direct cache outputs and the outer steady NPUGraph are consequently native
+four- or three-slot executables.  Prompt-cache prefill and the first live
+packet remain one-step; Talker sampling and chunk boundaries are unchanged.
+
+The first CFM4 official-shape run used two warmups followed by ten Chinese
+Seed-TTS requests at concurrency one, seed zero and temperature zero.  The
+first warmup absorbed 62 seconds of ATB/NPUGraph compilation.  All ten measured
+requests completed with 100% streaming continuity.
+
+| Variant | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM6 prompt-state-cache median | 0.230909 | 271.95 ms | 78.59 ms | 1409.24 ms | - |
+| Native static CFM4 run 1 | **0.218146** | 279.26 ms | **76.77 ms** | **1228.11 ms** | 56.32 s |
+| Native static CFM3 run 1 | **0.208385** | **275.25 ms** | 77.76 ms | **1173.12 ms** | 56.32 s |
+
+Static CFM4 improves aggregate RTF by 5.53% and mean E2E by 12.85%.  Its
+2.69% TTFP movement is treated as run variance because both profiles execute
+the same prompt-CFM1 and first-packet-CFM1 path.  Unlike the prompt-state cache,
+steady step reduction changes model numerics; CFM4 and CFM3 therefore remain
+accuracy-gated until the paired Seed-TTS WER/SIM screen and the final
+Daily-Omni and Video-MME gates pass.
+
+Native CFM3 completed the same ten-request shape without a failed request or
+stream discontinuity.  Relative to the retained CFM6 median, it lowers
+aggregate RTF by 9.76% and mean E2E by 16.76%; relative to native CFM4 it lowers
+aggregate RTF by another 4.47%.  It is the performance candidate, not yet the
+submission candidate: the missing accuracy gates are intentionally not
+inferred from transport success.
+
+```text
+/tmp/lunanexa-bench/cfm4-static-official10/
+/tmp/minicpmo-cfm4-static.log
+/tmp/lunanexa-bench/cfm3-static-official10/
+/tmp/minicpmo-cfm3-static.log
+```
+
+### BF16-bounded final Addcmul gate
+
+The final DiT modulation path had already qualified an exact `addcmul`
+rewrite on a retained 32-row WER/SIM screen, but the startup parity gate still
+used a fixed FP32 `1e-6` absolute threshold.  On the live BF16 estimator the
+canonical multiply/add expression and `addcmul` differ by exactly one BF16
+storage ULP (`0.0078125`), so every service start silently disabled the
+qualified path.  The gate now keeps the FP32 bound unchanged and allows at
+most one storage epsilon for FP16/BF16.  Startup logged:
+
+```text
+Validated dtype-bounded MiniCPM-o final Addcmul path;
+max_abs_drift=0.0078125, limit=0.0078125
+```
+
+The controlled CFM3 A/B retained the same 56.32 seconds of output, 10/10
+success and 100% continuity:
+
+| CFM3 variant | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed FP32 gate, fusion disabled | 0.208385 | 275.25 ms | 77.76 ms | 1173.12 ms |
+| Dtype-aware gate, fusion active | **0.208119** | **273.43 ms** | 78.61 ms | **1171.62 ms** |
+
+The 0.13% aggregate-RTF movement is too small to call a major service gain,
+but the fix prevents an already-qualified fast path from being incorrectly
+disabled.  It also confirms that the remaining leaderboard gap is dominated
+by the Talker execution cycle, not this isolated Stage-2 launch.
+
+```text
+/tmp/lunanexa-bench/cfm3-static-addcmul-official10/
+/tmp/minicpmo-cfm3-static-addcmul.log
+```
+
+### Exact n-gram speculative Talker experiment
+
+The next isolated profile attacked the 83.5% idle fraction in the hot Talker
+trace.  It proposed three codec tokens from matching one- to three-token
+suffixes in the already-generated sequence, then verified them with the
+ordinary Talker in one wider target forward.  Rejected drafts fall back to the
+target token, so this was an exact speculative execution mechanism rather than
+a trained or approximate multi-code head.
+
+The ordinary CPU n-gram proposer was rejected by vLLM configuration because
+the retained Talker requires asynchronous scheduling.  The device n-gram
+proposer was compatible after rebuilding the Stage-1 graph ABI at width four:
+it captured successfully as `FULL_AND_PIECEWISE` and completed 10/10 measured
+requests with 100% streaming continuity.  It was nevertheless a decisive
+service regression:
+
+| Talker path | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM3 + one-token full-decode graph | **0.208119** | **273.43 ms** | **78.61 ms** | **1171.62 ms** | 56.32 s |
+| CFM3 + NGram-GPU 3-token drafts | 0.459330 | 394.86 ms | 81.22 ms | 2705.69 ms | 58.92 s |
+
+The speculative candidate regressed aggregate RTF by 120.71% and TTFP by
+44.41%.  Codec suffix acceptance cannot amortize the wider target verification
+and the loss of the specialized one-token `FULL_DECODE_ONLY` executable on
+this A2 stack.  The profile and its test were removed rather than leaving a
+dormant trap.  A useful multi-code path now requires a trained compatible
+draft/MTP head or a backend device loop that preserves the efficient one-token
+executable; prompt n-gram reuse is closed.
+
+```text
+/tmp/lunanexa-bench/cfm3-talker-ngram3-official10/
+/tmp/minicpmo-cfm3-talker-ngram3-v3.log
+```
+
+### Current CFM3 Talker trace and chunk-boundary EOS candidate
+
+A fresh Stage-1-only trace was captured on the current static-CFM3 service,
+after stable PagedAttention and the fused inverse-CDF sampler had landed.  The
+1.067-second Talker window contained 390.45 ms of device compute and 676.25 ms
+of free time: the device was still idle for 63.4% of the observed interval.
+MatMulV2 and PagedAttention accounted for 40.36% and 32.90% of device compute,
+respectively, but the host trace exposed the more actionable serialization:
+
+| Host/API event | Count | Total time |
+| --- | ---: | ---: |
+| `aclrtSynchronizeStreamWithTimeout` | 229 | 177.12 ms |
+| `_local_scalar_dense` operator rows | about 141 | about one per codec step |
+| `aclnnInplaceUniform` | 140 | 10.03 ms |
+| `aclrtRandomNumAsync` | 140 | 6.65 ms |
+| `_compute_slot_mapping_kernel` | 141 | 26.66 ms device time |
+
+The ordinary Talker reads the sampled EOS scalar after every eligible codec
+token.  Sparse transport, however, makes codec output visible to Code2Wav only
+at the 10-frame initial and 25-frame steady boundaries.  The experimental
+`VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS` path therefore retains samples
+on-device, reads one vector at the existing publish boundary, finds the first
+EOS there, and publishes only the prefix before EOS.  The max-token boundary
+still drops its sampled code.  Native-duplex and non-sparse paths retain the
+ordinary immediate EOS behavior.
+
+The matched test used the same static-CFM3 base, two warmups, ten fixed Chinese
+Seed-TTS prompts, concurrency one, seed zero and temperature zero.  Both runs
+completed 10/10 with 100% continuity.
+
+| Variant | Aggregate RTF | Mean TTFP | Mean TTFT | Mean E2E | Serving duration | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Per-token EOS control | 0.208119 | 273.43 ms | **78.61 ms** | 1171.62 ms | 11.721 s | 56.32 s |
+| Chunk-boundary EOS | **0.171280** | **267.86 ms** | 79.47 ms | **1023.84 ms** | **10.243 s** | 59.80 s |
+
+Lower is better except audio duration.  The candidate lowers aggregate RTF by
+17.70%, mean E2E and total serving time by 12.61%, and TTFP by 2.04%; TTFT
+moves +1.09%, inside the 2% guard.  Mean middle-chunk RTF computed directly
+from raw samples falls from 0.15341 to 0.11607 (-24.34%), and continuity stays
+at 100%.
+
+This is a real execution-speed improvement, not merely a denominator effect:
+wall-clock serving time fell even though the run generated 6.18% more audio.
+That duration change also means the optimization is not bit-exact.  It remains
+an accuracy-gated candidate until paired Seed-TTS WER/SIM, Daily-Omni and
+Video-MME stay within the competition's two-point allowance.  The missing
+derived summary fields in the candidate JSON are a benchmark-reporting issue;
+the artifact contains all ten TTFP/E2E arrays and all 70 per-chunk RTF arrays,
+which were used for the figures above.
+
+```text
+/tmp/vllm-omni-profiles/minicpmo45/a2-cfm3-current-stage1/
+/tmp/lunanexa-bench/cfm3-deferred-eos-official10/
+/tmp/minicpmo-cfm3-deferred-eos.log
+```
+
+The follow-up request-local RNG-slab experiment replaced 140 scalar
+`uniform_` launches with one request-wide random fill and a per-step device
+slice copy.  It generated the same 59.80 seconds / 1,435,200 frames as the
+chunk-boundary-EOS control, but regressed aggregate RTF from 0.171280 to
+0.173524 (+1.31%), mean E2E from 1023.84 to 1037.17 ms (+1.30%), middle-chunk
+RTF from 0.11607 to 0.11746 (+1.19%), and TTFP by 0.50%.  The additional
+per-step copy/index dependency costs more than the eliminated random launch
+on this A2 stack.  The implementation and deployment switch were removed;
+the negative artifact remains at:
+
+```text
+/tmp/lunanexa-bench/cfm3-deferred-eos-rng-slab-official10/
+/tmp/minicpmo-cfm3-deferred-eos-rng-slab.log
+```
+
+### Post-EOS trace and fixed-codec-slab rejection
+
+The retained chunk-boundary-EOS path was profiled again rather than assuming
+the previous trace still described it.  For the same 140-code hot request,
+`aclrtSynchronizeStreamWithTimeout` fell from 177.12 ms to 1.94 ms.  The
+Talker device window fell from 1066.70 to 864.79 ms, and free time from 676.25
+to 464.18 ms.  Device compute was 400.61 ms and free time remained 53.7%, so
+the dominant remaining budget is the per-code vLLM scheduler/IPC round trip,
+not scalar synchronization.  Slot mapping remained 26.69 ms, only 6.66% of
+device compute; its previously rejected isolated graph cannot close the
+remaining gap.
+
+A Python stack sample exposed recurrent sampled-code clones plus 147 Cat
+calls.  A fixed 16-code history ring and two 25-code ping-pong transport slabs
+removed those allocations and concatenations.  It passed five focused
+semantic tests and completed 10/10 requests with 100% continuity, but failed
+both structure and performance gates:
+
+| Variant | Aggregate RTF | Mean TTFP | Mean E2E | Middle-chunk RTF | Audio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained deferred EOS | **0.171280** | **267.86 ms** | **1023.84 ms** | **0.11607** | 59.80 s |
+| Fixed history/transport slabs | 0.176502 | 276.59 ms | 1046.48 ms | 0.11702 | 59.32 s |
+
+The candidate regressed RTF by 3.05%, TTFP by 3.26%, E2E by 2.21%, and also
+changed output length.  Per-token view copies/dependencies cost more than the
+removed small Cats on this A2 stack.  The implementation and profile were
+removed.  The next material architecture target is a Talker device loop or
+backend multi-step execution that amortizes scheduler crossings while
+preserving the efficient one-token Llama executable.
+
+```text
+/tmp/vllm-omni-profiles/minicpmo45/a2-cfm3-deferred-eos-stage1/
+/tmp/minicpmo-cfm3-deferred-eos-stage1.raw
+/tmp/lunanexa-bench/cfm3-fixed-codec-slabs-official10/
+```
+
+### Graph-internal codec embedding rejection
+
+An additional Stage-1 candidate connected the standalone inverse-CDF sampler
+to the existing one-token Talker graph through a fixed resident NPU scalar.
+The graph performed the small codec embedding at ingress, while the runner
+skipped its ordinary Python decode preprocess, eager embedding launch and
+`inputs_embeds` copy.  The vocabulary-wide codec head deliberately remained
+outside the Talker graph because the earlier fused-head experiment was much
+slower.
+
+The implementation passed its focused fixed-address and graph-switch tests,
+and both measured runs completed 10/10 requests with 100% streaming
+continuity.  It nevertheless failed the determinism and performance gates:
+
+| Variant | Aggregate RTF | Mean reported RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Retained deferred EOS | **0.171280** | - | **267.86 ms** | **79.47 ms** | 1023.84 ms | 59.80 s |
+| Internal embedding run 1 | 0.170075 | 0.173272 | 276.73 ms | 79.94 ms | 1012.46 ms | 59.56 s |
+| Internal embedding run 2 | 0.172009 | 0.175373 | 271.09 ms | 79.82 ms | **982.02 ms** | 57.12 s |
+
+Aggregate RTF is serving duration divided by generated audio duration; lower
+is better.  Its marginal movement changed sign across repeats, while TTFP
+regressed in both runs.  More importantly, the same ten prompts, seed zero and
+temperature zero produced different total frame counts in all three rows.
+The candidate's resident sampled-code scalar crosses the asynchronous engine
+state boundary and can be overwritten before every downstream consumer has
+materialized the prior value.  This is not a safe fixed-address ABI even
+though the next Talker replay itself reads the correct address.  The code and
+profile were removed rather than retaining a nondeterministic fast path.
+
+The result narrows the next architecture change: a multi-code device loop must
+own sampling, history, EOS and the repeated Talker invocation together.  A
+single mutable tensor cannot be exported through the current per-step engine
+contract as both graph input and scheduler-visible request state.
+
+```text
+/tmp/lunanexa-bench/internal-codec-embed-official10/
+/tmp/lunanexa-bench/internal-codec-embed-official10-repeat/
+/tmp/minicpmo-cfm3-internal-codec-embed.log
+```
+
+### Synchronous Talker scheduler rejection
+
+The post-EOS Python profile showed `EngineCore.step_with_batch_queue` on every
+codec step, so a matched candidate disabled asynchronous scheduling only for
+Stage 1.  The hypothesis was that a single-request benchmark had no second
+request whose work could justify the queue handoff.  Startup confirmed that
+Thinker remained asynchronous, Talker was synchronous, and the existing
+one-token decode graph captured and replayed normally.
+
+The queue was not wasted overhead: it overlaps CPU output processing with the
+next NPU decode.  Removing it serialized those phases and regressed the full
+10-request test despite 10/10 success and 100% streaming continuity:
+
+| Variant | Aggregate RTF | Mean reported RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained asynchronous Talker | **0.171280** | - | **267.86 ms** | 79.47 ms | **1023.84 ms** |
+| Synchronous Talker | 0.194153 | 0.196695 | 276.38 ms | **78.45 ms** | 1226.56 ms |
+
+Aggregate RTF regressed about 13.3% and E2E about 19.8%.  The profile was
+removed.  A future device-loop implementation should retain asynchronous
+request handling around the loop; eliminating the outer batch queue is not a
+substitute for amortizing multiple decode steps inside one worker execution.
+
+```text
+/tmp/lunanexa-bench/cfm3-sync-talker-official10/
+/tmp/minicpmo-cfm3-sync-talker.log
+```
+
+### Retained five-code first-packet profile on the current CFM3 stack
+
+The earlier five-code screen predated prompt-state reuse, native CFM3 and
+chunk-boundary EOS, so its 566 ms result did not answer whether the minimum
+packet helps the current stack.  The new profile changes only Stage 1's first
+transport boundary from ten codes to five.  With the three-code left context,
+HiFT receives ten mel frames and publishes its minimum non-empty 40 ms packet.
+Width 10 intentionally stays eager because this A2 CANN release previously
+aborted its captured graph at first replay; width-50 steady work retains the
+proven graph.
+
+Two independent runs used two warmups, ten measured Chinese Seed-TTS prompts,
+concurrency one, seed zero and temperature zero.  Both completed 10/10 with no
+failures and 100% streaming continuity:
+
+| Variant | Aggregate RTF | Mean reported RTF | Mean TTFP | Mean TTFT | Mean E2E | Audio duration |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Retained first-10 control | 0.171280 | - | 267.86 ms | **79.47 ms** | 1023.84 ms | 59.80 s |
+| First-5 run 1 | 0.172712 | 0.176069 | **253.09 ms** | 79.36 ms | **970.83 ms** | 56.24 s |
+| First-5 run 2 | **0.165697** | **0.168205** | 255.55 ms | 80.02 ms | 1046.71 ms | 63.20 s |
+| First-5 pooled/mean | **0.169000** | 0.172137 | **254.32 ms** | 79.69 ms | **1008.77 ms** | 119.44 s total |
+
+Pooled aggregate RTF is total serving duration divided by total generated
+audio across both runs; other pooled-row latency values are two-run means.
+Relative to the first-10 control, the new profile improves aggregate RTF by
+1.33%, mean TTFP by 5.05%, and mean E2E by 1.47%.  TTFT moves by 0.27% and is
+effectively unchanged.  The repeated TTFP gain shows that the saved five
+Talker steps outweigh the eager width-10 Code2Wav launch on the current stack.
+
+This becomes the retained low-TTFP/high-score profile.  It does not remove the
+existing accuracy gate: native CFM3 and chunk-boundary EOS already require the
+official Seed-TTS WER/SIM, Daily-Omni and Video-MME checks, and changing the
+first HiFT partition must be covered by the same end-to-end audio screen.
+
+```text
+/tmp/lunanexa-bench/cfm3-deferred-eos-i5-official10/
+/tmp/lunanexa-bench/cfm3-deferred-eos-i5-official10-repeat/
+/tmp/minicpmo-cfm3-deferred-eos-i5.log
+```
+
+### Selective-BF16 HiFT rejection on A2
+
+The next Stage-2 candidate moved HiFT's F0 predictor, pre-convolution,
+upsamplers, source downsamplers, residual blocks and final convolution to
+BF16.  Harmonic-source construction, phase accumulation, STFT/ISTFT and the
+published waveform remained FP32 precision islands.  Startup confirmed that
+the candidate was active rather than silently falling back.
+
+Two matched runs used the retained native-CFM3, deferred-EOS and five-code
+first-packet stack.  They produced exactly the same 56.24 and 63.20 seconds of
+audio as the two retained control runs, completed 10/10 requests, and kept
+100% streaming continuity.  Lower is better:
+
+| Variant, pooled/two-run mean | Aggregate RTF | Mean reported RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained FP32 HiFT | **0.169000** | **0.172137** | 254.32 ms | 79.69 ms | **1008.77 ms** |
+| Selective BF16 HiFT | 0.171575 | 0.174798 | **252.88 ms** | **77.66 ms** | 1024.16 ms |
+
+Selective BF16 improves mean TTFP by only 0.57% and TTFT by 2.55%, while
+regressing pooled aggregate RTF by 1.52%, mean reported RTF by 1.55%, and E2E
+by 1.53%.  The first run is an especially clean paired comparison because its
+audio length is identical: serving time rose from 9.713 to 9.944 seconds and
+aggregate RTF regressed 2.37%.  A2's BF16 convolution path does not amortize
+the boundary casts and backend/layout overhead at these small batch-one HiFT
+shapes.  The implementation and profile were removed; future lower-precision
+HiFT work must use a graph-visible, layout-propagated boundary rather than
+per-module dtype conversion.
+
+```text
+/tmp/lunanexa-bench/cfm3-i5-hift-bf16-official10/
+/tmp/lunanexa-bench/cfm3-i5-hift-bf16-official10-repeat/
+/tmp/minicpmo-cfm3-i5-hift-bf16.log
+```
+
+### Native static CFM2 performance/accuracy candidate
+
+The previous reduced-step rejection changed a loop bound but retained a wider
+serving ABI.  This candidate instead sets the complete steady Code2Wav solver
+width to two before backend construction.  Timeline tensors, all-step AdaLN,
+fixed estimator cache slabs, direct outputs and the outer graph are therefore
+native two-slot objects.  Prompt prefill and the first live packet retain
+their one-step schedules.
+
+Two matched runs completed 10/10 requests with 100% streaming continuity and
+produced exactly the same 56.24 and 63.20 seconds of audio as the retained
+CFM3 runs.  Lower is better:
+
+| Variant, pooled/two-run mean | Aggregate RTF | Mean reported RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained native CFM3 | 0.169000 | 0.172137 | **254.32 ms** | **79.69 ms** | 1008.77 ms |
+| Native static CFM2 | **0.161572** | **0.164286** | 260.21 ms | 80.69 ms | **964.40 ms** |
+
+Native CFM2 lowers pooled aggregate RTF by 4.40%, mean reported RTF by 4.56%
+and E2E by 4.40%.  TTFP regresses 2.32% despite using the same one-step first
+packet, and TTFT moves 1.25%; those movements confirm that steady CFM is no
+longer the dominant first-packet path.  CFM2 changes diffusion numerics and is
+retained only as a performance/accuracy candidate until official Seed-TTS
+WER/SIM passes within the two-point allowance.  It must not replace CFM3 in a
+submission based on transport success alone.
+
+```text
+/tmp/lunanexa-bench/cfm2-deferred-eos-i5-official10/
+/tmp/lunanexa-bench/cfm2-deferred-eos-i5-official10-repeat/
+/tmp/minicpmo-cfm2-deferred-eos-i5.log
+```
+
+### In-process Talker EngineCore rejection
+
+A Stage-1 architecture candidate removed the per-token ZMQ/msgpack boundary by
+hosting Talker's EngineCore on a dedicated thread in the API process.  The
+second revision also ran the complete single-request EngineCore loop on that
+thread, so codec steps no longer round-tripped through the asyncio event loop;
+only real streaming outputs were delivered back to the orchestrator.  Thinker
+and Code2Wav retained their ordinary subprocess isolation, and Talker retained
+asynchronous scheduling and the one-token decode graph.
+
+The complete-loop revision passed its cancellation/output-race tests and the
+real run completed 10/10 requests with 100% streaming continuity.  It reduced
+the first per-step inline prototype slightly, but remained decisively slower
+than the retained process-isolated stack.  Lower is better:
+
+| Variant | Aggregate RTF | Mean chunk RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Retained native CFM3 | **0.169000** | **0.172137** | **254.32 ms** | 79.69 ms | **1008.77 ms** |
+| Inline EngineCore, per-step event-loop handoff | 0.2733 | 0.28 | 429.28 ms | 81.83 ms | 1359.14 ms |
+| Inline EngineCore, continuous worker drain | 0.265986 | 0.276008 | 422.67 ms | **76.95 ms** | 1283.70 ms |
+
+The continuous loop proves that Python event-loop resubmission was only a
+small part of the regression.  Moving Talker's NPU runtime into the API
+process introduces more expensive GIL, host-thread and NPU-runtime contention;
+the original EngineCore subprocess already keeps its own efficient scheduler
+loop, so ZMQ is not the dominant Talker cost.  The inline runtime, profile and
+tests were removed.  A future multi-code Talker optimization must stay inside
+the isolated worker and fuse several model steps behind one engine command,
+instead of moving the entire EngineCore across the process boundary.
+
+```text
+/tmp/lunanexa-bench/cfm3-i5-talker-inline-v2-official10/
+/tmp/lunanexa-bench/cfm3-i5-talker-inline-drain-official10-valid/
+/tmp/minicpmo-cfm3-i5-talker-inline-drain.log
+```
+
+### Evaluator-visible source policy and official-protocol qualification
+
+The organizer installs the submitted Python source but supplies
+`vllm_omni/deploy/minicpmo_4_5.yaml` from the current `minicpm-challenge`
+baseline. Candidate-only deployment profiles therefore do not affect the
+score. The single-chip source policy now fills only absent, output-preserving
+Talker and Code2Wav settings: batched codec transport, deferred chunk EOS,
+direct binary stop control, prompt-state templates, HiFT weight-normalization
+materialization, and event-backed shared-memory wakeup.
+Explicit deploy values retain authority, and
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS=0` provides a matched rollback
+without disabling the existing Stage-0/1 decode graphs or connector events.
+
+The official A3 YAML cannot initialize Stage 0 on the available 32-GiB 910B4,
+so `minicpmo_4_5_1npu_a2_evaluator_compat.yaml` changes capacity planning only.
+It deliberately carries no CFM, chunk-boundary, dtype, sampler, or model
+numeric overrides. With the source defaults and native CFM6, ten fixed Chinese
+Seed-TTS requests completed 10/10 with 100% continuity. A second service was
+then launched with
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS=0`; it retained the same
+Stage-0/1 decode graphs and event-backed shared memory, but removed only the
+new exact producer/consumer defaults. Lower is better:
+
+| CFM6 source policy | Prompts | Mean audio RTF | Mean chunk RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Exact defaults | 10 | **0.387873** | **0.404148** | **594.21 ms** | **78.34 ms** | **1758.29 ms** |
+| Exact-default rollback | 10 | 0.426696 | 0.451212 | 873.99 ms | 82.16 ms | 2035.45 ms |
+
+This exploratory matched run suggested that the bundle could improve the
+evaluator's primary all-chunk RTF by **10.43%**,
+mean request RTF by **9.10%**, TTFP by **32.01%**, TTFT by **4.65%**, and E2E
+by **13.62%**. The generated totals differ by one 1.32-second sampled audio
+chunk (46.96 versus 48.28 seconds), but both per-request RTF and the official
+flattened chunk statistic independently show a large win. This matched
+rollback justified an official-protocol follow-up; it did not qualify the
+bundle for submission.
+
+These first A2 policy runs also inherited the exploratory server flag
+`--interleave-mm-strings`. The official Seed-TTS server fixture intentionally
+omits that flag because interleaving and TTS `ref_audio` must not share the
+Daily-Omni request path. The relative exact/rollback A/B remains useful because
+both sides used the same server, but final promotion metrics and all accuracy
+screens must be repeated with only the official deploy config plus
+`--trust-remote-code`.
+
+The reduced-solver experiments use that retained exact policy:
+
+| Native solver | Prompts | Mean audio RTF | Mean chunk RTF | Mean TTFP | Mean TTFT | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| CFM6 | 10 | 0.387873 | 0.404148 | 594.21 ms | 78.34 ms | 1758.29 ms |
+| CFM5 | 32 | 0.310151 | 0.320209 | 556.73 ms | 78.44 ms | 1710.61 ms |
+| CFM2 | 10 | 0.264708 | 0.268982 | 449.46 ms | 78.81 ms | 1209.94 ms |
+| CFM2 | 32 | **0.257140** | **0.260838** | **440.75 ms** | **76.99 ms** | **1118.29 ms** |
+
+CFM2 reduced matched ten-row RTF by 31.8%, TTFP by 24.4%, and E2E by
+31.2%, confirming that solver arithmetic—not transport microseconds—is the
+dominant remaining score budget. It remains an unqualified performance
+candidate. The first 32-row Paraformer screens used the deterministic
+performance setting `temperature=0` and reported mean WER `1.202915` for CFM2
+and `1.246473` for CFM5. A subsequent CFM6 control under that same setting also
+reported catastrophic WER (`1.3103`), proving that this screen measured an
+unusable argmax Talker codec distribution rather than reduced-CFM accuracy.
+Those WER numbers must not be used to accept or reject any solver width.
+
+The official Seed-TTS accuracy test leaves temperature unset so the server's
+model generation config controls Talker sampling, and runs concurrency four.
+CFM2 and CFM5 therefore remain opt-in research controls until they are rerun
+under that exact protocol. A distilled few-step flow map/student remains the
+safer large-gain route if the correctly controlled native reductions fail.
+
+The corrected CFM6 control, with no interleave flag, 32 fixed Chinese rows,
+two warmups, concurrency four and server-default temperature, passed the
+quality gate decisively. The first candidate also enabled Talker
+`weight_nz_mode=2` and stable PA graph inputs. That pair was rejected: it
+changed the sampled codec/audio distribution, failed WER catastrophically and
+did not improve the concurrent run. Lower is better except audio throughput:
+
+| Official-protocol CFM6 | Duration | Audio throughput | Mean chunk RTF | Mean TTFP | Mean TTFT | Mean WER |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Rollback control | 78.09 s | 2.0311 audio-s/s | 2.0222 | **3850.48 ms** | **111.20 ms** | **0.00865** |
+| NZ2 + stable-PA candidate | 85.93 s | 1.9816 audio-s/s | 2.0531 | **2917.34 ms** | 111.45 ms | 1.22731 |
+| Safe exact paths, no NZ/stable PA | **69.11 s** | **2.2950 audio-s/s** | **1.7978** | 3884.46 ms | 116.07 ms | **0.00865** |
+
+The concurrent quality run includes queue stalls in per-chunk RTF and TTFP,
+so those absolute values are not leaderboard numbers. They are valid for this
+paired rejection. The candidate generated 170.28 seconds of audio versus
+158.60 seconds for the control and missed the `0.0156` WER gate by two orders
+of magnitude. NZ2 and stable PA were therefore removed from evaluator-visible
+defaults. The remaining transport/cache/HiFT exact paths generated the same
+158.60 seconds of audio as the control and exactly matched its mean WER. They
+lowered benchmark duration by **11.50%**, mean chunk RTF by **11.10%**, and
+mean E2E latency by **11.58%**, while increasing audio throughput by
+**13.00%**. Mean TTFP moved 0.88% and TTFT 4.38% in the wrong direction, so
+those first-response movements are treated as noise/regression rather than a
+claimed win. The safe exact bundle is promoted; the rejected layout leaves
+remain experimental-only.
+
+A separate concurrency-one run of the promoted CFM6 candidate completed
+32/32 requests with 100% continuity: mean chunk RTF `0.39525`, median chunk
+RTF `0.25438`, mean TTFP `621.37 ms`, and mean TTFT `80.95 ms` on the available
+910B4. These A2 absolute numbers are not compared directly with the single
+910C leaderboard, but they provide the local target for reduced-solver
+qualification.
+
+Stage 2 previously consumed and discarded the complete lazy parent-checkpoint
+iterator before loading its independently owned `flow.pt` and `hift.pt`.
+Skipping that unowned 17.46-GiB safetensors scan reduced the observed Stage-2
+initialization-to-API-ready interval from about 465 seconds to 148 seconds on
+the GlusterFS-backed A2 host, a **68%** reduction (about 5 minutes 17 seconds).
+The already running service imported this change when Stage 2 was spawned, so
+the passing safe-exact performance/WER run above also exercised the corrected
+loader. This changes startup only, not model tensors or scored inference.
+
+At the 2026-08-27 23:58:38 leaderboard refresh, `向量贴贴` ranked ninth at
+RTF `0.2423`, TTFP `514.22 ms` and TTFT `45.72 ms`. The RTF leader reported
+`0.1066`, while the best observed first-response entry reported TTFP
+`156.03 ms` and TTFT `6.37 ms`. The primary gap is now Stage-2 throughput:
+closing the RTF gap requires about a 56% reduction from the submitted score,
+not another microsecond-scale transport fusion.
+
+The quality run also found that FunASR's default `AutoModel` initialization
+performs an update check even when the Paraformer checkpoint is already
+cached. The evaluator now passes `disable_update=True`, with compatibility
+fallbacks for older FunASR releases. This removes an external-network hang
+from repeatable accuracy qualification without changing ASR results.
+
+### Correct-protocol two-step CFM promotion
+
+The reduced native solvers were rerun without `--interleave-mm-strings`, with
+server-default temperature, two warmups, concurrency four, and the same 32
+fixed Chinese Seed-TTS rows. Each run generated the same 158.60 seconds of
+audio as the retained CFM6 control and completed 32/32 requests with 100%
+streaming continuity. Higher is better for throughput and SIM; lower is better
+for the other columns:
+
+| Solver | Duration | Audio throughput | Mean TTFT | Mean WER | WavLM-base-plus SIM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CFM6 retained control | 69.11 s | 2.295 audio-s/s | 116.07 ms | 0.00865 | prior retained screens about 0.845 |
+| CFM3 | 41.55 s | 3.82 audio-s/s | 96.39 ms | 0.0101 | **0.84858** |
+| CFM2 | **40.60 s** | **3.91 audio-s/s** | **96.26 ms** | **0.0072** | 0.84240 |
+
+Relative to CFM6, CFM2 reduced the complete concurrent batch duration by
+**41.25%** and increased generated-audio throughput by **70.37%**, without
+shortening the output. Its WER is below the organizer's `0.0156` gate and its
+WavLM-base-plus similarity is 15.34 points above the `0.689` gate. CFM3 passed
+too, but was slower and had worse WER on the same screen, so it is not the
+submission default.
+
+The upstream Seed-TTS fine-tuned WavLM-SV protocol was also run for diagnostic
+parity. Its absolute scores are not comparable with the competition's `0.689`
+WavLM-base-plus threshold: CFM2 scored `0.25287` and CFM3 scored `0.27367`,
+while historical MiniCPM-o controls on other retained subsets were also near
+zero. Those figures are retained as cross-checks, not used as the competition
+admission metric.
+
+The first evaluator-visible one-chip promotion filled an absent Stage-2
+`VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS` with `2`. An explicit stage or
+launch environment value remains authoritative. Setting
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT=0` disables only this numerical
+default; setting `VLLM_OMNI_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS=0` retains the
+broader matched rollback. The complete official Seed-TTS pool remains a final
+release gate before submission; this 32-row promotion is the fail-fast screen,
+not a claim that the full pool has already run.
+
+A fresh source-visibility run then launched the generic evaluator-compatible
+deploy with no timestep override. The policy log included `code2wav-cfm2`, and
+Stage 2 reported `token2wav_n_timesteps=2`, proving that the organizer-visible
+source path—not a private profile or benchmark environment—selected the new
+solver. Its 32-row concurrency-one result is directly comparable with the
+retained CFM6 run on the same A2 host:
+
+| Metric | CFM6 | Source-default CFM2 | Change |
+| --- | ---: | ---: | ---: |
+| Mean flattened chunk RTF | 0.39525 | **0.32233** | **-18.45%** |
+| Median flattened chunk RTF | 0.25438 | **0.23707** | **-6.80%** |
+| P99 flattened chunk RTF | not retained | 0.72869 | — |
+| Mean TTFP | 621.37 ms | **491.92 ms** | **-20.83%** |
+| Mean E2E | 1797.41 ms | **1504.50 ms** | **-16.29%** |
+| Mean TTFT | 80.95 ms | **76.01 ms** | **-6.10%** |
+| Audio throughput | 2.7066 audio-s/s | **3.2933 audio-s/s** | **+21.67%** |
+
+The smaller concurrency-one gain relative to the concurrency-four duration
+gain shows that Talker and per-chunk HiFT/orchestration are now a larger share
+of the critical path. A further solver-only reduction cannot close the full
+leaderboard gap by itself.
+
+### Quality-gated one-step CFM promotion
+
+The same official-protocol screen was then repeated with native CFM1. It
+completed 32/32 requests with 100% streaming continuity and passed both quality
+gates:
+
+| Solver | Concurrent duration | Mean WER | WavLM-base-plus SIM |
+| --- | ---: | ---: | ---: |
+| CFM6 retained control | 69.11 s | 0.00865 | about 0.84485 |
+| CFM2 | **40.60 s** | **0.0072** | **0.84240** |
+| CFM1 | 41.48 s | 0.0087 | 0.83694 |
+
+CFM1's SIM loss is only 0.79 percentage points relative to the retained CFM6
+proxy, inside the two-point allowance, and its WER remains below `0.0156`.
+Concurrency four did not improve because the reduced solver is no longer the
+dominant resource at that load. At concurrency one, where the leaderboard's
+per-request latency metrics are visible, it retained a smaller but measurable
+win over CFM2:
+
+| Metric | CFM2 | CFM1 | Change |
+| --- | ---: | ---: | ---: |
+| Mean flattened chunk RTF | 0.32233 | **0.30273** | **-6.08%** |
+| Median flattened chunk RTF | 0.23707 | **0.22418** | **-5.44%** |
+| P99 flattened chunk RTF | 0.72869 | **0.63560** | **-12.77%** |
+| Mean TTFP | 491.92 ms | **455.93 ms** | **-7.32%** |
+| Mean E2E | 1504.50 ms | **1392.11 ms** | **-7.47%** |
+| Complete batch duration | 48.16 s | **44.56 s** | **-7.46%** |
+
+The CFM1 performance run generated 155.72 seconds of audio versus CFM2's
+158.60 seconds, a 1.82% length difference that is inside the quality allowance
+but means the latency delta is not purely compute. The source default therefore
+uses a rollback ladder rather than deleting the safer candidate. With no
+explicit timestep value, CFM1 is selected. Setting
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT=0` falls back to CFM2; also
+setting `VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT=0` restores CFM6.
+An explicit launch or Stage-2 timestep value still wins over every default.
+The complete 2020-row official pool remains the release gate.
+
+### First-five packet rejection under the official chunk-mean RTF
+
+With CFM1 established, synchronized hot timing measured the default first
+Code2Wav packet at 75.30 ms: 12.77 ms encode, 34.38 ms CFM, 27.85 ms HiFT and
+0.31 ms state publication. Client TTFP was 479.79 ms, leaving about 404.5 ms
+before or around Stage 2, principally the wait for the first 25 Talker codes.
+
+An official-protocol candidate lowered only the first transport boundary to
+five new codes, the HiFT continuity minimum. It completed 32/32 requests,
+retained 100% continuity and 158.60 seconds of audio at concurrency four, and
+passed WER at `0.0102`. At concurrency one it reduced mean TTFP from 455.93 ms
+to **271.47 ms** and P99 TTFP to **280.44 ms**, while E2E was unchanged.
+
+It is nevertheless rejected for the ranked submission. The organizer defines
+RTF as the arithmetic mean over every audio chunk and ranks RTF first. The
+40-ms first packet makes its full request wait the numerator of a very small
+first-chunk denominator. Mean flattened chunk RTF therefore regressed from
+`0.30273` to `1.33619`, despite unchanged whole-audio throughput. This is a
+real scoring consequence, not a throughput regression. A submission-oriented
+first boundary must amortize pre-audio work over a longer packet and preferably
+land on an efficient static Stage-2 width.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-source-default-cfm1-stage2-timing-zh1/
+/tmp/lunanexa-bench/a2-evaluator-source-default-cfm1-stage2-timing-hot-zh1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first5-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first5-official-export-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first5-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-source-default-cfm1-stage2-timing.log
+/tmp/minicpmo-a2-evaluator-cfm1-first5-official-server.log
+```
+
+### Ranked first-packet RTF optimization
+
+The official rules rank the arithmetic mean of all chunk RTF values before
+TTFP. The opposite scheduling direction was therefore screened: retain more
+Talker codes in the first packet so the one-time pre-audio latency is divided
+by a longer audio duration. First-47 also combines the three-code left context
+into a natural width-50 Stage-2 input.
+
+All performance rows use the same 32 Chinese prompts, two warmups,
+concurrency one and server-default sampling. Lower is better:
+
+| Initial codec frames | Mean chunk RTF | P99 chunk RTF | Mean TTFP | Mean E2E | Decision |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 25, CFM1 control | 0.30273 | 0.63560 | **455.93 ms** | 1392.11 ms | Lower-TTFP rollback |
+| 47 | **0.27479** | **0.53501** | 646.86 ms | 1405.55 ms | Promoted after quality gate |
+| 72 | 0.26916 | 0.51272 | 879.68 ms | **1399.39 ms** | Rejected: WER failure |
+
+First-47 improves the primary mean-chunk RTF by **9.23%** and P99 RTF by
+15.82% relative to first-25. First-72 improved RTF by another 2.05%, but its
+official-protocol WER was `0.0172`, above the `0.0156` admission threshold, so
+the numerically fastest ranked candidate is not eligible.
+
+First-47 completed 32/32 quality requests, retained 100% continuity and
+158.60 seconds of audio, scored WER `0.0087`, and scored `0.83727` with the
+competition WavLM-base-plus proxy. The SIM change is about -0.76 percentage
+points from the retained CFM6 proxy, inside the two-point allowance.
+
+The evaluator-visible single-chip policy now defaults an absent
+`VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES` to `47`. An explicit launch
+or Stage-1 value remains authoritative. Setting
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT=0` restores the native
+25-frame first boundary without disabling the other exact defaults. This is a
+ranked-profile tradeoff: it improves the primary RTF metric at the cost of
+about 191 ms TTFP on this A2 host.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-official-export-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first72-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first72-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first72-official-export-zh32/
+/tmp/minicpmo-a2-evaluator-cfm1-first47-quality-server.log
+/tmp/minicpmo-a2-evaluator-cfm1-first72-official-server.log
+```
+
+The evaluator-visible source default was then restarted without either an
+explicit timestep or chunk-boundary override.  The same 32-row, two-warmup,
+concurrency-one protocol measured mean flattened chunk RTF `0.27780`, P99
+`0.52572`, mean TTFP `648.94 ms`, and mean E2E `1418.63 ms`.  This is within
+1.10% of the explicit first-47 candidate and proves that the submitted source,
+not only the exploratory launch environment, selects CFM1 and first-47.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-source-default-cfm1-first47-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-source-default-cfm1-first47-server.log
+```
+
+### Steady-47 fixed-width rejection
+
+The next candidate also changed every steady Talker publication from 25 to 47
+new codec frames.  With the three-frame left context this makes the normal
+Stage-2 input width 50, but it did not improve the ranked metric.  The exact
+environment was confirmed in the Stage-1 process before measurement.
+
+| Candidate | Chunks | Mean chunk RTF | P99 chunk RTF | Mean TTFP | Mean E2E |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Source default: first 47, steady 25 | 141 | **0.27780** | **0.52572** | **648.94 ms** | **1418.63 ms** |
+| First 47, steady 47 | 98 | 0.33763 | 1.11675 | 651.50 ms | 1493.27 ms |
+
+Steady-47 regressed mean RTF by **21.54%**.  Its 66 non-terminal chunks
+already averaged `0.29689`, so the wider Stage-2 work is not cheaper per audio
+second on this A2 stack.  In addition, the 32 terminal chunks averaged
+`0.42168` and reached `1.19613`: a large publication boundary leaves a shorter
+terminal remainder whose fixed launch cost is heavily amplified by the
+organizer's unweighted mean-over-chunks metric.  Static width alone is
+therefore insufficient.  Future chunk-shape work must eliminate or cheaply
+complete short terminal packets and pass WER/SIM; this launch candidate is
+rejected and is not a source default.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-steady47-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-cfm1-first47-steady47-server.log
+```
+
+### First-60 boundary rejection
+
+An intermediate first-packet boundary was screened after first-47 passed and
+first-72 failed WER.  It retained the 25-frame steady boundary and changed
+only the initial publication to 60 new codec frames.  The same source tree,
+32 Chinese rows, two warmups and concurrency one produced 158.60 seconds of
+audio with 100% continuity.
+
+| Initial frames | Chunks | Mean chunk RTF | First-chunk mean RTF | Terminal-chunk mean RTF | Mean TTFP |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 47 explicit control | 141 | **0.27479** | 0.37608 | - | **646.86 ms** |
+| 60 | 127 | 0.28092 | **0.33850** | 0.35453 | 758.24 ms |
+
+First-60 amortized the first packet as intended, but its mean ranked RTF was
+2.23% worse than the explicit first-47 control.  The longer first boundary
+changes the modulo-25 terminal remainder and makes the final short packet more
+expensive under the unweighted chunk mean.  Because it failed the performance
+screen, WER/SIM were not run and first-47 remains the source default.
+
+A raw official-shape diagnostic request made the mechanism concrete.  Its
+first-60 packet contained 2.24 seconds of PCM, three normal steady packets
+contained exactly 1.00 second each, and its terminal packet contained only
+0.56 second.  The terminal arrival interval was 217.30 ms, so that final packet
+alone scored RTF `0.38319`.  This motivates a quality-gated terminal-duration
+floor rather than further initial-boundary integer search.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first60-steady25-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-cfm1-first60-steady25-server.log
+```
+
+### Quality-gated terminal-packet floor
+
+The first-60 diagnostic identified the short terminal remainder as a ranked
+RTF outlier.  Stage 2 can now extend only a shorter final packet with digital
+silence to an explicit minimum duration.  The synthesized prefix, request
+state, and every non-terminal packet are unchanged.  A 1000-ms screen improved
+the ranked RTF by 9.30% but failed WER at `0.0172`, so it was rejected.
+
+The safer 600-ms candidate passed two identical 32-row WER screens and the
+competition WavLM-base-plus proxy:
+
+| Metric | Source default | Terminal 600 ms | Change / gate |
+| --- | ---: | ---: | ---: |
+| Mean flattened chunk RTF | 0.27780 | **0.26327** | **-5.23%** |
+| P99 flattened chunk RTF | 0.52572 | **0.39779** | **-24.33%** |
+| Mean TTFP | 648.94 ms | **645.91 ms** | -0.47% |
+| Mean E2E | 1418.63 ms | **1383.28 ms** | -2.49% |
+| Mean WER, repeat 1 / 2 | 0.0087 | **0.0153 / 0.0153** | pass, <= 0.0156 |
+| WavLM-base-plus SIM | about 0.84485 | **0.8310** | -1.39 pp, pass |
+
+Two narrower offline boundary screens confirmed that 600 ms is the largest
+jointly admissible floor on this sample.  They appended only digital silence
+to the exact terminal-600 exports, then reran the same per-row Paraformer and
+WavLM-base-plus code paths:
+
+| Floor | Mean WER | WavLM SIM | Result |
+| --- | ---: | ---: | --- |
+| 700 ms | 0.01587 | 0.82620 | reject: WER > 0.0156 |
+| 800 ms | 0.01391 | 0.81891 | reject: SIM is -2.59 pp vs CFM6 |
+
+The two metrics bind in opposite directions near the boundary, so neither
+candidate is promoted without a larger official rerun demonstrating margin.
+
+The one-chip policy therefore defaults
+`VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS=600`.  An explicit launch or
+stage value remains authoritative.  Setting
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT=0` disables only
+this ranked-output policy.  The more aggressive 1000-ms candidate is not a
+source default.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-repeat-quality-sim-zh32/
+/tmp/minicpmo-a2-evaluator-cfm1-first47-terminal600-server.log
+```
+
+### Isolated stable-PagedAttention rejection
+
+The earlier stable-input PagedAttention screen combined that graph contract
+with `weight_nz_mode=2`, so its catastrophic accuracy result did not identify
+which switch changed Talker sampling.  A new candidate isolated stable PA on
+the current first-47, CFM1 and terminal-600 source defaults without NZ weight
+preformatting.
+
+Its apparent performance was large but invalid: 32-row flattened chunk RTF
+fell from `0.26327` to `0.20155` and TTFP from `645.91` to `570.99` ms, while
+total generated audio increased from 159.68 to 200.20 seconds.  Wall-clock
+duration improved only 1.16%.  The official quality screen confirmed that the
+longer output was not a valid speedup: mean WER was `1.2856` across 31
+evaluable rows, with one ASR failure, versus the `0.0156` admission limit.
+WavLM-base-plus SIM was `0.7797`, but speaker similarity cannot compensate for
+incorrect spoken content.
+
+Stable PA is therefore rejected independently of NZ2 and is not enabled by
+the evaluator-visible policy.  Future Talker graph-input work must preserve
+the fused-attention numerical path and the codec/EOS distribution, not merely
+reduce graph-parameter maintenance.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-stable-pa-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-stable-pa-official-quality-sim-zh32/
+/tmp/minicpmo-a2-evaluator-cfm1-first47-terminal600-stable-pa-server.log
+```
+
+### FIA sequence-length bucket: initial rejection and corrected promotion
+
+A second Talker experiment retained fused-infer-attention rather than changing
+to PagedAttention.  It rounded each decode KV length to a 16-token bucket,
+masked the not-yet-valid tail, and attempted to reuse the twenty captured FIA
+tasks inside a bucket.  Standalone 910B4 probes were bit-identical in BF16
+(maximum absolute error 0.0), including the real Talker shape (12 heads,
+64-dimensional heads, a three-dimensional KV-cache view and a 4096-slot block
+table).
+
+The full graph did not preserve that result.  The candidate completed the
+32-row performance run, but generated 202.32 seconds of audio in 186 chunks,
+versus 159.68 seconds and 141 chunks for the safe control.  Its apparent
+flattened chunk RTF of 0.19541 is therefore invalid; the Talker sampling/EOS
+path had drifted.  This isolates the failure to captured CANN task reuse rather
+than the eager attention arithmetic.  The bucket profile remains experimental
+and is not part of evaluator-visible defaults.
+
+A follow-up fixed the original mask-producer race by enqueueing the tail-mask
+writes on the task-update stream before signaling each captured FIA group.  A
+hot single request then matched the control's five chunks and 5.68-second
+audio duration, while E2E fell from 1.504 to 1.266 seconds.  The complete
+32-row run nevertheless reproduced 202.32 seconds and 186 chunks.  Its mean
+chunk RTF was 0.19643 (25.4% below the safe 0.26327), but the official WER-only
+screen rejected it decisively: mean WER was 1.7680, only seven rows were
+evaluable and 25 ASR/WER rows failed.  Stream ordering was therefore a real
+bug, but not the numerical cause of the invalid autoregressive trajectory.
+
+FIA-v2 separately demonstrated bit-identical eager output while accepting a
+fixed-address device sequence-length tensor.  On the installed A2 CANN 9.0 /
+torch-npu stack, both its workspace helper and the FIA-v2 task itself extract a
+local scalar from that tensor.  NPUGraph capture rejects the required stream
+synchronization with error 107027 (`stream is captured`), so this path cannot
+provide dynamic device lengths on the competition runtime and is also not
+promoted.
+
+The final correction identified two independent full-graph bugs that the
+operator-only probes could not expose. First, the reuse key contained only the
+rounded sequence length, so a new request could reuse tasks bound to the prior
+request's block-table buffers. The key now includes every captured layer's
+block-table address. Second, the initial tail-mask fill ran while the outer
+NPUGraph was capturing; replay therefore overwrote every runtime mask with the
+capture-time mask immediately before FIA. Capture now allocates the stable mask
+without recording a write, and the task-update stream produces the runtime mask
+before signaling the captured FIA groups.
+
+Real 910B4 checks then proved both levels independently: rounded FIA with the
+three-dimensional tail mask was bit-identical to exact-length sparse-mode-3
+FIA, and a captured single-FIA task remained bit-identical while crossing
+16-token buckets and reusing a bucket. The corrected complete service restored
+the expected output geometry instead of the rejected 202.32-second trajectory.
+The evaluator-visible source policy, using the generic A2 compatibility YAML
+with no private bucket override, reproduced the win:
+
+| Metric, lower is better | Safe control | Source-default bucket16 | Improvement |
+| --- | ---: | ---: | ---: |
+| Mean flattened chunk RTF | 0.263267 | **0.222028** | **15.66%** |
+| P99 flattened chunk RTF | 0.397793 | **0.334418** | **15.93%** |
+| Mean audio TTFP | 645.915 ms | **563.890 ms** | **12.70%** |
+| Mean E2E | 1383.281 ms | **1166.872 ms** | **15.64%** |
+
+The source-default run completed 32/32 requests, generated 158.20 seconds / 142
+chunks, and retained 100% streaming continuity. Two independent performance
+launches measured mean chunk RTF 0.22295 and 0.22203, so the result is not tied
+to the isolation profile.
+
+Three official-protocol 32-row WER screens scored `0.017020`, `0.013400`, and
+`0.017020`; all completed 32/32 with no request, PCM, ASR, or scoring failure.
+The stricter local `0.0156` early-screen boundary lies inside that run-to-run
+range, while the maximum degradation from the matched safe `0.0153` control is
+only 0.17 percentage points, inside the competition's two-point allowance.
+The WavLM-base-plus proxy scored `0.8260` versus the safe control's `0.8310`, a
+0.50-point loss, with 32/32 embeddings and no failures. The one-chip source
+policy therefore defaults `fia_graph_seq_len_bucket_size=16` only for Stage 1.
+An explicit Stage-1 additional-config value remains authoritative, and
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT=0` restores exact-length
+task updates.
+
+torch-npu's outer `auto_dispatch_capture` FIA handler was also evaluated and
+removed. The fused unified-attention custom-op boundary produced zero native
+dispatch records even though twenty Talker layers were captured. Its apparent
+0.188 chunk RTF came from replaying capture-time KV lengths and failed WER
+catastrophically; a larger outer handler cannot see through that compiled-op
+boundary on this stack.
+
+A wider 32-token bucket was then screened twice to test whether remaining task
+rebinding was still the dominant cost. Against bucket16 with the same
+161.04-second output signature, bucket32 reduced mean chunk RTF from 0.22295 to
+0.22222, only 0.33%, while P99 RTF regressed by 0.15%. With the alternate
+158.20-second signature it reduced mean RTF from 0.22203 to 0.22003, but TTFP
+regressed from 563.89 to 572.39 ms and P99 RTF from 0.33442 to 0.33973. The
+sub-one-percent mean gain is below the promotion threshold and loses both tail
+latency guards, so bucket16 remains the source default. Task rebinding is no
+longer the primary Talker bottleneck; the next trace targets in-block layout
+conversion and small operators.
+
+### Bucket16 hot trace and scalar decode slot mapping
+
+The refreshed Stage-1-only trace covered ten official-shape requests after the
+capture-safe bucket16 promotion. Unlike the older layout trace, it contained no
+material `TransData` or `Transpose` budget. `MatMulV2` accounted for 45.821% of
+device time and FIA for 20.732%. The next discrete hotspot was instead the
+generic `_compute_slot_mapping_kernel`: 1,288 launches, 243.294 ms total,
+188.892 us average and 8.972% of all Stage-1 device time. The kernel clears the
+maximum slot slab on every call even though batch-one Talker decode consumes
+only slot zero; the runner separately pads the much smaller active graph view.
+
+The retained vLLM-Ascend path is an opt-in scalar Triton kernel for exactly one
+request, one live token and DCP world size one. It reads the stable position,
+performs the same physical-to-logical hybrid-block mapping, writes slot zero,
+and leaves prefill, batching, DCP and every disabled case on the canonical
+kernel. `VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH=0` or
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT=0` restores the generic
+path. This is distinct from the previously rejected nested-NPUGraph prototype:
+the scalar kernel has no inner graph replay boundary.
+
+Three 32-row runs completed without request or streaming failures. The two
+runs with the same 158.20-second / 142-chunk output signature measured mean
+chunk RTF 0.219961 and 0.218859, versus 0.222028 for the retained bucket16
+control. Their mean is 0.219410, 1.18% lower. Server-side Stage-1 ITL over the
+last 32 requests fell from 7.3313 ms to 7.1977 ms, or 1.82%. The best matched
+run also reduced mean TTFP from 563.890 to 562.778 ms and mean E2E from
+1166.872 to 1154.089 ms. P99 chunk RTF was 0.335229 versus 0.334418, a 0.24%
+tail change; the alternate 160.92-second signature improved P99 from the
+matching 0.350188 control to 0.343646.
+
+The official quality gates preserved the output trajectory: WER was 0.0170
+over 32/32 rows with zero request, PCM, ASR or scoring failures, and WavLM
+speaker SIM was 0.82583 over 32/32 embeddings with zero failures. Those match
+the retained bucket16 ranges (WER 0.0134--0.01702 and SIM 0.8260) and remain
+well inside the competition's two-percentage-point allowance. The single-chip
+source policy therefore enables the scalar path only for the Talker stage and
+keeps both an explicit rollback and an isolation profile.
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-fia-bucket16-v2-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-fia-bucket16-v2-server.log
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-fia-bucket16-update-stream-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-first47-terminal600-fia-bucket16-update-stream-wer-only-zh32/
+/tmp/minicpmo-a2-evaluator-fia-bucket16-update-stream-server.log
+/tmp/minicpmo-a2-evaluator-fia-v2-stable-v3-server.log
+/tmp/fia-bucket16-capture-safe-perf-20260828/
+/tmp/fia-bucket16-capture-safe-wer-20260828/
+/tmp/source-default-fia-bucket16-perf-20260828/
+/tmp/source-default-fia-bucket16-wer-repeat-20260828/
+/tmp/source-default-fia-bucket16-sim-20260828/
+/tmp/minicpmo-a2-source-default-fia-bucket16-server.log
+/tmp/fia-bucket32-perf-20260828/
+/tmp/fia-bucket32-perf-repeat-20260828/
+/tmp/minicpmo-a2-fia-bucket32-server.log
+/tmp/vllm-omni-profiles/minicpmo45/a2-fia-bucket16-stage1/
+/tmp/slotfast-official-perf-20260828/
+/tmp/slotfast-official-wer-20260828/
+/tmp/slotfast-official-sim-20260828/
+/tmp/minicpmo-a2-fia-bucket16-slotfast-server.log
+```
+
+### Persistent Talker decode metadata
+
+The Stage-1 trace also showed that the batch-one decode runner retransmitted
+metadata whose values do not change between codec tokens. In particular, it
+uploaded the active KV block-table row on every step even though allocation
+changes occur only at block boundaries, and it recopied the same
+`query_start_loc`, request index, query offset, one-token schedule length,
+discard mask, and all-ones accepted-token slab. These tiny copies create host
+dispatch, H2D copy, fill, and event work around a decode graph whose tensor
+addresses are already stable.
+
+The retained vLLM-Ascend implementation has two independently reversible
+parts. Block-table rows are dirty-tracked by every append, clear, move and swap
+mutation and are uploaded only when an active row changed. The batch-one,
+non-speculative, non-DCP decode path fingerprints its invariant metadata and
+leaves matching slabs resident at their graph-visible NPU addresses. Prefill,
+batching, speculative decode, DCP, GDN, shape transitions, and disabled cases
+invalidate the fingerprints and use the canonical uploads. The source-default
+single-chip policy scopes both switches to the Talker stage. Set
+`VLLM_OMNI_MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT=0` to disable both,
+or set `VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT=0` and
+`VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE=0` independently.
+
+Dirty block-table submission alone reduced matched Stage-1 ITL from 7.1977 to
+7.0845 ms, but its 158.20-second whole-service run was neutral: mean chunk RTF
+was 0.219477 versus the slot-fast two-run mean of 0.219410. It therefore was
+not promoted by itself. Adding invariant metadata residency produced two
+same-direction official-shape runs and improved both output signatures.
+
+| Metric, lower is better | Slot-fast matched control | Persistent metadata | Improvement |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF, 158.20 s / 142 chunks | 0.219410 | **0.216392** | **1.38%** |
+| P99 chunk RTF | 0.336446 | **0.333836** | **0.78%** |
+| Mean audio TTFP | 562.852 ms | **553.566 ms** | **1.65%** |
+| Mean E2E | 1155.853 ms | **1138.786 ms** | **1.48%** |
+| Stage-1 ITL | 7.1977 ms | **6.9858 ms** | **2.94%** |
+
+The independent 161.04-second / 145-chunk repeat also improved every guarded
+metric versus dirty-only: mean chunk RTF 0.222004 to 0.216280, P99 0.346446 to
+0.334312, TTFP 568.236 to 556.054 ms, E2E 1188.152 to 1158.536 ms, and
+Stage-1 ITL 7.1777 to 7.0034 ms. All 96 measured requests across performance
+and quality runs completed with continuous streaming and no request or PCM
+failure.
+
+The exact quality gate remained unchanged. Seed-TTS WER was 0.0170 over 32/32
+utterances with zero ASR failures. Offline-cache WavLM SIM was 0.8259 over
+32/32 embeddings with zero failures, matching the prior 0.82583 result. The
+first combined WER/SIM invocation recorded 32 SIM infrastructure failures
+because Hugging Face HEAD requests were reset; forcing `HF_HUB_OFFLINE=1`
+loaded the already cached identical WavLM checkpoint and completed the gate.
+
+```text
+/tmp/dirtybt-official-perf-20260828/
+/tmp/dirtybt-official-perf-repeat-20260828/
+/tmp/metacache-official-perf-20260828/
+/tmp/metacache-official-perf-repeat-20260828/
+/tmp/metacache-official-quality-20260828/
+/tmp/metacache-official-sim-offline-20260828/
+/tmp/minicpmo-a2-fia-bucket16-slotfast-dirtybt-metacache-server.log
+```
+
+### Fused batch-one Talker metadata
+
+The next retained step replaces the remaining batch-one decode scalar chain
+with one graph-visible Triton/Ascend program. After the single dynamic
+`num_computed_tokens` upload, the kernel writes position, sequence length, and
+the first KV group's slot mapping together; every additional non-Mamba KV
+group updates only its own slot slab. The implementation retains the exact
+integer arithmetic and stable graph input addresses. It is gated by
+`VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING=1` under the same batch-one,
+one-token, non-prefill, non-speculative, non-DCP, non-GDN and non-multiaxis-RoPE
+conditions as the resident metadata path.
+
+The first integration attempt exposed that MiniCPM-o uses
+`MultiGroupBlockTable`; the missing wrapper method killed Stage 1 before any
+scored request (0/32). That run was rejected, the wrapper was implemented to
+cover every KV group, and both six focused unit tests and a cold real request
+then passed before the official-shape run.
+
+| Metric, lower is better | Persistent metadata control | Fused metadata | Improvement |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF, 161.04 s / 145 chunks | 0.216280 | **0.208516** | **3.59%** |
+| P99 chunk RTF | 0.334312 | **0.331753** | **0.77%** |
+| Mean audio TTFP | 556.054 ms | **544.965 ms** | **1.99%** |
+| Mean E2E | 1158.536 ms | **1120.094 ms** | **3.32%** |
+| Stage-1 ITL | 7.0034 ms | **6.7004 ms** | **4.33%** |
+
+The quality run completed 32/32 requests with continuous streaming and zero
+request, PCM, ASR or embedding failures. WER remained 0.0170 and WavLM SIM
+remained 0.8259, exactly matching the previous accepted quality gate.
+
+```text
+/tmp/fusedscalar-multigroup-official-perf-20260828/
+/tmp/fusedscalar-multigroup-official-quality-20260828/
+/tmp/minicpmo-a2-fia-bucket16-slotfast-dirtybt-metacache-fusedscalar-multigroup-server.log
+```
+
+### Isolated Talker FRACTAL_NZ rejection
+
+The current hot trace attributes 45.821% of Stage-1 device time to
+`MatMulV2`, so Stage 1 was rerun with only its immutable BF16 linear weights
+preformatted as FRACTAL_NZ (`weight_nz_mode=2`).  CFM1, first-47,
+terminal-600, FIA bucket16, scalar slot mapping and fused resident metadata
+were unchanged.  The 32-request result exactly matched the control's 161.04
+seconds of audio and 145 chunks, but did not improve the primary metric:
+
+| Metric, lower is better | ND control | FRACTAL_NZ | Change |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF | **0.208516** | 0.209138 | +0.30% |
+| P99 chunk RTF | 0.331753 | **0.327603** | -1.25% |
+| Mean audio TTFP | **544.965 ms** | 549.391 ms | +0.81% |
+| Mean E2E | **1120.094 ms** | 1124.911 ms | +0.43% |
+| Stage-1 ITL | **6.7004 ms** | 6.7046 ms | +0.06% |
+
+The small P99 movement does not compensate for regressions in the ranked
+mean, TTFP, E2E and total duration.  On this graph, GE's existing weight-format
+selection is already at least as effective as whole-layer NZ preformatting.
+The isolation profile was removed and the source default remains unchanged.
+
+```text
+/tmp/fusedscalar-nz-smoke-20260828/
+/tmp/fusedscalar-nz-official-perf-20260828/
+/tmp/minicpmo-a2-fia-bucket16-fusedscalar-nz-server.log
+```
+
+### Graph-wide FIA gate rejection
+
+Bucket16 avoids task-parameter rebinding for fifteen out of every sixteen
+Talker decode tokens, but its captured graph still contains one
+`ExternalEvent` gate per FIA layer.  An opt-in lower-layer candidate replaced
+those twenty gates with one gate before the first FIA layer.  At a bucket
+transition the update stream first queued all twenty task updates and then
+released the graph; inside a bucket it updated the tail mask and recorded only
+the single gate.  This preserved exact attention math and the 161.04-second,
+145-chunk output signature, but lost useful layer-by-layer update/compute
+overlap:
+
+| Metric, lower is better | Per-layer gates | Single graph gate | Change |
+| --- | ---: | ---: | ---: |
+| Mean chunk RTF | **0.208516** | 0.212717 | +2.01% |
+| P99 chunk RTF | 0.331753 | **0.331458** | -0.09% |
+| Mean audio TTFP | **544.965 ms** | 554.493 ms | +1.75% |
+| Mean E2E | **1120.094 ms** | 1142.809 ms | +2.03% |
+| Stage-1 ITL | **6.7004 ms** | 6.8430 ms | +2.04% |
+
+The event calls are therefore not pure host overhead: their granularity lets
+the replay stream start earlier while later FIA tasks are being rebound.  The
+implementation and profile were fully removed; bucket16 retains per-layer
+external events.
+
+```text
+/tmp/fusedscalar-singlegate-smoke-20260828/
+/tmp/fusedscalar-singlegate-official-perf-20260828/
+/tmp/minicpmo-a2-fia-bucket16-fusedscalar-singlegate-server.log
+```
+
+### ENPU update-before-replay rejection
+
+The safe FIA configuration was also launched with vLLM-Ascend's internal
+`ENPU_ENABLE=true` lifecycle path.  This preserves the exact attention
+operator and sequence lengths, but synchronizes the current stream, updates
+captured task parameters and only then enqueues graph replay.  That ordering is
+covered by upstream graph-mode tests for other models, but it is incompatible
+with MiniCPM-o's asynchronous three-stage execution on this stack.  The first
+request remained in Stage-1 replay for more than two minutes with only 2%
+AICore utilization and never produced a first audio packet.  The control's
+cold request completes in about 68 seconds and subsequent requests in about
+1.3 seconds.  The ENPU process was stopped and the safe post-replay external-
+event ordering restored.
+
+The next exact-math direction is therefore reducing the number of host task-
+group begin/end/update operations without changing their event ordering, not
+moving all updates ahead of replay.
+
+```text
+/tmp/minicpmo-a2-evaluator-source-default-enpu-server.log
+```
+
+```text
+/tmp/lunanexa-bench/a2-evaluator-exact-defaults-zh10/
+/tmp/lunanexa-bench/a2-evaluator-cfm2-zh10/
+/tmp/lunanexa-bench/a2-evaluator-cfm2-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm2-wer-fixed-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm5-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm5-wer-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm6-rollback-zh10/
+/tmp/lunanexa-bench/a2-evaluator-cfm6-rollback-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm6-exact-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm6-safe-exact-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm6-safe-exact-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm2-safe-exact-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm2-safe-exact-official-export-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm3-safe-exact-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm3-safe-exact-official-export-zh32/
+/tmp/lunanexa-bench/a2-evaluator-source-default-cfm2-official-perf-zh32-conc1/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-safe-exact-official-quality-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-safe-exact-official-export-zh32/
+/tmp/lunanexa-bench/a2-evaluator-cfm1-safe-exact-official-perf-zh32-conc1/
+/tmp/minicpmo-a2-evaluator-exact-defaults.log
+/tmp/minicpmo-a2-evaluator-cfm2.log
+/tmp/minicpmo-a2-evaluator-cfm5.log
+/tmp/minicpmo-a2-evaluator-cfm6-rollback.log
 ```

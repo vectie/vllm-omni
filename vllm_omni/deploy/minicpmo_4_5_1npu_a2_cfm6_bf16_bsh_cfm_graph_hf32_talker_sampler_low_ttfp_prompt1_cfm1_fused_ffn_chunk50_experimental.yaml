@@ -1,0 +1,47 @@
+# Atlas 800I A2 first-10 / steady-50 static-graph candidate.
+#
+# Preserve the minimum-latency ten-code first packet, then double only the
+# steady Talker-to-Code2Wav window.  Stage 2 compiles width 100 as its primary
+# Conv/MLP shape and captures recurrent CFM6 at width 100 with fixed
+# prompt+100 history and prompt+200 append storage.  This amortizes bridge,
+# CFM replay, and HiFT invocation overhead without changing solver count.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_experimental.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 50
+      initial_codec_chunk_frames: 10
+      codec_left_context_frames: 3
+      raw_tensor_shm: false
+      shm_event_notifications: true
+      shm_notification_namespace: minicpmo45-a2-1npu-bsh-i10-s50
+      token2wav_n_timesteps: 6
+      npu_dit_mlp_graph: true
+      npu_dit_mlp_graph_width: 100
+      npu_dit_graph_buckets: [20, 50, 302]
+      npu_dit_preamble_graph: true
+      npu_dit_wide_adaln: true
+      npu_dit_wide_final_adaln: true
+      npu_dit_final_addcmul: true
+      npu_dit_conv_mlp_graph: true
+      npu_dit_prompt_conv_mlp_graph: true
+      npu_dit_fused_conv_pack: true
+      npu_single_request_cache_passthrough: true
+      npu_dit_compute_dtype: bf16
+      npu_cfm_integration_dtype: bf16
+      npu_cfm_fixed_kv_slabs: true
+      npu_cfm_planar_kv_slabs: true
+      npu_dit_bsh_attention: true
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_SLOTS: "1"

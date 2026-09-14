@@ -1,0 +1,16 @@
+# Atlas 800I A3 / Ascend 910C single-chip fixed steady-CFM graph candidate.
+#
+# Capture only the repetitive width-50/cache-402 invocation. Prompt, cache-fill,
+# and final-tail work remains eager. The implementation owns two static output
+# slots, avoiding full-output clones between consecutive replays.
+
+base_config: minicpmo_4_5_1npu_910c_cfm6_canonical_layout_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "1"
+

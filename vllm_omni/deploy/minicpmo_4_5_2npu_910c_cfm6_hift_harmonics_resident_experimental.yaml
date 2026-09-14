@@ -1,0 +1,15 @@
+# Atlas 800I A3 / Ascend 910C HiFT harmonic-residency candidate.
+#
+# flashcosyvoice constructs the immutable SineGen2 harmonic multiplier on the
+# CPU and copies it to the NPU for every audio chunk. Cache the identical
+# FloatTensor once on Stage 2's device. Other dtype or device paths retain the
+# original implementation.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_hift_resblock_graph_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_RESIDENT_HARMONICS: "1"

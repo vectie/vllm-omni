@@ -1,0 +1,16 @@
+# Atlas 800I A2 / Ascend 910B fixed-slab six-step CFM graph candidate.
+#
+# Build on the A2 BSH layout prerequisite and capture only the repetitive
+# width-50/cache-402 CFM6 invocation into two graph/output slots. Prompt,
+# cache-fill, and tail widths retain the validated fallback partitions. HiFT
+# graphs remain disabled because both A2 HiFT screens regressed.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "1"

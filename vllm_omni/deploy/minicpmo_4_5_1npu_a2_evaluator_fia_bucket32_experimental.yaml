@@ -1,0 +1,16 @@
+# A2 evaluator-compatible isolation profile for a wider FIA sequence-length
+# bucket. Stage 1 (Talker) rebinds captured attention tasks when a request
+# crosses a 32-token boundary or its block-table address changes. Keep this
+# opt-in until it beats the quality-gated 16-token source default end to end.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_compat.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        additional_config:
+          enable_cpu_binding: false
+          ascend_compilation_config:
+            fuse_norm_quant: false
+          fia_graph_seq_len_bucket_size: 32

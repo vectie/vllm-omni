@@ -1,0 +1,15 @@
+# Atlas 800I A2 first-10 / steady-50 width-100 isolation profile.
+#
+# This differs from the chunk50 candidate only by disabling the outer CFM
+# NPUGraph.  It is a diagnostic gate for the wider causal-pack kernel and
+# fixed KV slabs: first prove eager CFM6 stability and audio continuity, then
+# enable the recurrent graph in the matched candidate profile.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_chunk50_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH: "0"

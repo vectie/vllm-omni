@@ -4,7 +4,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-import librosa  # noqa: TID251
 import numpy as np
 import onnxruntime
 import s3tokenizer
@@ -34,6 +33,14 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
 )
 
 logger = init_logger(__name__)
+
+
+def _resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample mono float audio without the banned librosa dependency."""
+    if orig_sr == target_sr:
+        return audio.astype(np.float32, copy=False)
+    tensor = torch.from_numpy(audio.astype(np.float32, copy=False))
+    return torchaudio.functional.resample(tensor, orig_sr, target_sr).numpy()
 
 
 def fade_in_out(
@@ -180,11 +187,10 @@ class StepAudio2Token2WavCore(nn.Module):
 
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
-        # Prefer soundfile/librosa path to avoid torchaudio->torchcodec runtime coupling.
-        try:
-            audio_np_raw, sample_rate = sf.read(prompt_wav, dtype="float32", always_2d=False)
-        except Exception:
-            audio_np_raw, sample_rate = librosa.load(prompt_wav, sr=None, mono=True)
+        # SoundFile reads the benchmark WAV assets without torchaudio's optional
+        # torchcodec loader.  Resampling below stays in the already-required
+        # torchaudio stack instead of imposing a process-wide librosa import.
+        audio_np_raw, sample_rate = sf.read(prompt_wav, dtype="float32", always_2d=False)
         if isinstance(audio_np_raw, np.ndarray) and audio_np_raw.ndim > 1:
             audio_np_raw = np.mean(audio_np_raw, axis=-1)
         sample_rate = int(sample_rate)
@@ -192,7 +198,7 @@ class StepAudio2Token2WavCore(nn.Module):
         # 16 kHz branch: s3tokenizer + speaker embedding
         audio_16k = audio_np_raw.astype(np.float32)
         if sample_rate != 16000:
-            audio_16k = librosa.resample(y=audio_16k, orig_sr=sample_rate, target_sr=16000)
+            audio_16k = _resample_audio(audio_16k, sample_rate, 16000)
         audio = torch.from_numpy(audio_16k)
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
@@ -211,7 +217,7 @@ class StepAudio2Token2WavCore(nn.Module):
         # Must resample from the ORIGINAL audio, not the 16 kHz version.
         audio_24k = audio_np_raw.astype(np.float32)
         if sample_rate != 24000:
-            audio_24k = librosa.resample(y=audio_24k, orig_sr=sample_rate, target_sr=24000)
+            audio_24k = _resample_audio(audio_24k, sample_rate, 24000)
         audio_24k_t = torch.from_numpy(audio_24k).unsqueeze(0)  # [1, T]
         prompt_mel = mel_spectrogram(audio_24k_t).transpose(1, 2).squeeze(0)  # [T, num_mels]
         prompt_mels = prompt_mel.unsqueeze(0).to(self.device)

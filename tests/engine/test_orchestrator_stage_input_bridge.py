@@ -11,6 +11,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock
 
 import janus
 import pytest
+import torch
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
@@ -19,6 +20,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     _OrchestratorDuplexStagePort,
 )
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexStageRequestContext,
@@ -246,12 +248,19 @@ async def test_async_prewarm_skips_outgoing_only_stage() -> None:
     stage0 = FakePrewarmPool("sender")
     stage1 = FakePrewarmPool("sender")
     stage2 = FakePrewarmPool("receiver")
+    stage2.stage_vllm_config.model_config.async_chunk_prewarm_input_func = (
+        "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.prepare_code2wav_request"
+    )
     orchestrator.stage_pools = [stage0, stage1, stage2]
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     orchestrator._record_duplex_stage_submission = MagicMock()
+    waveform = torch.tensor([0.1, -0.1], dtype=torch.float32)
     req_state = OrchestratorRequestState(
         request_id="req-prewarm",
-        prompt={"prompt_token_ids": [1, 2]},
+        prompt={
+            "prompt_token_ids": [1, 2],
+            "multi_modal_data": {"audio": [(waveform, 16000)]},
+        },
         sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
         final_stage_id=2,
         duplex_identity=SimpleNamespace(),
@@ -265,6 +274,15 @@ async def test_async_prewarm_skips_outgoing_only_stage() -> None:
 
     assert stage1.submitted == []
     assert len(stage2.submitted) == 1
+    prepare_info = deserialize_additional_information(stage2.submitted[0].additional_information)
+    assert prepare_info["meta"] == {
+        "lifecycle_event": "prepare",
+        "lifecycle_generation": 0,
+        "ref_audio_sr": 16000,
+    }
+    torch.testing.assert_close(prepare_info["codes"]["ref"], waveform)
+    assert req_state.prompt["multi_modal_data"]["audio"][0][0] is waveform
+    assert "additional_information" not in req_state.prompt
     assert 1 not in req_state.stage_submit_ts
     assert 2 in req_state.stage_submit_ts
     orchestrator._record_duplex_stage_submission.assert_called_once_with(
@@ -273,6 +291,34 @@ async def test_async_prewarm_skips_outgoing_only_stage() -> None:
         0,
         req_state,
     )
+
+
+@pytest.mark.asyncio
+async def test_async_prepare_hook_failure_is_nonfatal_and_not_recorded() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    stage0 = FakePrewarmPool("sender")
+    stage1 = FakePrewarmPool("receiver")
+    stage1.stage_vllm_config.model_config.async_chunk_prewarm_input_func = "missing.module.prepare"
+    orchestrator.stage_pools = [stage0, stage1]
+    orchestrator._emit_tx_edge = lambda **_kwargs: None
+    orchestrator._record_duplex_stage_submission = MagicMock()
+    req_state = OrchestratorRequestState(
+        request_id="req-prepare-failure",
+        prompt={"prompt_token_ids": [1, 2]},
+        sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(2)],
+        final_stage_id=1,
+        duplex_identity=SimpleNamespace(),
+    )
+
+    await orchestrator._prewarm_async_chunk_stages(
+        "req-prepare-failure",
+        SimpleNamespace(prompt_token_ids=[1, 2], resumable=True),
+        req_state,
+    )
+
+    assert stage1.submitted == []
+    assert 1 not in req_state.stage_submit_ts
+    orchestrator._record_duplex_stage_submission.assert_not_called()
 
 
 @pytest.mark.asyncio

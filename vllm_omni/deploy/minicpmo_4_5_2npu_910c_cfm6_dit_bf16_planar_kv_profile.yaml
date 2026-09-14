@@ -1,0 +1,13 @@
+# Development-only Stage-2 profiler overlay for the accepted Ascend 910C
+# homogeneous-BF16 + fixed planar K/V candidate. Keep profiling out of latency
+# measurements; bracket one warmed request through /start_profile and
+# /stop_profile with {"stages":[2]}.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_kv_experimental.yaml
+
+stages:
+  - stage_id: 2
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /tmp/vllm-omni-profiles/minicpmo45/planar-kv-stage2
+      torch_profiler_record_shapes: true

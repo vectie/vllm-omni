@@ -1,0 +1,11 @@
+# Synchronizing Stage-2 phase timers for bottleneck diagnosis only.
+# Never use this profile for submission performance numbers.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_stable_pa_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_STAGE2_TIMING: "1"

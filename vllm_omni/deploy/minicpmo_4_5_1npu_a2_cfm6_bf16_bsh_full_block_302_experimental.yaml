@@ -1,0 +1,21 @@
+# Atlas 800I A2 / Ascend 910B BSH full-block GE candidate.
+#
+# Retain the accepted steady CFM NPUGraph and HF32 MatMul profile. For the
+# cache-fill width-50/cache-302 phase, replace the split BSH preamble,
+# attention, and Conv+MLP launches with one GE-visible DiT block. Canonical
+# Conv1d remains visible to GE; the faster causal-pack variant is deliberately
+# excluded because its full-graph BF16 drift failed the real-weight screen.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_matmul_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          # Stage env blocks replace rather than deep-merge.
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "1"
+          VLLM_OMNI_MINICPMO45_NPU_MATMUL_HF32: "1"
+          VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_DIT_FULL_BLOCK_CACHE_BUCKETS: "302"

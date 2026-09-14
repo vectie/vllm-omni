@@ -65,6 +65,40 @@ class FakeRunningCounter:
         self.value -= 1
 
 
+def test_minicpmo45_chat_waits_for_complete_thinker_handoff() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [
+        SimpleNamespace(
+            stage_vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    model_arch="MiniCPMO45OmniForConditionalGeneration",
+                    model_stage="llm",
+                )
+            )
+        )
+    ]
+    request_state = SimpleNamespace(duplex_identity=None)
+
+    assert orchestrator._requires_complete_stage_handoff(0, request_state) is True
+
+
+def test_minicpmo45_duplex_keeps_segment_handoffs() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [
+        SimpleNamespace(
+            stage_vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    model_arch="MiniCPMO45OmniForConditionalGeneration",
+                    model_stage="llm",
+                )
+            )
+        )
+    ]
+    request_state = SimpleNamespace(duplex_identity=SimpleNamespace())
+
+    assert orchestrator._requires_complete_stage_handoff(0, request_state) is False
+
+
 @pytest.mark.asyncio
 async def test_engine_dead_broadcasts_fatal_to_rpc_waiters(monkeypatch: pytest.MonkeyPatch) -> None:
     rpc_queue: asyncio.Queue = asyncio.Queue()

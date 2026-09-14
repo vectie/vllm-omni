@@ -1,0 +1,21 @@
+# Atlas 800I A2 fixed-shape Talker decode candidate.
+#
+# Stage 1 is a 20-layer, hidden-768 autoregressive Llama whose steady decode
+# shape is exactly one token. It dominates request duration while leaving
+# AICore and HBM utilization low. Ask npugraph_ex to compile fixed-shape
+# operator binaries for that graph instead of spending another experiment on
+# a Stage-2 micro-op. Static-kernel compilation can add minutes to startup;
+# keep it scoped to Stage 1 and accuracy/performance gated.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        additional_config:
+          enable_cpu_binding: false
+          ascend_compilation_config:
+            enable_npugraph_ex: true
+            enable_static_kernel: true
+            fuse_norm_quant: false

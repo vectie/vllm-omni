@@ -432,6 +432,31 @@ text and audio structure, exactly matched mean WER at 0.565030, and moved
 proxy SIM from 0.803156 to 0.803233. Keep this profile opt-in until full
 Seed-TTS, Daily-Omni, and Video-MME gates are rerun.
 
+The next fixed-slab profile captures the complete six-step steady CFM call as
+one raw NPUGraph. It is intentionally narrower than the rejected growing-cache
+prototype: only width 50 and retained cache 402 are captured, all input and
+output addresses are stable, and two pooled output slots replace replay-time
+cache clones. Prompt and tail execution remain eager.
+
+Raw capture cannot enclose the accepted TorchAir executables on CANN 9.0, so
+the capture path invokes their plain graph-visible operations. It also cannot
+enclose `npu_fusion_attention`, whose auxiliary stream fails to join the
+capture stream. Only the captured path substitutes explicit FP32
+BMM-softmax-BMM attention; normal execution keeps fused BSH attention. A
+loaded-checkpoint width-50/cache-402 gate limits this substitution and measured
+`3.05175781e-05` maximum / `6.89178705e-08` mean absolute drift on the target
+910C. Any gate failure disables the candidate before request-time capture.
+
+The conservative reverse-order two-run A/B improved duration and mean E2E
+5.79%, throughput 6.15%, mean whole-audio RTF 7.92%, and mean steady-chunk RTF
+14.28%. P99 E2E, TTFP, and steady-chunk RTF improved 17.16%, 20.03%, and
+9.65%. A 32-row stability gate preserved the exact token/frame/audio signature,
+100% continuity, and zero underrun. A matched 32-row quality gate held mean
+WER exactly at `0.0165884463`; mean WavLM similarity declined only `0.000463335`
+absolute (`0.0463` percentage points), well below the allowed two-point
+regression. The deploy profile remains opt-in pending the three complete
+competition accuracy suites.
+
 Opt-in experiments, one at a time:
 
 ```bash
@@ -470,7 +495,9 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | SHM event notification | Retained for 910C: 20.63 us mean dispatch cost, 14.26 us lower P99, and avoids the receive loop's up-to-1 ms polling fallback |
 | Cached immutable Stage 0 control-token embeddings | Shipped in the static-weight native-duplex profile; exact operator parity, representative operator sequence -61.35%, resident Stage-0 TTFT mean -8.45% |
 | Sticky fused-to-MATH Ascend SDPA adapter | Implemented, target proof required |
-| Exact-shape CFM graph replay | Implemented, off by default; full-loop capture rejected on measured 910C |
+| Exact-shape CFM graph replay | Implemented, opt-in; fixed width-50/cache-402 six-step graph with two output slots improved reverse-order duration 5.79%, mean whole-audio RTF 7.92%, and mean steady-chunk RTF 14.28%; full competition qualification pending |
+| Complete six-step TorchAir/GE CFM executable | Rejected and removed; explicit 2-D input projection fixed CANN's 50-vs-320 MatMul inference and graph-owned outputs fixed an aliased-output streaming deadlock, but the resulting 30.37 MB optimized graph took 48.10 s for 3.12 s audio (RTF 15.416, Stage 2 48.08 s) after multi-minute compilation; retry only as a bounded one-step or contiguous-block partition |
+| Immutable six-step AdaLN modulation slabs | Rejected and removed; direct retention preserved TorchAir producer storage and passed 121/121 focused tests, but five-run medians regressed duration/E2E 6.60%, throughput 6.19%, mean whole-audio RTF 5.21%, and P99 E2E 30.11% because the external buffer boundary blocked more valuable graph-wide layout/scheduling optimization |
 | Exact output hash capture and deterministic JSON gate | Implemented |
 | Six- and eight-step CFM deploy profiles | Implemented; the CFM6 competition profile passed full Seed-TTS, Daily-Omni, and Video-MME gates |
 | Talker sliding repetition-frequency cache | Shipped; exact parity and full 1,088-row Seed-TTS WER/SIM gate passed |
@@ -490,6 +517,14 @@ VLLM_OMNI_NPU_PROFILER_L2_CACHE=1
 | Fixed-width DiT attention-preamble graph | Implemented, opt-in; exact isolated output, 30.6% isolated latency reduction |
 | Fixed-width DiT Conv+MLP megagraph | Implemented, opt-in; isolated partition -14-17%, real mean audio RTF -4.41%, paired EN8 WER unchanged and SIM +0.000077; full competition qualification pending |
 | HiFT inference weight-norm materialization | Implemented, opt-in; DevEnv_132987 three-run median mean chunk RTF -2.02%, mean whole-audio RTF -1.97%, E2E -1.91%, matched EN8 WER 0.0000 and proxy SIM +0.00032; full competition qualification still required before default-on promotion |
+| HiFT stage-0 residual-block graphs | Rejected for the current accepted stack; a fresh 3x32 A/B found the exact three-graph boundary regressed duration/E2E 3.58%, throughput 3.46%, and mean chunk RTF 3.16%, superseding the earlier 5.67% win on an older control; the accepted profile remains graph-free here |
+| Native AscendC HiFT full residual block | Rejected and removed; hand-packed Conv1d was 1.74-3.08x slower than eager and introduced kernel-size-dependent drift (worst cosine 0.987252) |
+| Aggregate three-sibling HiFT graph | Rejected and removed twice; the original exact aggregate regressed duration 11.75%, while a tuple-output/thread-local redesign was exact and 2.533x faster in isolation but regressed current-control duration/E2E 8.23%, throughput 7.61%, and mean chunk RTF 7.32%; further TorchAir sibling boundaries are closed |
+| HiFT discarded source-noise scratch | Implemented as diagnostic opt-in, rejected for promotion; exact discarded noise/RNG and 0.41% isolated source win, but fresh 3x32 serving regressed duration 7.07%, throughput 6.61%, mean E2E 7.08%, and mean chunk RTF 6.25% |
+| HiFT full F0 classifier graph | Implemented as diagnostic opt-in, rejected for promotion; original Linear/abs compiled with zero startup-gate drift, but 2-control/3-candidate Seed-TTS medians changed duration only -0.30% while mean TTFT regressed 2.10% and median chunk RTF regressed 5.53% |
+| HiFT F0 frozen weights and linearized Conv1d | Rejected for promotion; frozen weights changed sign across two 200-iteration measurements (0.999x/1.019x), while window-pack plus Linear was 7.27% slower and introduced 0.026312 maximum absolute drift |
 | Broader cache-shape-bucketed DiT graph partitions | Stock SDPA operator gate rejected: fixed 384/512 cache widths were 8.1-12.8% slower before copy; retry only as part of a larger fused CANN boundary |
 | Native AscendC DiT causal-pack/cache kernel | Implemented, opt-in; FP16/FP32/BF16 state exact, Conv/cache boundary -28.7%, full BF16 Conv+MLP graph -5.37%, resident mean E2E -7.01% and per-chunk RTF -6.63%; official qualification pending |
+| BF16 AscendC causal Conv-to-Linear fusion | Rejected and removed; 1.0308x isolated gain, but two matched serving regimes reversed sign for TTFP and whole-audio RTF (initial +5.23%/+2.08%, later -2.93%/-3.35%), and the opaque boundary hid the producer-consumer chain from GE |
+| Contiguous-window causal-pack DMA | Rejected and removed; six dtype/layout cases were exact, but the production cache-major path improved only 0.77% (18.995 to 18.849 us) and channel-major regressed 0.35% |
 | Deployment-distribution distillation/LoRA | Research fallback, not serving baseline |

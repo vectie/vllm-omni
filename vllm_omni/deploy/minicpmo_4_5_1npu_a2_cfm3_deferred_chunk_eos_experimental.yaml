@@ -1,0 +1,16 @@
+# Atlas 800I A2 static-CFM3 candidate with chunk-boundary EOS reconciliation.
+#
+# Stage 1 normally synchronizes one sampled codec scalar to Python per Talker
+# token after the minimum length.  Sparse codec transport already publishes at
+# 10/25-frame boundaries, so reconcile and trim EOS once at those boundaries
+# instead.  Keep this as an A/B overlay until official 10-case performance and
+# Seed-TTS output gates pass.
+
+base_config: minicpmo_4_5_1npu_a2_cfm3_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_stable_pa_prompt_state_cache_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS: "1"

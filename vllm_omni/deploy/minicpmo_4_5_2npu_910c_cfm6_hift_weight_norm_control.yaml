@@ -1,0 +1,14 @@
+# Atlas 800I A3 / Ascend 910C paired control for the HiFT F0 graph.
+#
+# This profile keeps the same inference-only HiFT weight materialization as the
+# candidate but leaves the F0 feature graph disabled, isolating graph replay in
+# paired Seed-TTS measurements.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_megagraph_competition.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM: "1"

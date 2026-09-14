@@ -1,0 +1,21 @@
+# Development-only Stage-1 profiler overlay for the best A2 single-chip
+# candidate.  Restrict the profiler to Talker: enabling it in Stage 2 creates
+# an auxiliary NPU stream before the fixed CFM graph captures and invalidates
+# that capture on current CANN releases.
+#
+# After one unprofiled warm-up request, bracket exactly one hot request with:
+#   curl -X POST http://127.0.0.1:8099/start_profile \
+#     -H 'content-type: application/json' -d '{"stages":[1]}'
+#   curl -X POST http://127.0.0.1:8099/stop_profile \
+#     -H 'content-type: application/json' -d '{"stages":[1]}'
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_experimental.yaml
+
+stages:
+  - stage_id: 1
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /tmp/vllm-omni-profiles/minicpmo45/a2-talker-nz-stage1
+      torch_profiler_record_shapes: true
+      torch_profiler_with_memory: false
+      torch_profiler_with_stack: false

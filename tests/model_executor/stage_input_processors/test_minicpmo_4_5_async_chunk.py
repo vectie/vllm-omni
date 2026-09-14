@@ -8,7 +8,9 @@ import pytest
 import torch
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.model_executor.stage_input_processors import minicpmo_4_5_omni as minicpmo_bridge
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
+    prepare_code2wav_request,
     tts2code2wav_async_chunk,
     tts2code2wav_full_payload,
     tts2code2wav_token_only,
@@ -72,6 +74,27 @@ def _codes(payload) -> list[int]:
     return payload.codes.audio.tolist()
 
 
+def test_prepare_request_moves_exact_reference_into_code2wav_control_payload() -> None:
+    waveform = torch.tensor([0.1, -0.1], dtype=torch.float32)
+    original_prompt = {
+        "multi_modal_data": {
+            "audio": [(waveform, 16000)],
+        }
+    }
+
+    prepared = prepare_code2wav_request(
+        {"prompt_token_ids": [0]},
+        original_prompt,
+        SimpleNamespace(),
+    )
+
+    torch.testing.assert_close(
+        prepared["additional_information"]["codes"]["ref"],
+        waveform,
+    )
+    assert prepared["additional_information"]["meta"]["ref_audio_sr"] == 16000
+
+
 @pytest.mark.parametrize(("count", "emitted"), [(24, False), (25, True), (26, True)])
 def test_first_chunk_threshold_is_25_generated_codes(count: int, emitted: bool) -> None:
     manager = _manager()
@@ -87,6 +110,30 @@ def test_first_chunk_threshold_is_25_generated_codes(count: int, emitted: bool) 
         assert _codes(payload) == [4218, 4218, 4218, *range(25)]
         assert payload.meta.chunk_seq == 0
         assert payload.meta.code_flat_numel == 28
+        assert payload.meta.lifecycle_event == "chunk"
+        assert payload.meta.lifecycle_generation == 0
+
+
+def test_one_token_deltas_stay_device_resident_until_chunk_publish(monkeypatch) -> None:
+    manager = _manager()
+    request = _request("req")
+    original = minicpmo_bridge._codec_tensor
+    cpu_copy_requests: list[bool] = []
+
+    def tracked_codec_tensor(value, *, to_cpu=True):
+        cpu_copy_requests.append(to_cpu)
+        return original(value, to_cpu=to_cpu)
+
+    monkeypatch.setattr(minicpmo_bridge, "_codec_tensor", tracked_codec_tensor)
+    for code in range(24):
+        assert tts2code2wav_async_chunk(manager, _delta(code), request, False) is None
+    assert cpu_copy_requests == [False] * 24
+
+    payload = tts2code2wav_async_chunk(manager, _delta(24), request, False)
+
+    assert payload is not None
+    assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+    assert cpu_copy_requests == [False] * 25 + [True]
 
 
 def test_codec_chunk_geometry_can_be_overridden_for_sweeps(monkeypatch) -> None:

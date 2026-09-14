@@ -1,0 +1,16 @@
+# Atlas 800I A2 balanced low-latency plus steady-RTF candidate.
+#
+# Compose the accuracy-safer prompt-CFM2 / first-packet-CFM4 schedule with the
+# native dense-BF16 npu_ffn DiT MLP.  The solver schedule changes only the
+# discarded prompt-cache prefill and first live packet; npu_ffn accelerates
+# the unchanged six-step steady path as well.  Keep this opt-in until the
+# official Seed-TTS, Daily-Omni, and Video-MME gates pass.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt2_cfm4_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_BF16_FFN: "1"

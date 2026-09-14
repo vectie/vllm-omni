@@ -1,0 +1,15 @@
+# Atlas 800I A2 minimum first-path latency plus steady-RTF candidate.
+#
+# Compose the prompt-CFM1 / first-packet-CFM1 latency ceiling with the native
+# dense-BF16 npu_ffn DiT MLP.  Every later chunk still executes the full CFM6
+# solver, now through the fused MLP path.  This has the largest first-path
+# quality risk and remains an accuracy-gated experiment.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_DIT_FUSED_BF16_FFN: "1"

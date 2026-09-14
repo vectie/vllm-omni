@@ -514,6 +514,14 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 if mm_output is not None:
                     mm_type = getattr(eco, "output_type", None) or default_mm_type
                     req_state.add_multimodal_tensor(mm_output, mm_type)
+                pooling_output = getattr(eco, "pooling_output", None)
+                if isinstance(pooling_output, dict) and pooling_output:
+                    # AR model runners use pooler_output as the inter-stage
+                    # tensor lane (for example {"hidden": full_request_hs}).
+                    # Completion requests previously ignored it entirely,
+                    # silently dropping the only complete prefill+decode
+                    # representation before model-specific bridges ran.
+                    req_state.add_multimodal_tensor(pooling_output, "hidden")
 
             # Route: if no detokenizer and no pooling output, handle locally
             # to avoid upstream's assert on detokenizer.

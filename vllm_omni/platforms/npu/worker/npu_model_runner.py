@@ -507,6 +507,13 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         # Omni-specific: build and inject extra model kwargs
         model_kwargs_extra = self._build_model_kwargs_extra()
         assert self.model is not None
+        prepare_fused_sampler = getattr(
+            self.model,
+            "prepare_fused_codec_sampler_inputs",
+            None,
+        )
+        if callable(prepare_fused_sampler):
+            prepare_fused_sampler(**model_kwargs_extra)
 
         forward_context = get_forward_context()
         assert forward_context is not None

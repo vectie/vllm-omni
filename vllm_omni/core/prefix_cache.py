@@ -610,6 +610,7 @@ class OmniTensorPrefixCache:
         input_batch: InputBatch,
         multimodal_outputs: dict | None,
         num_scheduled_tokens: dict[str, int],
+        include_computed_prefix: bool = False,
     ):
         """Get the merged multimodal states if hidden state prefix caching is enabled."""
         combined_multimodal_outputs = {}
@@ -628,6 +629,7 @@ class OmniTensorPrefixCache:
                     cache=self.mm_outputs_cache[mm_key],
                     hidden_states=mm_outputs[mm_key],
                     num_scheduled_tokens=num_scheduled_tokens,
+                    include_computed_prefix=include_computed_prefix,
                 )
 
         # Then, get everything else (passthrough data); first, convert to CPU
@@ -653,6 +655,7 @@ class OmniTensorPrefixCache:
         hidden_states: torch.Tensor,
         num_scheduled_tokens: dict[str, int],
         hidden_states_cpu: torch.Tensor | None = None,
+        include_computed_prefix: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Get merged hidden states, optionally reusing pre-staged CPU states.
 
@@ -668,6 +671,7 @@ class OmniTensorPrefixCache:
             num_scheduled_tokens=num_scheduled_tokens,
             staged_cpu_tensor=hidden_states_cpu,
             cache=self.hidden_states_cache,
+            include_computed_prefix=include_computed_prefix,
         )
 
     def _get_merged_tensors(
@@ -678,6 +682,7 @@ class OmniTensorPrefixCache:
         hidden_states: torch.Tensor,
         num_scheduled_tokens: dict[str, int],
         staged_cpu_tensor: torch.Tensor | None = None,
+        include_computed_prefix: bool = False,
     ) -> dict[str, torch.Tensor]:
         """When hidden state caching is enabled, takes the input hidden_states,
         which only correspond to the scheduled tokens, and returns a mapping
@@ -708,9 +713,19 @@ class OmniTensorPrefixCache:
         for req_id in input_batch.req_ids:
             req_idx = input_batch.req_id_to_index[req_id]
 
-            if req_id in self._new_req_cache_hit_ids:
-                block_ids = self._get_cached_block_ids(req_idx, input_batch)
+            if req_id in self._new_req_cache_hit_ids or include_computed_prefix:
+                num_computed = int(input_batch.num_computed_tokens_cpu[req_idx])
+                if include_computed_prefix:
+                    num_blocks = (num_computed + self.block_size - 1) // self.block_size
+                    block_ids = input_batch.block_table[0].block_table.cpu[req_idx, :num_blocks]
+                else:
+                    block_ids = self._get_cached_block_ids(req_idx, input_batch)
                 cached_hs = cache[block_ids].reshape(-1, cache.shape[-1])
+                if include_computed_prefix:
+                    # A running request may end in a partially filled block.
+                    # Only the first num_computed rows are valid prefix data;
+                    # the remaining rows belong to future slots in that block.
+                    cached_hs = cached_hs[:num_computed]
 
                 # Slice the hidden states corresponding to this request;
                 # we do this by using the query start

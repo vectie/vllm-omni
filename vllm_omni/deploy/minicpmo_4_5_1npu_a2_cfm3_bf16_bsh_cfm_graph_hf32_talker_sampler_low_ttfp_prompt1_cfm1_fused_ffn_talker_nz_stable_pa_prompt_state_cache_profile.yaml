@@ -1,0 +1,17 @@
+# Development-only Stage-1 profiler overlay for the current static-CFM3 A2
+# performance candidate.  Keep Stage 2 unprofiled because the profiler's
+# auxiliary NPU stream invalidates fixed CFM graph capture on this CANN stack.
+#
+# Warm the service once, then bracket one resident request with the public
+# /start_profile and /stop_profile endpoints, selecting only stage 1.
+
+base_config: minicpmo_4_5_1npu_a2_cfm3_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_stable_pa_prompt_state_cache_experimental.yaml
+
+stages:
+  - stage_id: 1
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /tmp/vllm-omni-profiles/minicpmo45/a2-cfm3-current-stage1
+      torch_profiler_record_shapes: true
+      torch_profiler_with_memory: false
+      torch_profiler_with_stack: false

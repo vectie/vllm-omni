@@ -1,0 +1,15 @@
+# Atlas 800I A2 static three-step steady-CFM leaderboard candidate.
+#
+# Build the complete steady solver, fixed caches and NPUGraph around three
+# native steps.  This is deliberately separate from the four-step accuracy
+# candidate so performance and Seed-TTS quality can be gated independently.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_prompt1_cfm1_fused_ffn_talker_nz_stable_pa_prompt_state_cache_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS: "3"
+

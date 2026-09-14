@@ -128,6 +128,7 @@ class OmniModelConfig(ModelConfig):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
+    async_chunk_prewarm_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(
         default_factory=lambda: {
             "name": "SharedMemoryConnector",

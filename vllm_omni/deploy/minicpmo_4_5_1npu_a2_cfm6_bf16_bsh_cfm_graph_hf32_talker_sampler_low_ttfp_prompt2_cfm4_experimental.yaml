@@ -1,0 +1,20 @@
+# Atlas 800I A2 prompt-cache CFM2 / first-packet CFM4 candidate.
+#
+# Seed-TTS supplies a different reference waveform per request. Before any live
+# packet can be emitted, Stage 2 runs the widest (~302-frame) DiT CFM6 only to
+# populate prompt K/V caches and discards its synthesized mel. Solve that cache
+# prefill with two cosine-schedule evaluations, map both cache states back into
+# the fixed six-slot ABI, use the stable ten-code/width-20 first packet with
+# CFM4, then retain CFM6 for every subsequent chunk. Speaker embedding and
+# prompt mel extraction remain exact. This aggressive cache approximation must
+# pass the official WER/SIM gate before submission.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_talker_sampler_low_ttfp_cfm4_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_INITIAL_CFM_TIMESTEPS: "4"
+          VLLM_OMNI_MINICPMO45_NPU_PROMPT_CFM_TIMESTEPS: "2"

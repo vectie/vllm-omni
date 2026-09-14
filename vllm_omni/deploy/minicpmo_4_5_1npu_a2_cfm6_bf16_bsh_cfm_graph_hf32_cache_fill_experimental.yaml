@@ -1,0 +1,18 @@
+# Atlas 800I A2 / Ascend 910B fixed cache-fill NPUGraph candidate.
+#
+# The retained HF32 profile captures only width-50/cache-402 steady state.
+# Seed-TTS traces show every request also executes the same width-50/cache-302
+# and width-50/cache-352 CFM shapes. The two-shape experiment improved TTFP
+# but regressed whole-audio RTF, so retain only cache-302: one output set for
+# first-packet cache fill and two ping-pong sets for cache-402 steady state.
+
+base_config: minicpmo_4_5_1npu_a2_cfm6_bf16_bsh_cfm_graph_hf32_matmul_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_CACHE_FILL_GRAPH_LENGTHS: "302"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "2"

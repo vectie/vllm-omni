@@ -64,6 +64,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
       codec-token deltas for the separate Code2Wav stage.
     """
 
+    requires_request_sample_eligibility = True
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -92,7 +94,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         patch_minicpmo_remote_config(config)
 
         self.model_stage = vllm_config.model_config.model_stage
-
         if self.model_stage == "llm":
             # Initialize thinker model (image preprocessing + vision encoder + 3D resampler)
             self.thinker = init_vllm_registered_model(
@@ -629,6 +630,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if self.model_stage != "tts":
             return model_outputs
         return self.talker.make_omni_output(model_outputs, **kwargs)
+
+    def prepare_fused_codec_sampler_inputs(self, **kwargs) -> bool:
+        """Stage fixed sampler inputs before an outer Talker graph replay."""
+        if self.model_stage != "tts":
+            return False
+        prepare = getattr(self.talker, "prepare_fused_codec_sampler_inputs", None)
+        return bool(prepare(**kwargs)) if callable(prepare) else False
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         # Handle OmniOutput type

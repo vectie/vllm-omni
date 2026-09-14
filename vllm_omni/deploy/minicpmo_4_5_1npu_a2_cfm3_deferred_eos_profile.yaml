@@ -1,0 +1,14 @@
+# Stage-1-only profiler for the retained chunk-boundary-EOS candidate.
+# Stage 2 remains unprofiled because this CANN release cannot combine its
+# fixed CFM NPUGraph with the profiler auxiliary stream.
+
+base_config: minicpmo_4_5_1npu_a2_cfm3_deferred_chunk_eos_experimental.yaml
+
+stages:
+  - stage_id: 1
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /tmp/vllm-omni-profiles/minicpmo45/a2-cfm3-deferred-eos-stage1
+      torch_profiler_record_shapes: true
+      torch_profiler_with_memory: false
+      torch_profiler_with_stack: false

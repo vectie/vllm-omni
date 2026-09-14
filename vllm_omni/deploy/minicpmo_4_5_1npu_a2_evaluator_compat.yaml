@@ -1,0 +1,45 @@
+# Atlas 800I A2 resource shim for evaluator-source-policy A/B tests.
+#
+# The organizer's A3 profile reserves percentages of a 64-GiB logical NPU.
+# A 32-GiB 910B4 cannot finish the Stage-0 synthetic video/KV profile with
+# those reservations.  This overlay changes capacity planning only; all
+# execution optimizations still come from the same source-level single-chip
+# policy that the untouched organizer YAML exercises on A3.
+
+base_config: minicpmo_4_5.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_seqs: 1
+        max_model_len: 8192
+        max_num_batched_tokens: 4096
+        kv_cache_memory_bytes: 1342177280  # 1.25 GiB
+        mm_processor_cache_gb: 0
+        skip_mm_profiling: true
+        engine_extras:
+          enable_prefix_caching: true
+          disable_hybrid_kv_cache_manager: true
+        additional_config:
+          enable_cpu_binding: false
+          ascend_compilation_config:
+            fuse_norm_quant: false
+        compilation_config:
+          pass_config:
+            fuse_norm_quant: false
+            fuse_act_quant: false
+      - stage_id: 1
+        max_num_seqs: 1
+        kv_cache_memory_bytes: 268435456  # 256 MiB
+        additional_config:
+          enable_cpu_binding: false
+          ascend_compilation_config:
+            fuse_norm_quant: false
+        compilation_config:
+          pass_config:
+            fuse_norm_quant: false
+            fuse_act_quant: false
+      - stage_id: 2
+        additional_config:
+          enable_cpu_binding: false

@@ -1,0 +1,19 @@
+# Atlas 800I A3 / Ascend 910C static steady-CFM graph experiment.
+#
+# Preserve the accepted BSH attention and fixed-slab profile, then capture only
+# the repetitive width-50/cache-402 CFM invocation. Prompt, cache-fill, and
+# final-tail shapes remain eager. Two graph/output slots are allocated once so
+# replay never clones the complete CFM output tuple.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_bsh_attention_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM: "1"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH: "58"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "1"

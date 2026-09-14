@@ -27,6 +27,8 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     StageType,
+    _apply_minicpmo45_a3_dual_chip_policy,
+    _apply_minicpmo45_single_chip_policy,
     _apply_platform_overrides,
     _deep_merge_stage,
     _resolve_scheduler,
@@ -1144,6 +1146,446 @@ class TestResolveScheduler:
 
 
 class TestDeployConfigLoading:
+    def test_official_minicpmo_config_uses_both_chips_of_one_a3_card(self):
+        deploy = load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml"))
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+
+        changed = _apply_minicpmo45_a3_dual_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=2,
+        )
+
+        assert changed
+        assert [stage.devices for stage in deploy.stages] == ["0", "0", "1"]
+        assert deploy.stages[2].env == {
+            "VLLM_OMNI_MINICPMO45_NPU_PLANAR_DEFAULTS": "1",
+        }
+        for stage in deploy.stages[:2]:
+            assert stage.compilation_config == {
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [1, 2, 4],
+            }
+
+    def test_minicpmo_a3_policy_preserves_single_chip_and_explicit_topology(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+
+        single_chip = load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml"))
+        assert not _apply_minicpmo45_a3_dual_chip_policy(
+            pipeline,
+            single_chip,
+            platform="npu",
+            device_count=1,
+        )
+        assert [stage.devices for stage in single_chip.stages] == ["0", "0", "0"]
+        assert single_chip.stages[2].env is None
+        assert all(stage.compilation_config is None for stage in single_chip.stages)
+
+        explicit = load_deploy_config(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_mlp_graph_competition.yaml"
+            )
+        )
+        assert not _apply_minicpmo45_a3_dual_chip_policy(
+            pipeline,
+            explicit,
+            platform="npu",
+            device_count=2,
+        )
+        assert [stage.devices for stage in explicit.stages] == ["0", "0", "1"]
+
+    def test_minicpmo_single_chip_policy_graphs_producers_and_enables_events(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert [stage.devices for stage in deploy.stages] == ["0", "0", "0"]
+        for stage in deploy.stages[:2]:
+            assert stage.compilation_config == {
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [1],
+            }
+        connector = deploy.connectors["connector_of_shared_memory"]
+        assert connector["extra"]["shm_event_notifications"] is True
+        assert deploy.stages[1].env == {
+            "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT": "1",
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE": "1",
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING": "1",
+            "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "1",
+            "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "1",
+            "VLLM_OMNI_MINICPMO45_NPU_DEFERRED_CHUNK_EOS": "1",
+            "VLLM_OMNI_MINICPMO45_DIRECT_STOP_SAMPLER": "1",
+            "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES": "47",
+        }
+        assert deploy.stages[1].engine_extras["additional_config"] == {
+            "fia_graph_seq_len_bucket_size": 16,
+        }
+        assert deploy.stages[2].env == {
+            "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE": "1",
+            "VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM": "1",
+            "VLLM_OMNI_MINICPMO45_NPU_SDPA_BACKEND": "auto",
+            "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS": "600",
+            "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS": "1",
+        }
+
+    def test_minicpmo_single_chip_policy_preserves_explicit_authority(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+        deploy.stages[0].compilation_config = {"cudagraph_mode": "NONE"}
+        deploy.stages[1].env = {
+            "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT": "0",
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE": "0",
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING": "0",
+            "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH": "0",
+            "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT": "0",
+        }
+        deploy.stages[1].engine_extras["additional_config"] = {
+            "weight_nz_mode": 0,
+            "enable_stable_pa_graph_inputs": False,
+            "fia_graph_seq_len_bucket_size": 0,
+        }
+        deploy.stages[2].env = {
+            "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE": "0",
+            "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS": "6",
+        }
+        deploy.connectors["connector_of_shared_memory"]["extra"]["shm_event_notifications"] = False
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert deploy.stages[0].compilation_config == {"cudagraph_mode": "NONE"}
+        assert deploy.stages[1].compilation_config == {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1],
+        }
+        assert deploy.stages[1].env[
+            "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH"
+        ] == "0"
+        assert deploy.stages[1].env[
+            "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT"
+        ] == "0"
+        assert deploy.stages[1].env[
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE"
+        ] == "0"
+        assert deploy.stages[1].env[
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING"
+        ] == "0"
+        assert deploy.stages[1].env[
+            "VLLM_OMNI_MINICPMO45_NPU_BATCHED_CODEC_OUTPUT"
+        ] == "0"
+        assert deploy.stages[1].engine_extras["additional_config"][
+            "weight_nz_mode"
+        ] == 0
+        assert deploy.stages[1].engine_extras["additional_config"][
+            "enable_stable_pa_graph_inputs"
+        ] is False
+        assert deploy.stages[1].engine_extras["additional_config"][
+            "fia_graph_seq_len_bucket_size"
+        ] == 0
+        assert deploy.stages[2].env[
+            "VLLM_OMNI_MINICPMO45_CODE2WAV_PROMPT_STATE_CACHE"
+        ] == "0"
+        assert deploy.stages[2].env[
+            "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
+        ] == "6"
+        assert deploy.connectors["connector_of_shared_memory"]["extra"]["shm_event_notifications"] is False
+
+    def test_minicpmo_single_chip_policy_can_fall_back_to_cfm2(self, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT", "0")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert deploy.stages[2].env[
+            "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS"
+        ] == "2"
+
+    def test_minicpmo_single_chip_policy_can_disable_fia_bucket16(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_FIA_BUCKET16_DEFAULT", "0"
+        )
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert deploy.stages[1].engine_extras.get("additional_config") is None
+
+    def test_minicpmo_single_chip_policy_can_disable_slot_fastpath(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_SLOT_FASTPATH_DEFAULT", "0"
+        )
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH" not in deploy.stages[1].env
+
+    def test_minicpmo_single_chip_policy_can_disable_decode_metadata(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_DECODE_METADATA_DEFAULT", "0"
+        )
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_ASCEND_DIRTY_BLOCK_TABLE_COMMIT" not in deploy.stages[1].env
+        assert (
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_METADATA_CACHE"
+            not in deploy.stages[1].env
+        )
+        assert (
+            "VLLM_ASCEND_SINGLE_REQUEST_DECODE_SCALAR_STAGING"
+            not in deploy.stages[1].env
+        )
+
+    def test_minicpmo_single_chip_policy_can_disable_ranked_terminal600(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_TERMINAL600_DEFAULT", "0"
+        )
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS" not in (
+            deploy.stages[2].env or {}
+        )
+
+    def test_minicpmo_single_chip_policy_preserves_launch_terminal_floor(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS", "400")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_OMNI_MINICPMO45_TERMINAL_MIN_AUDIO_MS" not in (
+            deploy.stages[2].env or {}
+        )
+
+    def test_minicpmo_single_chip_policy_can_disable_ranked_first47(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "VLLM_OMNI_MINICPMO45_SINGLE_CHIP_RTF_FIRST47_DEFAULT", "0"
+        )
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES" not in (
+            deploy.stages[1].env or {}
+        )
+
+    def test_minicpmo_single_chip_policy_preserves_launch_first_packet(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "25")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES" not in (
+            deploy.stages[1].env or {}
+        )
+
+    def test_minicpmo_single_chip_policy_can_disable_reduced_cfm_defaults(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM1_DEFAULT", "0")
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_SINGLE_CHIP_CFM2_DEFAULT", "0")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS" not in (
+            deploy.stages[2].env or {}
+        )
+
+    def test_minicpmo_single_chip_policy_preserves_launch_cfm_steps(self, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS", "6")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        assert "VLLM_OMNI_MINICPMO45_TOKEN2WAV_N_TIMESTEPS" not in (
+            deploy.stages[2].env or {}
+        )
+
+    def test_minicpmo_single_chip_policy_can_disable_exact_defaults(self, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_MINICPMO45_SINGLE_CHIP_EXACT_DEFAULTS", "0")
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml")),
+            platform="npu",
+        )
+
+        assert _apply_minicpmo45_single_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=1,
+        )
+
+        for stage in deploy.stages[:2]:
+            assert stage.compilation_config == {
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": [1],
+            }
+        assert deploy.stages[1].env is None
+        assert deploy.stages[1].engine_extras.get("additional_config") is None
+        assert deploy.stages[2].env is None
+        connector = deploy.connectors["connector_of_shared_memory"]
+        assert connector["extra"]["shm_event_notifications"] is True
+
+    def test_minicpmo_a3_policy_preserves_explicit_compile_mode(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = load_deploy_config(get_deploy_config_path("minicpmo_4_5.yaml"))
+        deploy.stages[0].compilation_config = {"cudagraph_mode": "NONE"}
+
+        assert _apply_minicpmo45_a3_dual_chip_policy(
+            pipeline,
+            deploy,
+            platform="npu",
+            device_count=2,
+        )
+
+        assert deploy.stages[0].compilation_config == {"cudagraph_mode": "NONE"}
+        assert deploy.stages[1].compilation_config == {
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [1, 2, 4],
+        }
+
     def test_load_minicpmo_910c_competition_topology(self):
         deploy_path = Path(
             get_deploy_config_path(
@@ -1937,7 +2379,6 @@ class TestQwen3TTSPipeline:
             "top_p": 1.0,
         }
 
-
 class TestMingFlashOmniPipeline:
     def test_registered(self):
         p = resolve_pipeline_config("ming_flash_omni")
@@ -2332,6 +2773,371 @@ class TestPlatformOverrides:
         assert extra["npu_dit_mlp_graph"] is True
         assert extra["npu_dit_preamble_graph"] is True
         assert extra["npu_dit_conv_mlp_graph"] is True
+
+    def test_minicpmo_4_5_910c_prompt_graph_buckets_are_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_prompt_graph_buckets_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_dit_mlp_graph_width"] == 50
+        assert extra["npu_dit_graph_buckets"] == [20, 302]
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_dit_wide_adaln"] is True
+        assert extra["npu_dit_wide_final_adaln"] is True
+        assert extra["npu_dit_final_addcmul"] is True
+        assert extra["npu_dit_conv_mlp_graph"] is True
+        assert extra["npu_dit_prompt_conv_mlp_graph"] is True
+        assert extra["npu_single_request_cache_passthrough"] is True
+
+    def test_minicpmo_4_5_910c_wide_final_adaln_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_wide_final_adaln_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(deploy_path),
+            platform="npu",
+        )
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_wide_adaln"] is True
+        assert extra["npu_dit_wide_final_adaln"] is True
+        assert extra["npu_dit_mlp_graph_width"] == 50
+
+    def test_minicpmo_4_5_910c_final_addcmul_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_final_addcmul_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(deploy_path),
+            platform="npu",
+        )
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_wide_final_adaln"] is True
+        assert extra["npu_dit_final_addcmul"] is True
+        assert extra["npu_dit_mlp_graph_width"] == 50
+
+    def test_minicpmo_4_5_910c_last_block_final_euler_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_last_block_final_euler_graph_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(deploy_path),
+            platform="npu",
+        )
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_conv_mlp_graph"] is True
+        assert extra["npu_dit_wide_final_adaln"] is True
+        assert extra["npu_dit_final_addcmul"] is True
+        assert extra["npu_dit_last_block_final_euler_graph"] is True
+        assert extra["npu_dit_mlp_graph_width"] == 50
+
+    def test_minicpmo_4_5_910c_hift_source_noise_scratch_is_stage2_env(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_hift_source_noise_scratch_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_SOURCE_NOISE_SCRATCH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM"] == "1"
+
+    def test_minicpmo_4_5_910c_hift_f0_classifier_graph_is_stage2_env(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_hift_f0_classifier_graph_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_CLASSIFIER_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"] == "58"
+
+    def test_minicpmo_4_5_910c_hift_f0_frozen_weights_are_stage2_env(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_hift_f0_frozen_weights_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_FROZEN_WEIGHTS"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"] == "58"
+
+    def test_minicpmo_4_5_910c_cache_major_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_cache_major_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_fused_conv_pack"] is True
+        assert extra["npu_dit_cache_major"] is True
+        assert extra["npu_dit_wide_adaln"] is False
+
+    def test_minicpmo_4_5_910c_chunk32_candidate_preserves_graph_buckets(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_chunk32_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["codec_chunk_frames"] == 32
+        assert extra["initial_codec_chunk_frames"] == 25
+        assert extra["npu_dit_mlp_graph_width"] == 64
+        assert extra["npu_dit_graph_buckets"] == [20, 50, 302]
+        assert extra["npu_dit_wide_adaln"] is True
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"] == "72"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_BUCKETS"] == "50"
+
+    def test_minicpmo_4_5_910c_wide_adaln_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_wide_adaln_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_dit_wide_adaln"] is True
+
+    def test_minicpmo_4_5_910c_post_attention_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_post_attention_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_cache_major"] is True
+        assert extra["npu_dit_post_attn_graph"] is True
+
+    def test_minicpmo_4_5_910c_qkv_pack_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_qkv_pack_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_cache_major"] is True
+        assert extra["npu_dit_qkv_pack"] is True
+
+    def test_minicpmo_4_5_910c_fused_qkv_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_fused_qkv_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_compute_dtype"] == "bf16"
+        assert extra["npu_cfm_planar_kv_slabs"] is True
+        assert extra["npu_dit_fused_qkv"] is True
+
+    def test_minicpmo_4_5_910c_planar_cache_major_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_cache_major_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_wide_final_adaln"] is True
+        assert extra["npu_cfm_planar_kv_slabs"] is True
+        assert extra["npu_dit_cache_major"] is True
+
+    def test_minicpmo_4_5_910c_attention_cache_output_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_attn_cache_out_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_dit_attn_cache_out"] is True
+
+    def test_minicpmo_4_5_910c_stacked_cache_output_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_stacked_cache_out_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_cfm_stacked_cache_out"] is True
+
+    def test_minicpmo_4_5_910c_single_request_cache_passthrough_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_single_request_cache_passthrough_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_single_request_cache_passthrough"] is True
+
+    def test_minicpmo_4_5_910c_fixed_kv_graph_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_bf16_fixed_kv_graph_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(deploy_path), platform="npu"
+        )
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_cfm_fixed_kv_slabs"] is True
+        assert extra["npu_dit_compute_dtype"] == "bf16"
+        assert extra["npu_cfm_integration_dtype"] == "bf16"
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE"] == "1"
+
+    def test_minicpmo_4_5_910c_planar_kv_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_kv_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(deploy_path), platform="npu"
+        )
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_dit_wide_adaln"] is True
+        assert extra["npu_cfm_fixed_kv_slabs"] is True
+        assert extra["npu_cfm_planar_kv_slabs"] is True
+        assert extra["npu_dit_compute_dtype"] == "bf16"
+        assert extra["npu_cfm_integration_dtype"] == "bf16"
+
+    def test_minicpmo_4_5_910c_bsh_attention_candidate_is_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_bsh_attention_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(deploy_path), platform="npu"
+        )
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_dit_preamble_graph"] is True
+        assert extra["npu_dit_wide_adaln"] is True
+        assert extra["npu_dit_wide_final_adaln"] is True
+        assert extra["npu_cfm_fixed_kv_slabs"] is True
+        assert extra["npu_cfm_planar_kv_slabs"] is True
+        assert extra["npu_dit_bsh_attention"] is True
+        assert extra["npu_dit_compute_dtype"] == "bf16"
+        assert extra["npu_cfm_integration_dtype"] == "bf16"
+
+    def test_minicpmo_4_5_910c_bsh_cfm_graph_candidate_is_steady_only(self):
+        deploy_path = Path(_DEPLOY_DIR) / (
+            "minicpmo_4_5_2npu_910c_cfm6_dit_bf16_planar_"
+            "bsh_attention_cfm_graph_experimental.yaml"
+        )
+
+        deploy = _apply_platform_overrides(
+            load_deploy_config(deploy_path), platform="npu"
+        )
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_cfm_fixed_kv_slabs"] is True
+        assert extra["npu_cfm_planar_kv_slabs"] is True
+        assert extra["npu_dit_bsh_attention"] is True
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE"] == "1"
+
+    def test_minicpmo_4_5_910c_full_block_cache_buckets_are_explicit(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_full_block_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["token2wav_n_timesteps"] == 6
+        assert extra["npu_dit_fused_conv_pack"] is True
+        assert extra["npu_dit_full_block_graph"] is True
+        assert extra["npu_dit_full_block_cache_buckets"] == [302, 352, 402]
+        stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH"] == "1"
+        assert stage2.env["VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH"] == "58"
+
+    def test_minicpmo_4_5_910c_full_stack_targets_only_capped_history(self):
+        deploy_path = Path(
+            get_deploy_config_path(
+                "minicpmo_4_5_2npu_910c_cfm6_dit_full_stack_experimental.yaml"
+            )
+        )
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.connectors is not None
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["npu_dit_full_stack_graph"] is True
+        assert extra["npu_dit_full_block_cache_buckets"] == [402]
+        assert "npu_dit_full_block_graph" not in extra
 
     def test_minicpmo_4_5_910c_prefix_cache_is_thinker_only(self):
         deploy_path = Path(

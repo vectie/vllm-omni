@@ -278,6 +278,18 @@ class TestTtsRegionDetection:
         assert buffer["ids"]["tts"] == [30, 31]
         assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
 
+    def test_teacher_forcing_prefers_complete_span_before_open_generation_suffix(self) -> None:
+        # The MiniCPM multimodal processor appends its normal TTS generation
+        # suffix even when serving has already inserted a teacher-forced span.
+        # The trailing open BOS must not shadow the complete target text.
+        # sequence: [10, BOS, 30, 31, EOS, 90, BOS]
+        buffer, hidden = self._run(
+            [10, 151703, 30, 31, 151704, 90, 151703],
+            [20],
+        )
+        assert buffer["ids"]["tts"] == [30, 31]
+        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[2:4])
+
     def test_plain_chat_without_tts_markers_uses_assistant_span(self) -> None:
         buffer, hidden = self._run([10, 11], [20, 21, 22])
         assert buffer["ids"]["tts"] == [20, 21, 22]

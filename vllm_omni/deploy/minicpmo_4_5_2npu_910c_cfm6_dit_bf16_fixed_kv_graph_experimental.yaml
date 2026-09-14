@@ -1,0 +1,18 @@
+# Atlas 800I A3 / Ascend 910C steady-CFM executable experiment.
+#
+# Capture only the repetitive width-50/cache-(prompt+100) CFM shape after the
+# fixed slabs have stabilized all input and output addresses. Prompt, cache
+# fill, and final-tail shapes intentionally bypass NPUGraph.
+
+base_config: minicpmo_4_5_2npu_910c_cfm6_dit_bf16_fixed_kv_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        env:
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_MATERIALIZE_WEIGHT_NORM: "1"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_HIFT_F0_GRAPH_WIDTH: "58"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH: "1"
+          VLLM_OMNI_MINICPMO45_NPU_CFM_GRAPH_CACHE: "1"

@@ -1,0 +1,19 @@
+# Atlas 800I A3 / Ascend 910C sequence-major attention isolation profile.
+#
+# Keep the evaluator-shaped dual-chip/full-decode/fixed-planar candidate and
+# change only the DiT attention representation.  Q/K/V stay BSH through the
+# projection, cache append, fused attention and output projection, avoiding
+# the repeated BSH/BNSD transformations in all sixteen DiT blocks.
+
+base_config: minicpmo_4_5_2npu_910c_full_decode_planar_diagnostic.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      npu_dit_bsh_attention: true

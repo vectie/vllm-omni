@@ -1,0 +1,13 @@
+# A2 evaluator-compatible isolation profile for the quality-gated Talker
+# optimizations. The FIA task cache rebinds at 16-token boundaries, while the
+# batch-one decode path maps only its live KV slot instead of clearing the
+# maximum slot slab on every generated codec token.
+
+base_config: minicpmo_4_5_1npu_a2_evaluator_fia_bucket16_experimental.yaml
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 1
+        env:
+          VLLM_ASCEND_SINGLE_TOKEN_SLOT_GRAPH: "1"

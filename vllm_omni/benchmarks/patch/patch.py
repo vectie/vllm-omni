@@ -165,11 +165,12 @@ _DEFAULT_VIDEOMME_REPO = VIDEOMME_DEFAULT_HF_REPO
 
 
 def _seed_tts_capture_pcm_for_wer() -> bool:
-    return os.environ.get("SEED_TTS_WER_EVAL", "").lower() in (
+    wer_enabled = os.environ.get("SEED_TTS_WER_EVAL", "").lower() in (
         "1",
         "true",
         "yes",
     )
+    return wer_enabled or bool(os.environ.get("SEED_TTS_OFFICIAL_EXPORT_DIR", "").strip())
 
 
 def _merge_extra_body_mm_kwargs(base: dict | None, overlay: dict | None) -> dict | None:

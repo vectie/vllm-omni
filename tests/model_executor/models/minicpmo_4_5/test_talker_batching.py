@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -15,6 +17,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
     _apply_repetition_penalty,
     _apply_repetition_penalty_from_frequencies,
+    _apply_top_k_top_p,
+    _bounded_codec_distribution,
+    _bounded_top_k_top_p_candidates,
+    _graphable_codec_sample,
     _max_audio_tokens,
     _restore_weight_norm_weight,
 )
@@ -56,6 +62,14 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     nn.Module.__init__(talker)
     talker._num_audio_tokens = 8
     talker._batch_stop_logits = None
+    talker._batch_stop_token_ids = None
+    talker._stop_logits_constants = None
+    talker._stop_token_constants = None
+    talker.direct_stop_sampler = False
+    talker.batched_codec_output = False
+    talker.deferred_chunk_eos = False
+    talker._request_transport_codes = {}
+    talker._request_transport_chunks = {}
     talker._request_generators = {}
     talker._request_audio_states = {}
     talker._request_repetition_frequencies = {}
@@ -63,7 +77,227 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._codec_vocab_ids = torch.arange(8)
     talker._codec_min_tokens = 50
     talker._codec_seed = 42
+    talker._fused_codec_sampler_enabled = False
+    talker._fused_codec_sampler_prepared = False
+    talker._fused_codec_sampler_request_id = None
     return talker
+
+
+def test_fused_codec_sampler_stages_fixed_request_state() -> None:
+    talker = _make_talker()
+    talker._fused_codec_sampler_enabled = True
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_uniform = torch.full((1, 1), 0.5)
+    talker._fused_codec_mask_eos = torch.ones(1, dtype=torch.bool)
+    talker._fused_codec_expired = torch.full((1, 1), -1, dtype=torch.long)
+    history = torch.tensor([0, 1, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6])
+    talker._request_audio_states["req-fused"] = {
+        "codes": history,
+        "step": 4,
+        "min_tokens": 5,
+    }
+
+    prepared = talker.prepare_fused_codec_sampler_inputs(
+        model_intermediate_buffer=[{"request_id": "req-fused"}],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+    )
+
+    assert prepared is True
+    assert talker._fused_codec_sampler_request_id == "req-fused"
+    assert talker._fused_codec_sampler_prepared is True
+    assert talker._fused_codec_mask_eos.item() is True
+    assert talker._fused_codec_expired.item() == 0
+    expected = torch.bincount(history, minlength=8).float().reshape(1, -1)
+    assert torch.equal(talker._fused_codec_frequencies, expected)
+    assert talker._request_repetition_frequencies["req-fused"].data_ptr() == (
+        talker._fused_codec_frequencies.data_ptr()
+    )
+
+
+def test_fused_codec_sampler_does_not_stage_final_prefill_chunk() -> None:
+    talker = _make_talker()
+    talker._fused_codec_sampler_enabled = True
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_uniform = torch.full((1, 1), 0.5)
+    talker._fused_codec_mask_eos = torch.ones(1, dtype=torch.bool)
+    talker._fused_codec_expired = torch.full((1, 1), -1, dtype=torch.long)
+    talker._request_audio_states["req-prefill"] = {
+        "codes": torch.empty(0, dtype=torch.long),
+        "step": 0,
+        "min_tokens": 5,
+    }
+
+    prepared = talker.prepare_fused_codec_sampler_inputs(
+        model_intermediate_buffer=[{"request_id": "req-prefill"}],
+        request_token_spans=[(0, 12)],
+        request_sample_eligible=[True],
+    )
+
+    assert prepared is False
+    assert talker._fused_codec_sampler_prepared is False
+    assert talker._request_generators == {}
+
+
+def test_make_output_consumes_fused_codec_result_without_second_sampler(monkeypatch) -> None:
+    talker = _make_talker()
+    talker._fused_codec_sampler_enabled = True
+    talker._fused_codec_sampler_prepared = True
+    talker._fused_codec_sampler_request_id = "req-fused"
+    talker._fused_codec_sampled = torch.tensor([[3]])
+    talker._fused_codec_frequencies = torch.zeros(1, 8)
+    talker._fused_codec_next_frequencies = torch.tensor(
+        [[0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]]
+    )
+    state = {"step": 0, "min_tokens": 50, "max_tokens": 64}
+    talker._request_audio_states["req-fused"] = state
+    monkeypatch.setattr(
+        talker,
+        "_sample_audio_code",
+        lambda *_args: pytest.fail("standalone sampler must be bypassed"),
+    )
+    info = {
+        "request_id": "req-fused",
+        "audio_state": state,
+        "audio_codes": {"accumulated": torch.tensor([1])},
+    }
+
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+        request_sample_eligible=[True],
+    )
+
+    assert output.multimodal_outputs["codes"]["audio"][0].tolist() == [[3]]
+    assert talker._fused_codec_sampler_prepared is False
+    assert torch.equal(
+        talker._request_repetition_frequencies["req-fused"],
+        talker._fused_codec_next_frequencies,
+    )
+
+
+def test_talker_batches_codec_transport_at_initial_and_steady_boundaries(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "2")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "3")
+    talker = _make_talker()
+    talker.batched_codec_output = True
+
+    def push(code: int, *, finished: bool = False) -> torch.Tensor:
+        return talker._transport_codec_delta(
+            "req-batched-output",
+            torch.tensor([[code]], dtype=torch.long),
+            finished=finished,
+            native_duplex=False,
+        )
+
+    assert push(1).numel() == 0
+    assert push(2).tolist() == [[1, 2]]
+    assert push(3).numel() == 0
+    assert push(4).numel() == 0
+    assert push(5).tolist() == [[3, 4, 5]]
+    assert push(6).numel() == 0
+    flushed = talker._transport_codec_delta(
+        "req-batched-output",
+        torch.empty((0, 1), dtype=torch.long),
+        finished=True,
+        native_duplex=False,
+    )
+    assert flushed.tolist() == [[6]]
+
+
+def test_talker_marks_only_publishable_codec_chunks_as_sparse_output(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "2")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "3")
+    talker = _make_talker()
+    talker.batched_codec_output = True
+    samples = iter((torch.tensor(3), torch.tensor(4)))
+    monkeypatch.setattr(talker, "_sample_audio_code", lambda *_args: next(samples))
+    info = {
+        "request_id": "req-sparse-output",
+        "audio_state": {"step": 0, "min_tokens": 50, "max_tokens": 64},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    first = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+    second = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+
+    assert first.multimodal_outputs["meta"]["req_id"] == []
+    assert first.multimodal_outputs["codes"]["audio"] == []
+    assert second.multimodal_outputs["meta"]["req_id"] == ["req-sparse-output"]
+    assert second.multimodal_outputs["codes"]["audio"][0].tolist() == [[3, 4]]
+
+
+def test_talker_deferred_eos_trims_terminal_tail_at_chunk_boundary(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "3")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "3")
+    talker = _make_talker()
+    talker.batched_codec_output = True
+    talker.deferred_chunk_eos = True
+    samples = iter((torch.tensor(1), torch.tensor(7), torch.tensor(3)))
+    monkeypatch.setattr(talker, "_sample_audio_code", lambda *_args: next(samples))
+    monkeypatch.setattr(
+        talker,
+        "_sampled_code_is_eos",
+        lambda *_args, **_kwargs: pytest.fail("deferred EOS must avoid per-token scalar reads"),
+    )
+    info = {
+        "request_id": "req-deferred-eos",
+        "audio_state": {"step": 0, "min_tokens": 0, "max_tokens": 10},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    outputs = [
+        talker.make_omni_output(
+            torch.ones(1, 2),
+            model_intermediate_buffer=[info],
+            request_token_spans=[(0, 1)],
+        )
+        for _ in range(3)
+    ]
+
+    assert outputs[0].multimodal_outputs["codes"]["audio"] == []
+    assert outputs[1].multimodal_outputs["codes"]["audio"] == []
+    assert outputs[2].multimodal_outputs["codes"]["audio"][0].tolist() == [[1]]
+    assert outputs[2].multimodal_outputs["meta"]["finished"][0].item() is True
+    assert talker._request_transport_codes["req-deferred-eos"] == []
+
+
+def test_talker_deferred_eos_flushes_limit_without_boundary_sample(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_INITIAL_CODEC_CHUNK_FRAMES", "4")
+    monkeypatch.setenv("VLLM_OMNI_MINICPMO45_CODEC_CHUNK_FRAMES", "4")
+    talker = _make_talker()
+    talker.batched_codec_output = True
+    talker.deferred_chunk_eos = True
+    samples = iter((torch.tensor(1), torch.tensor(2), torch.tensor(6)))
+    monkeypatch.setattr(talker, "_sample_audio_code", lambda *_args: next(samples))
+    info = {
+        "request_id": "req-deferred-limit",
+        "audio_state": {"step": 0, "min_tokens": 50, "max_tokens": 3},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    outputs = [
+        talker.make_omni_output(
+            torch.ones(1, 2),
+            model_intermediate_buffer=[info],
+            request_token_spans=[(0, 1)],
+        )
+        for _ in range(3)
+    ]
+
+    assert outputs[0].multimodal_outputs["codes"]["audio"] == []
+    assert outputs[1].multimodal_outputs["codes"]["audio"] == []
+    assert outputs[2].multimodal_outputs["codes"]["audio"][0].tolist() == [[1, 2]]
+    assert outputs[2].multimodal_outputs["meta"]["finished"][0].item() is True
 
 
 def _routed(output, index: int):
@@ -118,6 +352,122 @@ def test_incremental_repetition_frequencies_match_sliding_window() -> None:
     assert torch.equal(talker._request_repetition_frequencies["req"], expected)
 
 
+def test_bounded_codec_candidates_match_full_warper_distribution() -> None:
+    generator = torch.Generator().manual_seed(7)
+    logits = torch.randn(2, 128, generator=generator)
+    expected_logits = _apply_top_k_top_p(
+        logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+    expected = torch.softmax(expected_logits, dim=-1)
+
+    candidate_logits, candidate_ids = _bounded_top_k_top_p_candidates(
+        logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+    actual = torch.zeros_like(expected).scatter(
+        -1,
+        candidate_ids,
+        torch.softmax(candidate_logits, dim=-1),
+    )
+
+    assert torch.allclose(actual, expected, atol=1e-7, rtol=1e-6)
+
+
+@pytest.mark.parametrize("mask_eos", [False, True])
+def test_graphable_codec_distribution_matches_eager_filter(mask_eos: bool) -> None:
+    generator = torch.Generator().manual_seed(19)
+    hidden = torch.randn(1, 16, generator=generator, dtype=torch.bfloat16)
+    weight = torch.randn(128, 16, generator=generator, dtype=torch.bfloat16)
+    frequencies = torch.randint(0, 4, (1, 128), generator=generator).float()
+    penalty = torch.tensor([1.05])
+
+    logits = torch.nn.functional.linear(hidden, weight).float() / 0.8
+    expected_logits = _apply_repetition_penalty_from_frequencies(
+        logits,
+        frequencies,
+        penalty=1.05,
+    )
+    if mask_eos:
+        expected_logits[..., 127] = float("-inf")
+    expected_candidates, expected_ids = _bounded_top_k_top_p_candidates(
+        expected_logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+    expected_probabilities = torch.softmax(expected_candidates, dim=-1)
+
+    probabilities, candidate_ids = _bounded_codec_distribution(
+        hidden,
+        frequencies,
+        weight,
+        penalty,
+        temperature=0.8,
+        top_k=25,
+        top_p=0.85,
+        eos_id=127,
+        mask_eos=mask_eos,
+    )
+
+    assert torch.equal(candidate_ids, expected_ids)
+    assert torch.equal(probabilities, expected_probabilities)
+
+
+@pytest.mark.parametrize("mask_eos", [False, True])
+def test_inverse_cdf_codec_sample_matches_bounded_distribution(mask_eos: bool) -> None:
+    generator = torch.Generator().manual_seed(23)
+    hidden = torch.randn(1, 16, generator=generator, dtype=torch.bfloat16)
+    weight = torch.randn(128, 16, generator=generator, dtype=torch.bfloat16)
+    frequencies = torch.randint(0, 4, (1, 128), generator=generator).float()
+    penalty = torch.tensor([1.05])
+    uniform = torch.tensor([[0.417]])
+    expired = torch.tensor([[7]])
+    vocab_ids = torch.arange(128).reshape(1, -1)
+
+    probabilities, candidate_ids = _bounded_codec_distribution(
+        hidden,
+        frequencies,
+        weight,
+        penalty,
+        temperature=0.8,
+        top_k=25,
+        top_p=0.85,
+        eos_id=127,
+        mask_eos=mask_eos,
+    )
+    expected_position = torch.sum(
+        probabilities.cumsum(dim=-1) < uniform,
+        dim=-1,
+        keepdim=True,
+    ).clamp_max_(probabilities.shape[-1] - 1)
+    expected_sample = candidate_ids.gather(-1, expected_position)
+    expected_frequencies = frequencies + (vocab_ids == expected_sample).float()
+    expected_frequencies -= (vocab_ids == expired).float()
+
+    sampled, next_frequencies = _graphable_codec_sample(
+        hidden,
+        frequencies,
+        weight,
+        penalty,
+        uniform,
+        torch.tensor([mask_eos]),
+        expired,
+        vocab_ids,
+        temperature=0.8,
+        top_k=25,
+        top_p=0.85,
+        eos_id=127,
+    )
+
+    assert torch.equal(sampled, expected_sample)
+    assert torch.equal(next_frequencies, expected_frequencies)
+
+
 def test_weight_norm_restore_matches_checkpoint_parametrization_in_bfloat16() -> None:
     generator = torch.Generator().manual_seed(42)
     weight_v = torch.randn(8, 16, generator=generator, dtype=torch.bfloat16)
@@ -170,6 +520,90 @@ def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> N
     assert _routed(output, 0)["meta"]["finished"].item() is False
     assert set(output.multimodal_outputs["meta"]) == {"finished"}
     assert talker.compute_logits(output.text_hidden_states).argmax(dim=-1).tolist() == [0, 0]
+
+
+def test_direct_stop_sampler_reuses_model_continue_and_stop_decisions(monkeypatch) -> None:
+    talker = _make_talker()
+    talker.direct_stop_sampler = True
+    sampling_metadata = SimpleNamespace(
+        max_num_logprobs=None,
+        logprob_token_ids={},
+    )
+    sample_calls = 0
+
+    def sample(*_args) -> torch.Tensor:
+        nonlocal sample_calls
+        sample_calls += 1
+        return torch.tensor(3)
+
+    monkeypatch.setattr(talker, "_sample_audio_code", sample)
+    info = {
+        "request_id": "req-direct-stop",
+        "audio_state": {"step": 0, "min_tokens": 0, "max_tokens": 2},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    first = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+    first_logits = talker.compute_logits(first.text_hidden_states)
+    first_sample = talker.sample(first_logits, sampling_metadata)
+    first_constant = first_sample.sampled_token_ids
+
+    second = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+    second_logits = talker.compute_logits(second.text_hidden_states)
+    second_sample = talker.sample(second_logits, sampling_metadata)
+
+    third = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+    third_logits = talker.compute_logits(third.text_hidden_states)
+    third_sample = talker.sample(third_logits, sampling_metadata)
+
+    assert sample_calls == 2
+    assert first_logits.argmax(dim=-1).tolist() == [0]
+    assert first_sample.sampled_token_ids.tolist() == [[0]]
+    assert first_sample.sampled_token_ids is first_constant
+    assert second_logits.argmax(dim=-1).tolist() == [1]
+    assert second_sample.sampled_token_ids.tolist() == [[1]]
+    assert third_logits is second_logits
+    assert third_sample.sampled_token_ids is second_sample.sampled_token_ids
+
+
+def test_pre_minimum_codec_steps_do_not_read_sample_back_to_host(mocker) -> None:
+    talker = _make_talker()
+
+    class NoHostReadbackSample:
+        def item(self):
+            raise AssertionError("pre-minimum codec sample must not be read by the host")
+
+        def reshape(self, *shape):
+            return torch.tensor(2).reshape(*shape)
+
+    mocker.patch.object(talker, "_sample_audio_code", return_value=NoHostReadbackSample())
+    info = {
+        "request_id": "req-no-sync",
+        "audio_state": {"step": 0, "min_tokens": 50},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+
+    assert info["audio_state"]["step"] == 1
+    assert _routed(output, 0)["codes"]["audio"].tolist() == [[2]]
+    assert _routed(output, 0)["meta"]["finished"].item() is False
 
 
 def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
@@ -272,7 +706,9 @@ def test_eos_is_terminal_once_and_never_enters_codec_history(mocker) -> None:
     sample = mocker.patch.object(talker, "_sample_audio_code", return_value=torch.tensor(7))
     info = {
         "request_id": "req-stop",
-        "audio_state": {"step": 3},
+        # The real sampler masks EOS before min_tokens. This test injects EOS
+        # directly, so make the request eligible for the host-side EOS check.
+        "audio_state": {"step": 3, "min_tokens": 0},
         "audio_codes": {"accumulated": torch.tensor([4, 5])},
     }
 

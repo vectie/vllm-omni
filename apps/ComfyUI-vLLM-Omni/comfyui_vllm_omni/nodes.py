@@ -167,6 +167,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "sampling_params": ("SAMPLING_PARAMS",),
                 "lora": ("REMOTE_LORA",),
                 "model_params": ("VIDEO_PARAMS",),
+                "generate_sound": ("BOOLEAN", {"default": False}),
+                "max_wait_seconds": ("INT", {"default": 7200, "min": 30, "max": 7200}),
             },
         }
 
@@ -188,6 +190,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         sampling_params: dict | list[dict] | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
+        generate_sound: bool = False,
+        max_wait_seconds: int = 7200,
         **kwargs,
     ):
         if kwargs:
@@ -206,11 +210,11 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             sampling_params = sampling_params[0]
 
         if sampling_params is not None:
-            sampling_params.pop("type", None)  # internal fields
+            sampling_params = {key: value for key, value in sampling_params.items() if key != "type"}
         if model_params is not None:
-            model_params.pop("type", None)  # internal fields
+            model_params = {key: value for key, value in model_params.items() if key != "type"}
 
-        client = VLLMOmniClient(url)
+        client = VLLMOmniClient(url, timeout=60, max_poll_duration=max_wait_seconds)
         output = await client.generate_video(
             model=model,
             prompt=prompt,
@@ -223,6 +227,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             sampling_params=sampling_params,
             lora=lora,
             model_params=model_params,
+            generate_sound=generate_sound,
         )
         return (output,)
 

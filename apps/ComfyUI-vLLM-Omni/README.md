@@ -182,3 +182,21 @@ UI/UX design references
 - https://github.com/sgl-project/sglang/pull/15271 SGLang Diffusion's official ComfyUI integration for image and video generation.
 - https://github.com/SXQBW/ComfyUI-Qwen-Omni A third party ComfyUI integration for Qwen Omni series.
 - https://github.com/flybirdxx/ComfyUI-Qwen-TTS https://github.com/DarioFT/ComfyUI-Qwen3-TTS Third  party ComfyUI integrations for Qwen TTS series.
+## Managed video gateways
+
+Video generation now sends an `Idempotency-Key` for each enqueue attempt and
+never automatically repeats an ambiguous POST. The node exposes a bounded
+`max_wait_seconds` setting (up to two hours) and `generate_sound` for compatible
+models. A gateway may restrict supported parameters to its qualified profile.
+
+Known jobs are cleaned up after success, generation failure, timeout, cancelled
+execution, download failure or decoding failure. Cleanup is best effort: if the
+service cannot acknowledge deletion, server-side reconciliation is still
+required. Do not interpret a browser/node timeout as proof that a GPU stopped.
+Provider error bodies, prompts and internal URLs are omitted from video errors.
+
+The transport regression tests can run without loading a model:
+
+```console
+PYTHONPATH=apps/ComfyUI-vLLM-Omni python -m unittest discover -s apps/ComfyUI-vLLM-Omni/tests -v
+```

@@ -6,7 +6,6 @@ The image generation part is derived from dougbtv/comfyui-vllm-omni by Doug (@do
 Original source at https://github.com/dougbtv/comfyui-vllm-omni, distributed under the MIT License.
 """
 
-import asyncio
 import json
 from typing import Any
 
@@ -28,6 +27,7 @@ from .format import (
 from .logger import get_logger, pretty_printer
 from .models import lookup_model_spec
 from .types import AudioFormat
+from .video_transport import run_video_job
 
 logger = get_logger(__name__)
 
@@ -63,7 +63,11 @@ async def url_bytes(session: aiohttp.ClientSession, url: str, verb: str = "get",
 
 class VLLMOmniClient:
     def __init__(
-        self, base_url: str, timeout: float | None = None, poll_interval: float = 5.0, max_poll_duration: float = 60 * 5
+        self,
+        base_url: str,
+        timeout: float | None = None,
+        poll_interval: float = 5.0,
+        max_poll_duration: float = 60 * 120,
     ):
         self.base_url = base_url
         self.timeout = aiohttp.ClientTimeout(total=timeout)
@@ -265,6 +269,7 @@ class VLLMOmniClient:
         sampling_params: dict | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
+        generate_sound: bool | None = None,
         **extra_body,
     ) -> VideoInput:
         form = aiohttp.FormData()
@@ -274,6 +279,8 @@ class VLLMOmniClient:
         form.add_field("height", str(height))
         form.add_field("num_frames", str(num_frames))
         form.add_field("fps", str(fps))
+        if generate_sound is not None:
+            form.add_field("generate_sound", json.dumps(generate_sound))
         if negative_prompt:
             form.add_field("negative_prompt", negative_prompt)
         if sampling_params is not None:
@@ -281,7 +288,7 @@ class VLLMOmniClient:
                 form.add_field(k, str(v))
         if model_params is not None:
             for k, v in model_params.items():
-                form.add_field(k, str(v))
+                form.add_field(k, json.dumps(v) if isinstance(v, bool) else str(v))
         if lora is not None:
             form.add_field("lora", json.dumps(lora, ensure_ascii=False))
         if extra_body:
@@ -296,41 +303,14 @@ class VLLMOmniClient:
                 content_type="image/png",
             )
 
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            # Start the video generation job
-            url = f"{self.base_url}/videos"
-            data = await url_json(session, url, "post", data=form)
-            if (job_id := data.get("id", None)) is None:
-                raise RuntimeError("API response missing job 'id' field - expected OpenAI compliant format")
-            if (job_status := data.get("status", None)) is None:
-                raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
-
-            # Poll for video generation job completion
-            deadline = asyncio.get_running_loop().time() + self.max_poll_duration
-            url = f"{self.base_url}/videos/{job_id}"
-            while job_status not in {"completed", "failed"}:
-                await asyncio.sleep(self.poll_interval)
-
-                data = await url_json(session, url)
-                if (job_status := data.get("status", None)) is None:
-                    raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise RuntimeError(f"Timed out waiting for video job {job_id} to complete")
-
-            if job_status == "failed":
-                raise RuntimeError(f"Video job failed: {data}")
-
-            # Retrieve completed content
-            video_bytes = await url_bytes(session, f"{url}/content")
-
-            # Decode video and make a best effort at cleaning up server resources
-            try:
-                return bytes_to_video(video_bytes)
-            finally:
-                try:
-                    await url_json(session, url, "delete")
-                except Exception as exc:
-                    logger.warning("Failed to clean up video job %s: %s", job_id, exc)
+        video_bytes = await run_video_job(
+            self.base_url,
+            form,
+            timeout=self.timeout,
+            poll_interval=self.poll_interval,
+            max_poll_duration=self.max_poll_duration,
+        )
+        return bytes_to_video(video_bytes)
 
     async def generate_understanding_chat_completion(
         self,
